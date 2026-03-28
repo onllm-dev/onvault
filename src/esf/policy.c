@@ -219,6 +219,27 @@ int onvault_policy_add_rule(const char *vault_id,
         }
     }
 
+    /* Auto-create a policy for this vault if one doesn't exist */
+    if (g_policy_count < MAX_VAULT_POLICIES) {
+        onvault_vault_policy_t *new_policy = &g_policies[g_policy_count];
+        memset(new_policy, 0, sizeof(*new_policy));
+        strlcpy(new_policy->vault_id, vault_id, sizeof(new_policy->vault_id));
+        new_policy->verify_mode = VERIFY_CODESIGN_PREFERRED;
+        new_policy->allow_escalated = 0;
+
+        onvault_rule_t *rule = &new_policy->rules[0];
+        memset(rule, 0, sizeof(*rule));
+        strlcpy(rule->process_path, process_path, PATH_MAX);
+        rule->action = action;
+        onvault_sha256_file(process_path, &rule->binary_hash);
+        rule->use_hash = 1;
+        new_policy->rule_count = 1;
+
+        g_policy_count++;
+        pthread_rwlock_unlock(&g_policy_lock);
+        return ONVAULT_OK;
+    }
+
     pthread_rwlock_unlock(&g_policy_lock);
     return ONVAULT_ERR_NOT_FOUND;
 }
