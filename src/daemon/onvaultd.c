@@ -31,6 +31,7 @@
 #include <string.h>
 #include <signal.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <pthread.h>
@@ -269,66 +270,10 @@ static void on_deny(const onvault_process_t *process,
     onvault_menubar_notify_deny(proc_name, file_path, vault_id);
 }
 
-int main(int argc, char *argv[])
+/* IPC accept loop — runs on background thread when menu bar is active */
+static void *ipc_accept_loop(void *arg)
 {
-    (void)argc;
-    (void)argv;
-
-    fprintf(stderr, "onvaultd starting...\n");
-
-    /* Install signal handlers */
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
-
-    /* Initialize crypto */
-    onvault_crypto_init();
-
-    /* Check if initialized */
-    if (!onvault_auth_is_initialized()) {
-        fprintf(stderr, "onvaultd: not initialized. Run 'onvault init' first.\n");
-        return 1;
-    }
-
-    /* Try to load master key from session or SE */
-    int rc = onvault_auth_check_session(&g_master_key);
-    if (rc == ONVAULT_OK) {
-        g_master_key_loaded = 1;
-        fprintf(stderr, "onvaultd: session restored\n");
-
-        /* Initialize audit logging with config key */
-        onvault_key_t config_key;
-        onvault_mlock(&config_key, sizeof(config_key));
-        onvault_derive_config_key(&g_master_key, &config_key);
-        if (onvault_log_init(&config_key) == ONVAULT_OK) {
-            g_log_initialized = 1;
-            onvault_log_write(LOG_AUTH_SUCCESS, NULL, NULL, 0, NULL, "session restored");
-        }
-        onvault_key_wipe(&config_key, sizeof(config_key));
-    } else {
-        fprintf(stderr, "onvaultd: waiting for unlock via 'onvault unlock'\n");
-    }
-
-    /* Start IPC server */
-    if (onvault_ipc_server_start() != ONVAULT_OK) {
-        fprintf(stderr, "onvaultd: failed to start IPC server\n");
-        return 1;
-    }
-
-    /* Initialize ESF (may fail without entitlement — non-fatal for dev) */
-    rc = onvault_esf_init();
-    if (rc == ONVAULT_OK) {
-        onvault_esf_set_deny_callback(on_deny);
-        fprintf(stderr, "onvaultd: ESF agent active\n");
-    } else {
-        fprintf(stderr, "onvaultd: ESF not available (running without Layer 2)\n");
-    }
-
-    fprintf(stderr, "onvaultd: ready\n");
-
-    /* Accept IPC connections */
-    /* Note: In production, this would also integrate with the menu bar
-     * run loop. For now, simple accept loop. */
-    int server_fd = onvault_ipc_server_fd();
+    int server_fd = *(int *)arg;
 
     while (g_running) {
         struct sockaddr_un client_addr;
@@ -349,6 +294,89 @@ int main(int argc, char *argv[])
             if (client_fd >= 0)
                 handle_client(client_fd);
         }
+    }
+
+    return NULL;
+}
+
+int main(int argc, char *argv[])
+{
+    (void)argc;
+    (void)argv;
+
+    fprintf(stderr, "onvaultd starting...\n");
+
+    /* Install signal handlers */
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+
+    /* Initialize crypto */
+    onvault_crypto_init();
+
+    /* Check if initialized (just check for salt file — no Keychain access) */
+    char data_dir[PATH_MAX];
+    if (onvault_get_data_dir(data_dir) != ONVAULT_OK) {
+        fprintf(stderr, "onvaultd: failed to access data directory\n");
+        return 1;
+    }
+    {
+        char salt_path[PATH_MAX];
+        snprintf(salt_path, PATH_MAX, "%s/salt", data_dir);
+        struct stat check_st;
+        if (stat(salt_path, &check_st) != 0) {
+            fprintf(stderr, "onvaultd: not initialized. Run 'onvault init' first.\n");
+            return 1;
+        }
+    }
+
+    /* Don't try to load key at startup — wait for explicit unlock via IPC.
+     * This avoids Keychain/iCloud permission popups on daemon start. */
+    fprintf(stderr, "onvaultd: waiting for unlock via 'onvault unlock'\n");
+
+    /* Start IPC server */
+    if (onvault_ipc_server_start() != ONVAULT_OK) {
+        fprintf(stderr, "onvaultd: failed to start IPC server\n");
+        return 1;
+    }
+
+    /* Initialize ESF (may fail without entitlement — non-fatal for dev) */
+    int rc = onvault_esf_init();
+    if (rc == ONVAULT_OK) {
+        onvault_esf_set_deny_callback(on_deny);
+        fprintf(stderr, "onvaultd: ESF agent active\n");
+    } else {
+        fprintf(stderr, "onvaultd: ESF not available (running without Layer 2)\n");
+    }
+
+    fprintf(stderr, "onvaultd: ready\n");
+
+    /* IPC accept loop (runs on background thread when menu bar is active) */
+    int server_fd = onvault_ipc_server_fd();
+
+    /* Check if we should show the menu bar (default: yes, unless --no-gui) */
+    int show_gui = 1;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--no-gui") == 0) {
+            show_gui = 0;
+            break;
+        }
+    }
+
+    if (show_gui) {
+        /* Run IPC accept loop on background thread */
+        pthread_t ipc_thread;
+        pthread_create(&ipc_thread, NULL, ipc_accept_loop, &server_fd);
+        pthread_detach(ipc_thread);
+
+        /* Menu bar runs on main thread (required by macOS for UI) */
+        fprintf(stderr, "onvaultd: menu bar active\n");
+        onvault_menubar_init(); /* Blocks — runs NSApp event loop */
+
+        /* If we get here, menu bar was closed */
+        g_running = 0;
+    } else {
+        /* Headless mode: IPC loop on main thread */
+        ipc_accept_loop(&server_fd);
     }
 
     cleanup();

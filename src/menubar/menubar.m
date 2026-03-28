@@ -31,35 +31,37 @@
     /* Build menu */
     [self rebuildMenu];
 
-    /* Request notification permission */
-    UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
-    center.delegate = self;
-    [center requestAuthorizationWithOptions:(UNAuthorizationOptionAlert | UNAuthorizationOptionSound)
-                          completionHandler:^(BOOL granted, NSError *error) {
-        if (!granted)
-            NSLog(@"onvault: notification permission denied");
-        if (error)
-            NSLog(@"onvault: notification error: %@", error);
-    }];
+    /* Request notification permission (only when running as bundled app) */
+    if ([[NSBundle mainBundle] bundleIdentifier] != nil) {
+        UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+        center.delegate = self;
+        [center requestAuthorizationWithOptions:(UNAuthorizationOptionAlert | UNAuthorizationOptionSound)
+                              completionHandler:^(BOOL granted, NSError *error) {
+            if (!granted)
+                NSLog(@"onvault: notification permission denied");
+            if (error)
+                NSLog(@"onvault: notification error: %@", error);
+        }];
 
-    /* Register notification actions */
-    UNNotificationAction *allowOnce = [UNNotificationAction
-        actionWithIdentifier:@"ALLOW_ONCE"
-        title:@"Allow Once"
-        options:UNNotificationActionOptionNone];
+        /* Register notification actions */
+        UNNotificationAction *allowOnce = [UNNotificationAction
+            actionWithIdentifier:@"ALLOW_ONCE"
+            title:@"Allow Once"
+            options:UNNotificationActionOptionNone];
 
-    UNNotificationAction *allowAlways = [UNNotificationAction
-        actionWithIdentifier:@"ALLOW_ALWAYS"
-        title:@"Allow Always"
-        options:UNNotificationActionOptionNone];
+        UNNotificationAction *allowAlways = [UNNotificationAction
+            actionWithIdentifier:@"ALLOW_ALWAYS"
+            title:@"Allow Always"
+            options:UNNotificationActionOptionNone];
 
-    UNNotificationCategory *denyCategory = [UNNotificationCategory
-        categoryWithIdentifier:@"DENY"
-        actions:@[allowOnce, allowAlways]
-        intentIdentifiers:@[]
-        options:UNNotificationCategoryOptionNone];
+        UNNotificationCategory *denyCategory = [UNNotificationCategory
+            categoryWithIdentifier:@"DENY"
+            actions:@[allowOnce, allowAlways]
+            intentIdentifiers:@[]
+            options:UNNotificationCategoryOptionNone];
 
-    [center setNotificationCategories:[NSSet setWithObject:denyCategory]];
+        [center setNotificationCategories:[NSSet setWithObject:denyCategory]];
+    }
 }
 
 - (void)rebuildMenu {
@@ -206,6 +208,10 @@ void onvault_menubar_notify_deny(const char *process_name,
                                    const char *file_path,
                                    const char *vault_id)
 {
+    /* Notifications require a bundled app; skip if not available */
+    if ([[NSBundle mainBundle] bundleIdentifier] == nil)
+        return;
+
     NSString *proc = [NSString stringWithUTF8String:process_name ?: "unknown"];
     NSString *fpath = [NSString stringWithUTF8String:file_path ?: "unknown"];
     NSString *vid = [NSString stringWithUTF8String:vault_id ?: "unknown"];
