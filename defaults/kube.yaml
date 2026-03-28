@@ -1,0 +1,21 @@
+# onvault — Default allowlist for ~/.kube
+vault_type: kube
+processes:
+  - path: /usr/local/bin/kubectl
+    verify: codesign
+    note: "Kubernetes CLI"
+  - path: /opt/homebrew/bin/kubectl
+    verify: codesign
+    note: "kubectl (Homebrew)"
+  - path: /usr/local/bin/helm
+    verify: codesign
+    note: "Helm"
+  - path: /opt/homebrew/bin/helm
+    verify: codesign
+    note: "Helm (Homebrew)"
+  - path: /usr/local/bin/k9s
+    verify: codesign
+    note: "K9s terminal UI"
+  - path: /opt/homebrew/bin/k9s
+    verify: codesign
+    note: "K9s (Homebrew)"

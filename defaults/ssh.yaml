@@ -1,0 +1,24 @@
+# onvault — Default allowlist for ~/.ssh
+vault_type: ssh
+processes:
+  - path: /usr/bin/ssh
+    verify: codesign
+    note: "SSH client"
+  - path: /usr/bin/scp
+    verify: codesign
+    note: "Secure copy"
+  - path: /usr/bin/sftp
+    verify: codesign
+    note: "Secure FTP"
+  - path: /usr/bin/ssh-add
+    verify: codesign
+    note: "SSH agent key manager"
+  - path: /usr/bin/ssh-agent
+    verify: codesign
+    note: "SSH authentication agent"
+  - path: /usr/bin/ssh-keygen
+    verify: codesign
+    note: "SSH key generator"
+  - path: /usr/bin/git
+    verify: codesign
+    note: "Git (uses SSH for remote ops)"

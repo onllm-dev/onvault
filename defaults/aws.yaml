@@ -1,0 +1,21 @@
+# onvault — Default allowlist for ~/.aws
+vault_type: aws
+processes:
+  - path: /usr/local/bin/aws
+    verify: codesign
+    note: "AWS CLI v2"
+  - path: /opt/homebrew/bin/aws
+    verify: codesign
+    note: "AWS CLI v2 (Homebrew)"
+  - path: /usr/local/bin/terraform
+    verify: codesign
+    note: "Terraform"
+  - path: /opt/homebrew/bin/terraform
+    verify: codesign
+    note: "Terraform (Homebrew)"
+  - path: /usr/local/bin/pulumi
+    verify: codesign
+    note: "Pulumi"
+  - path: /opt/homebrew/bin/pulumi
+    verify: codesign
+    note: "Pulumi (Homebrew)"

@@ -1,0 +1,44 @@
+# Build artifacts
+*.o
+*.a
+*.dylib
+onvault
+onvaultd
+tests/test_crypto
+tests/test_vault
+
+# Temporary files
+*.tmp
+*.swp
+*.swo
+*~
+/tmp/
+
+# macOS
+.DS_Store
+._*
+__MACOSX/
+
+# IDE
+.vscode/
+.idea/
+*.xcodeproj/
+*.xcworkspace/
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+xcuserdata/
+
+# onvault runtime data (never commit user data)
+.onvault/
+
+# Claude Code / planning (internal only)
+.claude/
+plan.md
+
+# Coverage / profiling
+*.gcda
+*.gcno
+*.gcov
+coverage/
