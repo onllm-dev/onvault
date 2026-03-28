@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/mount.h>
@@ -235,14 +236,133 @@ static int ov_write(const char *path, const char *buf, size_t size, off_t offset
                     struct fuse_file_info *fi)
 {
     (void)fi;
-    (void)path;
-    (void)buf;
-    (void)size;
-    (void)offset;
 
-    /* TODO: Implement write support for vaults */
-    /* For now, credential files are mostly read-only */
-    return -EROFS;
+    char rpath[PATH_MAX];
+    real_path(path, rpath);
+
+    onvault_fuse_ctx_t *ctx = get_ctx();
+
+    /* Load nonce */
+    onvault_nonce_t nonce;
+    if (onvault_file_nonce_load(rpath, &nonce) != ONVAULT_OK)
+        return -EIO;
+
+    /* Open ciphertext file for reading current state and writing */
+    FILE *f = fopen(rpath, "r+b");
+    if (!f)
+        return -errno;
+
+    /* Read current file size from header */
+    uint64_t file_size;
+    if (fread(&file_size, sizeof(file_size), 1, f) != 1) {
+        fclose(f);
+        return -EIO;
+    }
+
+    /* Calculate new file size if write extends past end */
+    uint64_t write_end = (uint64_t)offset + size;
+    uint64_t new_file_size = (write_end > file_size) ? write_end : file_size;
+
+    /* Write blocks */
+    uint64_t start_block = (uint64_t)offset / ONVAULT_BLOCK_SIZE;
+    size_t block_offset_in = (size_t)((uint64_t)offset % ONVAULT_BLOCK_SIZE);
+    size_t total_written = 0;
+
+    while (total_written < size) {
+        uint64_t cipher_pos = sizeof(file_size) + start_block * ONVAULT_BLOCK_SIZE;
+        uint8_t plainbuf[ONVAULT_BLOCK_SIZE];
+        memset(plainbuf, 0, sizeof(plainbuf));
+
+        /* Read existing block if we're doing a partial block write */
+        size_t copy_start = (total_written == 0) ? block_offset_in : 0;
+        if (copy_start > 0 || (size - total_written) < ONVAULT_BLOCK_SIZE) {
+            /* Need to read-modify-write: decrypt existing block first */
+            if (fseeko(f, (off_t)cipher_pos, SEEK_SET) == 0) {
+                uint8_t cipherbuf[ONVAULT_BLOCK_SIZE];
+                size_t block_read = fread(cipherbuf, 1, ONVAULT_BLOCK_SIZE, f);
+                if (block_read >= 16) {
+                    onvault_file_decrypt_block(&ctx->vault_key, &nonce,
+                                               cipherbuf, block_read,
+                                               plainbuf, start_block);
+                }
+            }
+        }
+
+        /* Overlay new data */
+        size_t copy_len = ONVAULT_BLOCK_SIZE - copy_start;
+        if (copy_len > size - total_written)
+            copy_len = size - total_written;
+        memcpy(plainbuf + copy_start, buf + total_written, copy_len);
+
+        /* Determine block size to encrypt (at least 16 for XTS) */
+        size_t block_end = copy_start + copy_len;
+        /* Calculate how much of this block actually has data */
+        uint64_t block_data_end = (start_block + 1) * ONVAULT_BLOCK_SIZE;
+        if (block_data_end > new_file_size)
+            block_data_end = new_file_size;
+        size_t encrypt_len = (size_t)(block_data_end - start_block * ONVAULT_BLOCK_SIZE);
+        if (encrypt_len < block_end)
+            encrypt_len = block_end;
+        if (encrypt_len < 16)
+            encrypt_len = 16;
+        if (encrypt_len > ONVAULT_BLOCK_SIZE)
+            encrypt_len = ONVAULT_BLOCK_SIZE;
+
+        /* Encrypt the block */
+        uint8_t cipherout[ONVAULT_BLOCK_SIZE];
+        int rc = onvault_file_encrypt_block(&ctx->vault_key, &nonce,
+                                             plainbuf, encrypt_len,
+                                             cipherout, start_block);
+        onvault_memzero(plainbuf, sizeof(plainbuf));
+
+        if (rc != ONVAULT_OK) {
+            fclose(f);
+            onvault_memzero(&nonce, sizeof(nonce));
+            return -EIO;
+        }
+
+        /* Write encrypted block to ciphertext file */
+        if (fseeko(f, (off_t)cipher_pos, SEEK_SET) != 0) {
+            fclose(f);
+            onvault_memzero(&nonce, sizeof(nonce));
+            return -EIO;
+        }
+        if (fwrite(cipherout, 1, encrypt_len, f) != encrypt_len) {
+            fclose(f);
+            onvault_memzero(&nonce, sizeof(nonce));
+            return -EIO;
+        }
+
+        total_written += copy_len;
+        start_block++;
+    }
+
+    /* Update file size header if it changed */
+    if (new_file_size != file_size) {
+        if (fseeko(f, 0, SEEK_SET) == 0)
+            fwrite(&new_file_size, sizeof(new_file_size), 1, f);
+    }
+
+    fflush(f);
+    fclose(f);
+    onvault_memzero(&nonce, sizeof(nonce));
+    return (int)total_written;
+}
+
+static int ov_truncate(const char *path, off_t newsize)
+{
+    char rpath[PATH_MAX];
+    real_path(path, rpath);
+
+    /* Update the plaintext size in the ciphertext header */
+    FILE *f = fopen(rpath, "r+b");
+    if (!f)
+        return -errno;
+
+    uint64_t new_file_size = (uint64_t)newsize;
+    fwrite(&new_file_size, sizeof(new_file_size), 1, f);
+    fclose(f);
+    return 0;
 }
 
 static int ov_release(const char *path, struct fuse_file_info *fi)
@@ -253,12 +373,45 @@ static int ov_release(const char *path, struct fuse_file_info *fi)
     return 0;
 }
 
+static int ov_create(const char *path, mode_t mode, struct fuse_file_info *fi)
+{
+    /* Layer 2 policy check */
+    if (g_policy_check) {
+        pid_t caller = fuse_get_context()->pid;
+        if (g_policy_check(caller, path) != 0)
+            return -EACCES;
+    }
+
+    char rpath[PATH_MAX];
+    real_path(path, rpath);
+
+    /* Create the ciphertext file with size header */
+    int fd = open(rpath, O_CREAT | O_WRONLY | O_TRUNC, mode);
+    if (fd < 0)
+        return -errno;
+
+    /* Write initial size header (0 bytes) */
+    uint64_t file_size = 0;
+    (void)write(fd, &file_size, sizeof(file_size));
+
+    /* Generate and store a nonce for this new file */
+    onvault_nonce_t nonce;
+    onvault_file_nonce_generate(&nonce);
+    onvault_file_nonce_store(rpath, &nonce);
+    onvault_memzero(&nonce, sizeof(nonce));
+
+    fi->fh = (uint64_t)fd;
+    return 0;
+}
+
 static struct fuse_operations onvault_fuse_ops = {
     .getattr  = ov_getattr,
     .readdir  = ov_readdir,
     .open     = ov_open,
     .read     = ov_read,
     .write    = ov_write,
+    .truncate = ov_truncate,
+    .create   = ov_create,
     .release  = ov_release,
 };
 

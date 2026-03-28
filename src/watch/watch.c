@@ -20,6 +20,49 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <libproc.h>
+#include <Security/Security.h>
+
+/* Extract code signing info from a binary path */
+static void extract_codesign_info(const char *path, onvault_watch_entry_t *entry)
+{
+    CFURLRef url = CFURLCreateFromFileSystemRepresentation(
+        kCFAllocatorDefault, (const UInt8 *)path, (CFIndex)strlen(path), false);
+    if (!url) return;
+
+    SecStaticCodeRef code = NULL;
+    OSStatus status = SecStaticCodeCreateWithPath(url, kSecCSDefaultFlags, &code);
+    CFRelease(url);
+    if (status != errSecSuccess || !code) return;
+
+    /* Verify the signature (don't reject unsigned — just note it) */
+    status = SecStaticCodeCheckValidity(code, kSecCSDefaultFlags, NULL);
+    if (status == errSecSuccess) {
+        entry->is_signed = 1;
+
+        /* Extract signing information */
+        CFDictionaryRef info = NULL;
+        status = SecCodeCopySigningInformation(code, kSecCSSigningInformation, &info);
+        if (status == errSecSuccess && info) {
+            /* Team ID */
+            CFStringRef teamId = CFDictionaryGetValue(info, kSecCodeInfoTeamIdentifier);
+            if (teamId && CFGetTypeID(teamId) == CFStringGetTypeID()) {
+                CFStringGetCString(teamId, entry->team_id,
+                                    sizeof(entry->team_id), kCFStringEncodingUTF8);
+            }
+
+            /* Signing identifier */
+            CFStringRef signId = CFDictionaryGetValue(info, kSecCodeInfoIdentifier);
+            if (signId && CFGetTypeID(signId) == CFStringGetTypeID()) {
+                CFStringGetCString(signId, entry->signing_id,
+                                    sizeof(entry->signing_id), kCFStringEncodingUTF8);
+            }
+
+            CFRelease(info);
+        }
+    }
+
+    CFRelease(code);
+}
 
 /* In-memory watch results */
 static onvault_watch_entry_t g_entries[ONVAULT_MAX_WATCH_ENTRIES];
@@ -54,7 +97,7 @@ void onvault_watch_record_access(pid_t pid)
         strlcpy(e->path, proc_path, PATH_MAX);
         e->access_count = 1;
         onvault_sha256_file(proc_path, &e->binary_hash);
-        /* TODO: Extract code signing info via SecStaticCode */
+        extract_codesign_info(proc_path, e);
         g_entry_count++;
     }
 

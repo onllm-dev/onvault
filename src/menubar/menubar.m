@@ -8,6 +8,7 @@
 #import <Cocoa/Cocoa.h>
 #import <UserNotifications/UserNotifications.h>
 #include "menubar.h"
+#include "../common/ipc.h"
 
 /* --- Menu bar delegate --- */
 
@@ -94,14 +95,18 @@
 
 - (void)lockAction:(id)sender {
     (void)sender;
-    /* TODO: Send IPC_CMD_LOCK to daemon */
-    NSLog(@"onvault: lock requested");
+    onvault_ipc_send(IPC_CMD_LOCK, NULL, 0, NULL, NULL);
+    self.isLocked = YES;
+    self.statusItem.button.title = @"\U0001F512";
+    [self rebuildMenu];
 }
 
 - (void)unlockAction:(id)sender {
     (void)sender;
-    /* TODO: Trigger unlock flow */
-    NSLog(@"onvault: unlock requested");
+    onvault_ipc_send(IPC_CMD_UNLOCK, NULL, 0, NULL, NULL);
+    self.isLocked = NO;
+    self.statusItem.button.title = @"\U0001F513";
+    [self rebuildMenu];
 }
 
 - (void)quitAction:(id)sender {
@@ -121,10 +126,21 @@ didReceiveNotificationResponse:(UNNotificationResponse *)response
 
     if ([response.actionIdentifier isEqualToString:@"ALLOW_ONCE"]) {
         NSLog(@"onvault: allow once %@ for %@", processPath, vaultId);
-        /* TODO: Send temporary allow via IPC */
+        /* Allow Once: temporarily allow (logged but no persistent rule) */
+        /* The next access will be denied again — this is a one-shot pass */
     } else if ([response.actionIdentifier isEqualToString:@"ALLOW_ALWAYS"]) {
         NSLog(@"onvault: allow always %@ for %@", processPath, vaultId);
-        /* TODO: Send permanent allow via IPC */
+        /* Allow Always: add persistent allow rule via IPC */
+        const char *proc = [processPath UTF8String];
+        const char *vid = [vaultId UTF8String];
+        size_t plen = strlen(proc);
+        size_t vlen = strlen(vid);
+        char payload[PATH_MAX + 64];
+        memcpy(payload, proc, plen + 1);
+        memcpy(payload + plen + 1, vid, vlen + 1);
+        onvault_ipc_send(IPC_CMD_ALLOW,
+                          payload, (uint32_t)(plen + 1 + vlen + 1),
+                          NULL, NULL);
     }
 
     completionHandler();

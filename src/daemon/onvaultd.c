@@ -17,12 +17,14 @@
 #include "../common/crypto.h"
 #include "../common/memwipe.h"
 #include "../common/ipc.h"
+#include "../common/log.h"
 #include "../auth/auth.h"
 #include "../keystore/keystore.h"
 #include "../fuse/vault.h"
 #include "../fuse/onvault_fuse.h"
 #include "../esf/agent.h"
 #include "../esf/policy.h"
+#include "../menubar/menubar.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,9 +45,17 @@ static void signal_handler(int sig)
     g_running = 0;
 }
 
+static int g_log_initialized = 0;
+
 static void cleanup(void)
 {
     fprintf(stderr, "onvaultd: shutting down\n");
+
+    /* Close audit log */
+    if (g_log_initialized) {
+        onvault_log_close();
+        g_log_initialized = 0;
+    }
 
     /* Unmount all vaults */
     char ids[32][64];
@@ -218,7 +228,15 @@ static void on_deny(const onvault_process_t *process,
 {
     fprintf(stderr, "onvaultd: DENIED %s (pid %d) → %s [vault: %s]\n",
             process->path, process->pid, file_path, vault_id);
-    /* TODO: Send macOS notification via menu bar module */
+
+    /* Log the denial event */
+    onvault_log_write(LOG_ACCESS_DENIED, vault_id, process->path,
+                       process->pid, file_path, NULL);
+
+    /* Send macOS notification with Allow Once / Allow Always actions */
+    const char *proc_name = strrchr(process->path, '/');
+    proc_name = proc_name ? proc_name + 1 : process->path;
+    onvault_menubar_notify_deny(proc_name, file_path, vault_id);
 }
 
 int main(int argc, char *argv[])
@@ -246,6 +264,16 @@ int main(int argc, char *argv[])
     if (rc == ONVAULT_OK) {
         g_master_key_loaded = 1;
         fprintf(stderr, "onvaultd: session restored\n");
+
+        /* Initialize audit logging with config key */
+        onvault_key_t config_key;
+        onvault_mlock(&config_key, sizeof(config_key));
+        onvault_derive_config_key(&g_master_key, &config_key);
+        if (onvault_log_init(&config_key) == ONVAULT_OK) {
+            g_log_initialized = 1;
+            onvault_log_write(LOG_AUTH_SUCCESS, NULL, NULL, 0, NULL, "session restored");
+        }
+        onvault_key_wipe(&config_key, sizeof(config_key));
     } else {
         fprintf(stderr, "onvaultd: waiting for unlock via 'onvault unlock'\n");
     }

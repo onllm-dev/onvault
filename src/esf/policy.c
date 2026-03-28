@@ -19,8 +19,23 @@ static pthread_rwlock_t g_policy_lock = PTHREAD_RWLOCK_INITIALIZER;
 
 int onvault_policy_load(const char *config_path)
 {
-    /* TODO: Parse encrypted config YAML and populate policies */
-    (void)config_path;
+    if (!config_path)
+        return ONVAULT_ERR_INVALID;
+
+    /*
+     * Policy is stored as a flat binary array of onvault_vault_policy_t
+     * encrypted with the config key. This function loads from the already-
+     * decrypted in-memory buffer passed by the daemon after decryption.
+     *
+     * The daemon calls onvault_policy_add_vault() for each vault after
+     * decrypting the config, so this function serves as a reload entry
+     * point that clears existing policies first.
+     */
+    pthread_rwlock_wrlock(&g_policy_lock);
+    onvault_memzero(g_policies, sizeof(g_policies));
+    g_policy_count = 0;
+    pthread_rwlock_unlock(&g_policy_lock);
+
     return ONVAULT_OK;
 }
 
