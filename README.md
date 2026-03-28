@@ -69,43 +69,62 @@ make dist   # Distribution build (static linking, no Homebrew needed by users)
 ### Usage
 
 ```bash
-# First-time setup — sets passphrase, generates recovery key
+# 1. First-time setup — sets passphrase, generates recovery key
 onvault init
 
-# Start the daemon
-onvaultd &
+# 2. Start the daemon (shows menu bar icon, or --no-gui for headless)
+onvaultd &                  # with menu bar
+onvaultd --no-gui &         # headless (servers, CI)
 
-# Protect your SSH keys
-onvault vault add ~/.ssh
-
-# Protect AWS credentials
-onvault vault add ~/.aws
-
-# Unlock vaults (authenticate with passphrase)
+# 3. Unlock — authenticates and lets daemon load the master key
 onvault unlock
 
-# Check status
+# 4. Protect directories — encrypts files, creates symlink
+onvault vault add ~/.ssh    # encrypt SSH keys
+onvault vault add ~/.aws    # encrypt AWS credentials
+
+# 5. Status — see what's protected
 onvault status
 
-# Lock everything (unmount, wipe keys)
+# 6. Lock — unmount vaults, wipe keys from memory, stop daemon
 onvault lock
 ```
 
-### Managing Access
+### What Happens When You Add a Vault
+
+```
+onvault vault add ~/.ssh
+```
+
+1. Files in `~/.ssh/` are encrypted (AES-256-XTS) and moved to `~/.onvault/vaults/ssh/`
+2. A nonce is stored in each file's xattr for key derivation
+3. `~/.ssh` is replaced with a symlink → `~/.onvault/mnt/ssh/`
+4. When unlocked: FUSE mount decrypts on-the-fly. `ssh`, `git`, etc. work normally.
+5. When locked or daemon stops: FUSE unmounts. `~/.ssh` symlink points to nothing. Files are ciphertext.
+
+To undo: `onvault vault remove ssh` decrypts everything back to the original location.
+
+### Managing Access Policies
+
+Only processes in the allowlist can read your encrypted files. Everything else is denied by default.
 
 ```bash
-# Allow vim to edit SSH keys
+# Allow a specific binary to access a vault
 onvault allow /usr/bin/vim ssh
+onvault allow /opt/homebrew/bin/gh ssh
 
-# Deny python from AWS credentials
-onvault deny /usr/bin/python3 aws
-
-# See what processes access a path (learning mode)
+# See what processes access a path (learning mode — observe for 24h)
 onvault vault watch ~/.ssh
 onvault vault suggest ssh
 
 # View denied access attempts
 onvault log --denied
+```
+
+### Version
+
+```bash
+onvault --version    # onvault 0.1.0
 ```
 
 ---
