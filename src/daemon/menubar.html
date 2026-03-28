@@ -85,6 +85,12 @@ body {
 .input-row input { flex: 1; padding: 4px 8px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: rgba(0,0,0,0.3); color: var(--text); font-size: 10px; font-family: 'SF Mono', Menlo, monospace; outline: none; }
 .input-row input:focus { border-color: rgba(59, 130, 246, 0.5); }
 .input-row button { padding: 4px 8px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: var(--green-dim); color: var(--green); font-size: 10px; cursor: pointer; font-family: inherit; }
+/* Overlay panel */
+.panel-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.6); z-index: 200; }
+.panel-overlay.show { display: flex; align-items: center; justify-content: center; }
+.panel { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); width: 280px; max-height: 350px; overflow: hidden; }
+.panel-header { display: flex; justify-content: space-between; align-items: center; padding: 10px 12px; border-bottom: 1px solid var(--border); font-weight: 600; font-size: 12px; }
+.panel-body { padding: 10px 12px; font-size: 10px; color: var(--text-soft); white-space: pre-wrap; font-family: 'SF Mono', Menlo, monospace; overflow-y: auto; max-height: 280px; margin: 0; }
 </style>
 </head>
 <body>
@@ -110,8 +116,16 @@ body {
     <div id="denialList"></div>
 </div>
 
+<div id="addVaultPanel" style="display:none; padding: 8px 12px;">
+    <div class="section-title">Add Vault</div>
+    <div class="input-row">
+        <input placeholder="~/.ssh or /path/to/dir" id="addVaultInput">
+        <button onclick="doAddVault()">Protect</button>
+    </div>
+</div>
+
 <div class="action-bar">
-    <button class="primary" onclick="copyCmd('onvault vault add &lt;path&gt; --smart')">+ Add Vault</button>
+    <button class="primary" onclick="promptAddVault()">+ Add Vault</button>
     <button onclick="viewPolicies()">Policies</button>
     <button onclick="refresh()" id="refreshBtn">Refresh</button>
 </div>
@@ -122,6 +136,16 @@ body {
 </div>
 
 <div class="toast" id="toast"></div>
+
+<div class="panel-overlay" id="panelOverlay" onclick="hidePanel()">
+    <div class="panel" onclick="event.stopPropagation()">
+        <div class="panel-header">
+            <span id="panelTitle"></span>
+            <button onclick="hidePanel()" style="background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:14px">✕</button>
+        </div>
+        <pre class="panel-body" id="panelBody"></pre>
+    </div>
+</div>
 
 <script>
 const API = window.location.origin;
@@ -179,10 +203,10 @@ function render() {
                 '<div class="vault-source">' + v.source + '</div>' +
                 '<div class="vault-detail">' +
                 '<div class="vault-actions">' +
-                '<button onclick="event.stopPropagation();copyCmd(\'onvault rules ' + v.id + '\')">Rules</button>' +
+                '<button onclick="event.stopPropagation();viewRules(\'' + v.id + '\')">Rules</button>' +
                 '<button onclick="event.stopPropagation();showAllow(\'' + v.id + '\')">Allow</button>' +
                 '<button onclick="event.stopPropagation();showDeny(\'' + v.id + '\')">Deny</button>' +
-                '<button class="danger" onclick="event.stopPropagation();copyCmd(\'onvault vault remove ' + v.id + '\')">Remove</button>' +
+                '<button class="danger" onclick="event.stopPropagation();toast(\'Use CLI: onvault vault remove ' + v.id + '\')">Remove</button>' +
                 '</div>' +
                 '<div class="input-row" id="allow-' + v.id + '" style="display:none">' +
                 '<input placeholder="/usr/bin/process" id="allow-input-' + v.id + '">' +
@@ -191,7 +215,6 @@ function render() {
                 '<div class="input-row" id="deny-' + v.id + '" style="display:none">' +
                 '<input placeholder="/usr/bin/process" id="deny-input-' + v.id + '">' +
                 '<button onclick="event.stopPropagation();doDeny(\'' + v.id + '\')">Deny</button>' +
-                '</div>' +
                 '</div></div>';
         }).join('');
     }
@@ -205,7 +228,7 @@ function render() {
             '<span class="denial-proc">' + d.process + '</span> \u2192 ' + d.vault +
             '<div class="denial-file">' + d.file + '</div></div>' +
             '<span class="denial-time">' + timeAgo(d.time) + '</span>' +
-            '<button class="denial-allow" onclick="copyCmd(\'onvault allow ' + d.path + ' ' + d.vault + '\')">Allow</button>' +
+            '<button class="denial-allow" onclick="quickAllow(\'' + d.path + '\',\'' + d.vault + '\')">Allow</button>' +
             '</div>'
         ).join('');
     } else {
@@ -233,22 +256,72 @@ function showDeny(id) {
     document.getElementById('allow-' + id).style.display = 'none';
 }
 
-function doAllow(id) {
+async function doAllow(id) {
     const input = document.getElementById('allow-input-' + id);
-    const path = input.value.trim();
-    if (!path) return;
-    copyCmd('onvault allow ' + path + ' ' + id);
+    const proc = input.value.trim();
+    if (!proc) return;
+    try {
+        const r = await fetch(API + '/api/allow', { method: 'POST', body: proc + '\n' + id });
+        const j = await r.json();
+        toast(j.msg, !j.ok);
+    } catch(e) { toast('Failed to allow', true); }
     input.value = '';
     document.getElementById('allow-' + id).style.display = 'none';
+    fetchData();
 }
 
-function doDeny(id) {
+async function doDeny(id) {
     const input = document.getElementById('deny-input-' + id);
-    const path = input.value.trim();
-    if (!path) return;
-    copyCmd('onvault deny ' + path + ' ' + id);
+    const proc = input.value.trim();
+    if (!proc) return;
+    try {
+        const r = await fetch(API + '/api/deny', { method: 'POST', body: proc + '\n' + id });
+        const j = await r.json();
+        toast(j.msg, !j.ok);
+    } catch(e) { toast('Failed to deny', true); }
     input.value = '';
     document.getElementById('deny-' + id).style.display = 'none';
+    fetchData();
+}
+
+function promptAddVault() {
+    const panel = document.getElementById('addVaultPanel');
+    panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+    if (panel.style.display === 'block') {
+        document.getElementById('addVaultInput').focus();
+    }
+    notifyResize();
+}
+
+async function doAddVault() {
+    const input = document.getElementById('addVaultInput');
+    const path = input.value.trim();
+    if (!path) return;
+    try {
+        const r = await fetch(API + '/api/vault/add', { method: 'POST', body: path });
+        const j = await r.json();
+        toast(j.msg, !j.ok);
+    } catch(e) { toast('Failed to add vault', true); }
+    input.value = '';
+    document.getElementById('addVaultPanel').style.display = 'none';
+    fetchData();
+}
+
+async function viewRules(id) {
+    try {
+        const r = await fetch(API + '/api/rules?vault=' + id);
+        const text = await r.text();
+        showPanel('Rules: ' + id, text);
+    } catch(e) { toast('Failed to load rules', true); }
+}
+
+async function quickAllow(proc, vault) {
+    try {
+        const r = await fetch(API + '/api/allow', { method: 'POST', body: proc + '\n' + vault });
+        const j = await r.json();
+        toast(j.msg, !j.ok);
+    } catch(e) { toast('Failed', true); }
+    fetchData();
 }
 
 async function refresh() {
@@ -258,7 +331,22 @@ async function refresh() {
     btn.textContent = 'Refresh';
 }
 
-function viewPolicies() { window.open(API + '/api/policies', '_blank'); }
+async function viewPolicies() {
+    try {
+        const r = await fetch(API + '/api/policies');
+        showPanel('All Policies', await r.text());
+    } catch(e) { toast('Failed to load policies', true); }
+}
+
+function showPanel(title, body) {
+    document.getElementById('panelTitle').textContent = title;
+    document.getElementById('panelBody').textContent = body;
+    document.getElementById('panelOverlay').className = 'panel-overlay show';
+}
+
+function hidePanel() {
+    document.getElementById('panelOverlay').className = 'panel-overlay';
+}
 
 function notifyResize() {
     try { window.webkit.messageHandlers.resize.postMessage(document.body.scrollHeight); } catch(e) {}
