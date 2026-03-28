@@ -62,7 +62,7 @@ brew install --cask macfuse
 git clone https://github.com/onllm-dev/onvault.git
 cd onvault
 make        # Development build
-make test   # Run test suite (22 tests)
+make test   # Run test suite (23 tests)
 make dist   # Distribution build (static linking, no Homebrew needed by users)
 ```
 
@@ -287,7 +287,7 @@ Contributions welcome. Please open an issue before submitting large PRs.
 # Build and test
 make clean && make test
 
-# Run all 22 tests
+# Run all 23 tests
 make test
 ```
 

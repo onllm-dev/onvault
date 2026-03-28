@@ -137,6 +137,10 @@ static void esf_handler(es_client_t *client, const es_message_t *msg)
     case ES_EVENT_TYPE_AUTH_TRUNCATE:
         if (msg->event.truncate.target) file_path = msg->event.truncate.target->path.data;
         break;
+    case ES_EVENT_TYPE_AUTH_EXEC:
+        if (msg->event.exec.target && msg->event.exec.target->executable)
+            file_path = msg->event.exec.target->executable->path.data;
+        break;
     default:
         es_respond_auth_result(client, msg, ES_AUTH_RESULT_ALLOW, false);
         return;

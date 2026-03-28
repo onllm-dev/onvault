@@ -57,10 +57,15 @@ int onvault_policy_remove_vault(const char *vault_id)
 
 const onvault_vault_policy_t *onvault_policy_get_by_mount(const char *mount_path)
 {
+    pthread_rwlock_rdlock(&g_policy_lock);
     for (int i = 0; i < g_policy_count; i++) {
-        if (strcmp(g_policies[i].mount_path, mount_path) == 0)
-            return &g_policies[i];
+        if (strcmp(g_policies[i].mount_path, mount_path) == 0) {
+            const onvault_vault_policy_t *result = &g_policies[i];
+            pthread_rwlock_unlock(&g_policy_lock);
+            return result;
+        }
     }
+    pthread_rwlock_unlock(&g_policy_lock);
     return NULL;
 }
 
@@ -141,7 +146,8 @@ int onvault_policy_evaluate(const onvault_process_t *process,
     const onvault_vault_policy_t *policy = NULL;
     for (int i = 0; i < g_policy_count; i++) {
         size_t mlen = strlen(g_policies[i].mount_path);
-        if (strncmp(vault_mount_path, g_policies[i].mount_path, mlen) == 0) {
+        if (strncmp(vault_mount_path, g_policies[i].mount_path, mlen) == 0 &&
+            (vault_mount_path[mlen] == '/' || vault_mount_path[mlen] == '\0')) {
             policy = &g_policies[i];
             break;
         }

@@ -30,7 +30,7 @@ ${CYAN}USAGE:${NC}
 ${CYAN}FLAGS:${NC}
     --build,   -b       Build development binaries
     --dist              Build distribution binaries (static linking)
-    --test,    -t       Run full test suite (22 tests)
+    --test,    -t       Run full test suite (23 tests)
     --run,     -r       Build and run daemon in foreground
     --clean,   -c       Remove binaries, object files, test artifacts
     --deps,    -d       Install all build dependencies

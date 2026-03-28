@@ -137,9 +137,14 @@ int onvault_auth_init(const char *passphrase, char *recovery_key_out)
     uint8_t tag[ONVAULT_GCM_TAG_SIZE];
     uint8_t iv[ONVAULT_GCM_IV_SIZE];
 
-    onvault_aes_gcm_encrypt(&config_key, NULL, NULL, 0,
-                            pass_hash, ONVAULT_KEY_SIZE,
-                            encrypted_hash, tag, iv);
+    if (onvault_aes_gcm_encrypt(&config_key, NULL, NULL, 0,
+                                pass_hash, ONVAULT_KEY_SIZE,
+                                encrypted_hash, tag, iv) != ONVAULT_OK) {
+        onvault_key_wipe(&master_key, sizeof(master_key));
+        onvault_key_wipe(&config_key, sizeof(config_key));
+        onvault_memzero(pass_hash, sizeof(pass_hash));
+        return ONVAULT_ERR_CRYPTO;
+    }
 
     /* Write auth blob: [iv(12)] [tag(16)] [encrypted_hash(32)] */
     char auth_path[PATH_MAX];
@@ -167,6 +172,10 @@ int onvault_auth_init(const char *passphrase, char *recovery_key_out)
     onvault_key_wipe(&master_key, sizeof(master_key));
     onvault_key_wipe(&config_key, sizeof(config_key));
     onvault_memzero(pass_hash, sizeof(pass_hash));
+    onvault_memzero(encrypted_hash, sizeof(encrypted_hash));
+    onvault_memzero(auth_blob, sizeof(auth_blob));
+    onvault_memzero(tag, sizeof(tag));
+    onvault_memzero(iv, sizeof(iv));
 
     return ONVAULT_OK;
 }

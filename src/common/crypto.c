@@ -194,6 +194,10 @@ int onvault_aes_gcm_decrypt(const onvault_key_t *key,
     ret = ONVAULT_OK;
 
 cleanup:
+    if (ret != ONVAULT_OK) {
+        /* Wipe partial plaintext written by DecryptUpdate before tag check */
+        onvault_memzero(out, in_len);
+    }
     EVP_CIPHER_CTX_free(ctx);
     return ret;
 }
@@ -253,16 +257,14 @@ int onvault_derive_vault_key(const onvault_key_t *master_key,
     if (!master_key || !vault_id || !vault_key)
         return ONVAULT_ERR_INVALID;
 
-    /* info = "onvault\0vault\0" + vault_id */
+    /* info = "onvault\0vault\0" + vault_id (null bytes are part of the domain separator) */
     char info[256];
-    size_t info_len = (size_t)snprintf(info, sizeof(info),
-                                        "onvault%cvault%c%s",
-                                        '\0', '\0', vault_id);
-    /* snprintf stops at first \0, so build manually */
     memcpy(info, "onvault\0vault\0", 14);
     size_t id_len = strlen(vault_id);
+    if (id_len > sizeof(info) - 14)
+        return ONVAULT_ERR_INVALID;
     memcpy(info + 14, vault_id, id_len);
-    info_len = 14 + id_len;
+    size_t info_len = 14 + id_len;
 
     return onvault_hkdf(NULL, 0,
                         master_key->data, ONVAULT_KEY_SIZE,

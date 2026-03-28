@@ -187,7 +187,8 @@ static int ov_read(const char *path, char *buf, size_t size, off_t offset,
     while (total_read < size) {
         /* Seek to the right ciphertext block */
         uint64_t cipher_offset = sizeof(file_size) + start_block * ONVAULT_BLOCK_SIZE;
-        fseek(f, (long)cipher_offset, SEEK_SET);
+        if (fseeko(f, (off_t)cipher_offset, SEEK_SET) != 0)
+            break;
 
         uint8_t cipherbuf[ONVAULT_BLOCK_SIZE];
         uint8_t plainbuf[ONVAULT_BLOCK_SIZE];
@@ -222,6 +223,11 @@ static int ov_read(const char *path, char *buf, size_t size, off_t offset,
 
     onvault_memzero(&nonce, sizeof(nonce));
     fclose(f);
+
+    /* If decryption failed before reading any bytes, return I/O error */
+    if (total_read == 0 && size > 0 && (uint64_t)offset < file_size)
+        return -EIO;
+
     return (int)total_read;
 }
 
@@ -279,7 +285,7 @@ int onvault_fuse_mount(const char *vault_id,
     char *argv[] = {
         "onvault",
         (char *)mount_dir,
-        "-o", "local,allow_other,auto_unmount,fsname=onvault",
+        "-o", "local,auto_unmount,fsname=onvault",
         "-f",  /* foreground */
         NULL
     };
@@ -322,15 +328,22 @@ int onvault_fuse_unmount(const char *mount_dir)
     if (!mount_dir)
         return ONVAULT_ERR_INVALID;
 
+    /* Validate mount_dir contains no shell-dangerous characters */
+    for (const char *p = mount_dir; *p; p++) {
+        if (*p == '\'' || *p == '`' || *p == '$' || *p == '\\' ||
+            *p == ';' || *p == '|' || *p == '&' || *p == '\n')
+            return ONVAULT_ERR_INVALID;
+    }
+
     /* Use unmount(2) on macOS */
     if (unmount(mount_dir, MNT_FORCE) == 0)
         return ONVAULT_OK;
 
-    /* Fallback to umount command */
-    char cmd[PATH_MAX + 32];
-    snprintf(cmd, sizeof(cmd), "umount '%s' 2>/dev/null", mount_dir);
-    int rc = system(cmd);
-    return (rc == 0) ? ONVAULT_OK : ONVAULT_ERR_IO;
+    /* Fallback: try without force flag */
+    if (unmount(mount_dir, 0) == 0)
+        return ONVAULT_OK;
+
+    return ONVAULT_ERR_IO;
 }
 
 int onvault_fuse_is_mounted(const char *mount_dir)

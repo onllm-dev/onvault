@@ -34,10 +34,13 @@ int onvault_sha256_file(const char *path, onvault_hash_t *hash)
     int err = ferror(f);
     fclose(f);
 
-    if (err)
+    if (err) {
+        memset(buf, 0, sizeof(buf));
         return -1;
+    }
 
     CC_SHA256_Final(hash->data, &ctx);
+    memset(buf, 0, sizeof(buf));
     return 0;
 }
 

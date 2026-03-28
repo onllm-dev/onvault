@@ -8,7 +8,9 @@
 
 #include "types.h"
 
-#define ONVAULT_SOCKET_PATH "/tmp/onvault.sock"
+/* Socket in user's data dir (not /tmp) to avoid TOCTOU and permission issues */
+#define ONVAULT_SOCKET_DIR_FMT "%s/.onvault"
+#define ONVAULT_SOCKET_NAME "onvault.sock"
 #define ONVAULT_IPC_MAX_MSG 4096
 
 /* IPC command types */

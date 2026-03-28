@@ -89,7 +89,12 @@ static void handle_client(int client_fd)
     /* Read payload if any */
     char payload[ONVAULT_IPC_MAX_MSG] = {0};
     if (header.payload_len > 0 && header.payload_len < ONVAULT_IPC_MAX_MSG) {
-        read(client_fd, payload, header.payload_len);
+        ssize_t pn = read(client_fd, payload, header.payload_len);
+        if (pn <= 0) {
+            close(client_fd);
+            return;
+        }
+        payload[pn] = '\0'; /* Ensure null termination */
     }
 
     /* Process command */
@@ -161,13 +166,17 @@ static void handle_client(int client_fd)
     }
 
     case IPC_CMD_LOCK:
-        cleanup();
+        /* Signal main loop to exit — cleanup happens there */
         g_running = 0;
         snprintf(resp_buf, sizeof(resp_buf), "Locked\n");
         resp.payload_len = (uint32_t)strlen(resp_buf);
         break;
 
     case IPC_CMD_ALLOW: {
+        if (!g_master_key_loaded) {
+            resp.status = IPC_RESP_AUTH_REQUIRED;
+            break;
+        }
         /* payload: "process_path\0vault_id" */
         char *sep = memchr(payload, '\0', header.payload_len);
         if (sep && sep < payload + header.payload_len - 1) {

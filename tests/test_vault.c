@@ -20,6 +20,8 @@
 #include "hash.h"
 #include "memwipe.h"
 #include "config.h"
+#include "log.h"
+#include "../auth/auth.h"
 #include "../fuse/encrypt.h"
 #include "../esf/policy.h"
 
@@ -27,6 +29,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
 #include <sys/stat.h>
 
 static int tests_run = 0;
@@ -332,6 +335,76 @@ static int test_config_encrypt_decrypt(void)
     return ok;
 }
 
+/* --- Encrypted audit log --- */
+
+static int test_encrypted_log(void)
+{
+    /* Clean up stale log files from previous test runs */
+    char data_dir_pre[PATH_MAX];
+    if (onvault_get_data_dir(data_dir_pre) == ONVAULT_OK) {
+        char log_dir_pre[PATH_MAX];
+        snprintf(log_dir_pre, PATH_MAX, "%s/logs", data_dir_pre);
+        cleanup_path(log_dir_pre);
+    }
+
+    onvault_key_t log_key;
+    onvault_random_bytes(log_key.data, ONVAULT_KEY_SIZE);
+
+    if (onvault_log_init(&log_key) != ONVAULT_OK)
+        return 0;
+
+    /* Write some log entries */
+    onvault_log_write(LOG_ACCESS_ALLOWED, "ssh", "/usr/bin/ssh", 1234,
+                       "/home/user/.ssh/id_rsa", "test allowed");
+    onvault_log_write(LOG_ACCESS_DENIED, "ssh", "/usr/bin/python3", 5678,
+                       "/home/user/.ssh/id_rsa", "test denied");
+    onvault_log_write(LOG_VAULT_MOUNTED, "aws", NULL, 0, NULL, "mounted");
+
+    /* Read all entries back */
+    char buf[8192];
+    size_t buf_len = sizeof(buf);
+    if (onvault_log_read(buf, &buf_len, 0, 0) != ONVAULT_OK)
+        return 0;
+
+    /* Should have all 3 entries */
+    if (buf_len == 0)
+        return 0;
+
+    /* Check that entries contain expected content */
+    buf[buf_len] = '\0';
+    if (strstr(buf, "\"ALLOWED\"") == NULL)
+        return 0;
+    if (strstr(buf, "\"DENIED\"") == NULL)
+        return 0;
+    if (strstr(buf, "\"MOUNTED\"") == NULL)
+        return 0;
+
+    /* Read denied-only entries */
+    buf_len = sizeof(buf);
+    if (onvault_log_read(buf, &buf_len, 0, 1) != ONVAULT_OK)
+        return 0;
+
+    buf[buf_len] = '\0';
+    if (strstr(buf, "\"DENIED\"") == NULL)
+        return 0;
+    /* Should NOT contain ALLOWED entries */
+    if (strstr(buf, "\"ALLOWED\"") != NULL)
+        return 0;
+
+    onvault_log_close();
+    onvault_memzero(log_key.data, ONVAULT_KEY_SIZE);
+
+    /* Clean up log files created during test */
+    char data_dir[PATH_MAX];
+    if (onvault_get_data_dir(data_dir) == ONVAULT_OK) {
+        char log_dir[PATH_MAX];
+        snprintf(log_dir, PATH_MAX, "%s/logs", data_dir);
+        cleanup_path(log_dir);
+    }
+
+    return 1;
+}
+
 /* --- Full pipeline: key hierarchy → encrypt → decrypt --- */
 
 static int test_full_pipeline(void)
@@ -428,6 +501,9 @@ int main(void)
 
     printf("\nEncrypted config:\n");
     TEST(config_encrypt_decrypt);
+
+    printf("\nEncrypted logging:\n");
+    TEST(encrypted_log);
 
     printf("\nFull pipeline:\n");
     TEST(full_pipeline);

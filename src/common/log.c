@@ -10,6 +10,7 @@
 #include "../auth/auth.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <sys/stat.h>
@@ -82,20 +83,46 @@ int onvault_log_write(onvault_log_event_t event,
         detail ? detail : ""
     );
 
-    /* Append to daily log file */
+    /* Encrypt and append to daily log file */
     char date_str[16];
     strftime(date_str, sizeof(date_str), "%Y%m%d", tm);
 
     char log_path[PATH_MAX];
-    snprintf(log_path, PATH_MAX, "%s/%s.log", g_log_dir, date_str);
+    snprintf(log_path, PATH_MAX, "%s/%s.log.enc", g_log_dir, date_str);
 
-    FILE *f = fopen(log_path, "a");
-    if (!f)
+    /* Encrypt the log entry with the log key (AES-256-GCM) */
+    uint8_t *ciphertext = malloc((size_t)len);
+    if (!ciphertext)
+        return ONVAULT_ERR_MEMORY;
+
+    uint8_t iv[ONVAULT_GCM_IV_SIZE];
+    uint8_t tag[ONVAULT_GCM_TAG_SIZE];
+
+    int enc_rc = onvault_aes_gcm_encrypt(&g_log_key, NULL, NULL, 0,
+                                          (const uint8_t *)entry, (size_t)len,
+                                          ciphertext, tag, iv);
+    if (enc_rc != ONVAULT_OK) {
+        free(ciphertext);
+        return enc_rc;
+    }
+
+    /* Write encrypted entry: [entry_len(4)] [iv(12)] [tag(16)] [ciphertext(N)] */
+    FILE *f = fopen(log_path, "ab");
+    if (!f) {
+        free(ciphertext);
         return ONVAULT_ERR_IO;
+    }
 
-    fwrite(entry, 1, (size_t)len, f);
+    uint32_t entry_len = (uint32_t)len;
+    fwrite(&entry_len, sizeof(entry_len), 1, f);
+    fwrite(iv, 1, ONVAULT_GCM_IV_SIZE, f);
+    fwrite(tag, 1, ONVAULT_GCM_TAG_SIZE, f);
+    fwrite(ciphertext, 1, (size_t)len, f);
     fclose(f);
     chmod(log_path, 0600);
+
+    onvault_memzero(ciphertext, (size_t)len);
+    free(ciphertext);
 
     return ONVAULT_OK;
 }
@@ -106,16 +133,16 @@ int onvault_log_read(char *buf, size_t *buf_len,
     if (!buf || !buf_len)
         return ONVAULT_ERR_INVALID;
 
-    /* Read today's log */
+    /* Read today's encrypted log */
     time_t now = time(NULL);
     struct tm *tm = localtime(&now);
     char date_str[16];
     strftime(date_str, sizeof(date_str), "%Y%m%d", tm);
 
     char log_path[PATH_MAX];
-    snprintf(log_path, PATH_MAX, "%s/%s.log", g_log_dir, date_str);
+    snprintf(log_path, PATH_MAX, "%s/%s.log.enc", g_log_dir, date_str);
 
-    FILE *f = fopen(log_path, "r");
+    FILE *f = fopen(log_path, "rb");
     if (!f) {
         *buf_len = 0;
         return ONVAULT_OK; /* No logs yet */
@@ -123,21 +150,67 @@ int onvault_log_read(char *buf, size_t *buf_len,
 
     size_t offset = 0;
     int entries = 0;
-    char line[2048];
 
-    while (fgets(line, sizeof(line), f) != NULL) {
+    while (!feof(f)) {
         if (max_entries > 0 && entries >= max_entries)
             break;
 
-        if (denied_only && strstr(line, "\"DENIED\"") == NULL)
-            continue;
+        /* Read entry header: [entry_len(4)] [iv(12)] [tag(16)] [ciphertext(N)] */
+        uint32_t entry_len;
+        if (fread(&entry_len, sizeof(entry_len), 1, f) != 1)
+            break;
 
-        size_t line_len = strlen(line);
-        if (offset + line_len < *buf_len) {
-            memcpy(buf + offset, line, line_len);
-            offset += line_len;
+        if (entry_len > 4096) /* Sanity check */
+            break;
+
+        uint8_t iv[ONVAULT_GCM_IV_SIZE];
+        uint8_t tag[ONVAULT_GCM_TAG_SIZE];
+
+        if (fread(iv, 1, ONVAULT_GCM_IV_SIZE, f) != ONVAULT_GCM_IV_SIZE)
+            break;
+        if (fread(tag, 1, ONVAULT_GCM_TAG_SIZE, f) != ONVAULT_GCM_TAG_SIZE)
+            break;
+
+        uint8_t *ciphertext = malloc(entry_len);
+        if (!ciphertext)
+            break;
+
+        if (fread(ciphertext, 1, entry_len, f) != entry_len) {
+            free(ciphertext);
+            break;
+        }
+
+        /* Decrypt */
+        char *plaintext = malloc(entry_len + 1);
+        if (!plaintext) {
+            free(ciphertext);
+            break;
+        }
+
+        int rc = onvault_aes_gcm_decrypt(&g_log_key, iv, NULL, 0,
+                                           ciphertext, entry_len,
+                                           (uint8_t *)plaintext, tag);
+        free(ciphertext);
+
+        if (rc != ONVAULT_OK) {
+            free(plaintext);
+            break;
+        }
+
+        plaintext[entry_len] = '\0';
+
+        if (denied_only && strstr(plaintext, "\"DENIED\"") == NULL) {
+            free(plaintext);
+            continue;
+        }
+
+        if (offset + entry_len < *buf_len) {
+            memcpy(buf + offset, plaintext, entry_len);
+            offset += entry_len;
             entries++;
         }
+
+        free(plaintext);
     }
 
     fclose(f);

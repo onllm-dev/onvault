@@ -83,8 +83,11 @@ int onvault_config_read(const char *path,
     uint8_t iv[ONVAULT_GCM_IV_SIZE];
     uint8_t tag[ONVAULT_GCM_TAG_SIZE];
 
-    fread(iv, 1, ONVAULT_GCM_IV_SIZE, f);
-    fread(tag, 1, ONVAULT_GCM_TAG_SIZE, f);
+    if (fread(iv, 1, ONVAULT_GCM_IV_SIZE, f) != ONVAULT_GCM_IV_SIZE ||
+        fread(tag, 1, ONVAULT_GCM_TAG_SIZE, f) != ONVAULT_GCM_TAG_SIZE) {
+        fclose(f);
+        return ONVAULT_ERR_IO;
+    }
 
     uint8_t *ciphertext = malloc(cipher_len);
     if (!ciphertext) {
@@ -92,7 +95,11 @@ int onvault_config_read(const char *path,
         return ONVAULT_ERR_MEMORY;
     }
 
-    fread(ciphertext, 1, cipher_len, f);
+    if (fread(ciphertext, 1, cipher_len, f) != cipher_len) {
+        free(ciphertext);
+        fclose(f);
+        return ONVAULT_ERR_IO;
+    }
     fclose(f);
 
     int rc = onvault_aes_gcm_decrypt(config_key, iv, NULL, 0,

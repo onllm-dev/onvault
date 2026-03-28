@@ -5,12 +5,23 @@
 
 #include "ipc.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/stat.h>
 #include <errno.h>
+
+/* Resolve socket path: ~/.onvault/onvault.sock */
+static void get_socket_path(char *out, size_t len)
+{
+    const char *home = getenv("HOME");
+    if (home)
+        snprintf(out, len, "%s/.onvault/%s", home, ONVAULT_SOCKET_NAME);
+    else
+        snprintf(out, len, "/tmp/%s", ONVAULT_SOCKET_NAME);
+}
 
 /* --- Client side (CLI → daemon) --- */
 
@@ -22,10 +33,13 @@ int onvault_ipc_send(onvault_ipc_cmd_t cmd,
     if (sock < 0)
         return ONVAULT_ERR_IO;
 
+    char sock_path[PATH_MAX];
+    get_socket_path(sock_path, sizeof(sock_path));
+
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    strlcpy(addr.sun_path, ONVAULT_SOCKET_PATH, sizeof(addr.sun_path));
+    strlcpy(addr.sun_path, sock_path, sizeof(addr.sun_path));
 
     if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         close(sock);
@@ -84,9 +98,12 @@ int onvault_ipc_send(onvault_ipc_cmd_t cmd,
 
 static int g_server_sock = -1;
 
+static char g_socket_path[PATH_MAX] = {0};
+
 int onvault_ipc_server_start(void)
 {
-    unlink(ONVAULT_SOCKET_PATH);
+    get_socket_path(g_socket_path, sizeof(g_socket_path));
+    unlink(g_socket_path);
 
     g_server_sock = socket(AF_UNIX, SOCK_STREAM, 0);
     if (g_server_sock < 0)
@@ -95,16 +112,18 @@ int onvault_ipc_server_start(void)
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    strlcpy(addr.sun_path, ONVAULT_SOCKET_PATH, sizeof(addr.sun_path));
+    strlcpy(addr.sun_path, g_socket_path, sizeof(addr.sun_path));
 
-    if (bind(g_server_sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+    /* Set restrictive umask before bind to avoid TOCTOU window */
+    mode_t old_mask = umask(0177);
+    int bind_rc = bind(g_server_sock, (struct sockaddr *)&addr, sizeof(addr));
+    umask(old_mask);
+
+    if (bind_rc != 0) {
         close(g_server_sock);
         g_server_sock = -1;
         return ONVAULT_ERR_IO;
     }
-
-    /* Restrict socket permissions */
-    chmod(ONVAULT_SOCKET_PATH, 0600);
 
     if (listen(g_server_sock, 5) != 0) {
         close(g_server_sock);
@@ -126,5 +145,6 @@ void onvault_ipc_server_stop(void)
         close(g_server_sock);
         g_server_sock = -1;
     }
-    unlink(ONVAULT_SOCKET_PATH);
+    if (g_socket_path[0] != '\0')
+        unlink(g_socket_path);
 }

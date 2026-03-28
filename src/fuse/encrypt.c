@@ -9,6 +9,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 #include <sys/xattr.h>
 #include <sys/stat.h>
 #include <errno.h>
@@ -190,8 +191,10 @@ int onvault_file_encrypt(const onvault_key_t *vault_key,
     fclose(fin);
     fclose(fout);
 
-    if (rc != ONVAULT_OK)
+    if (rc != ONVAULT_OK) {
+        unlink(ciphertext_path); /* Remove partial ciphertext on failure */
         return rc;
+    }
 
     /* Store nonce in xattr after file is written */
     rc = onvault_file_nonce_store(ciphertext_path, &nonce);

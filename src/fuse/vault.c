@@ -18,6 +18,26 @@
 #include <libgen.h>
 #include <errno.h>
 
+/* Validate vault_id contains only safe characters (no path traversal) */
+static int validate_vault_id(const char *vault_id)
+{
+    if (!vault_id || vault_id[0] == '\0')
+        return 0;
+    for (const char *p = vault_id; *p; p++) {
+        /* Allow alphanumeric, underscore, hyphen, dot (but not leading/double dots) */
+        if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+            (*p >= '0' && *p <= '9') || *p == '_' || *p == '-')
+            continue;
+        if (*p == '.' && p > vault_id && *(p - 1) != '.')
+            continue; /* Allow single dots, not leading or double */
+        return 0;
+    }
+    /* Reject ".." anywhere */
+    if (strstr(vault_id, "..") != NULL)
+        return 0;
+    return 1;
+}
+
 void onvault_vault_id_from_path(const char *source_path, char *vault_id, size_t len)
 {
     /* Extract last component, strip leading dot */
@@ -217,6 +237,10 @@ int onvault_vault_add(const onvault_key_t *master_key,
     } else {
         onvault_vault_id_from_path(resolved, vault_id, sizeof(vault_id));
     }
+
+    /* Validate vault_id to prevent path traversal */
+    if (!validate_vault_id(vault_id))
+        return ONVAULT_ERR_INVALID;
 
     /* Get paths */
     char vault_dir[PATH_MAX], mount_dir[PATH_MAX];
