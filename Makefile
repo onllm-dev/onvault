@@ -39,6 +39,11 @@ LDFLAGS += -L$(ARGON2_DIR)/lib -largon2
 LDFLAGS += -framework Security
 LDFLAGS += -framework Foundation
 
+# Test linking (no Security/Foundation — uses in-memory keystore stub)
+TEST_LDFLAGS  = -L$(OPENSSL_DIR)/lib -lcrypto
+TEST_LDFLAGS += -L$(ARGON2_DIR)/lib -largon2
+TEST_LDFLAGS += $(SYSROOT_FLAG)
+
 # Static linking (distribution) — no Homebrew needed by end users
 STATIC_LDFLAGS  = $(OPENSSL_DIR)/lib/libcrypto.a
 STATIC_LDFLAGS += $(ARGON2_DIR)/lib/libargon2.a
@@ -54,10 +59,12 @@ LDFLAGS_GUI += -framework LocalAuthentication
 MACOS_SDK := $(shell for sdk in /Library/Developer/CommandLineTools/SDKs/MacOSX26*.sdk /Library/Developer/CommandLineTools/SDKs/MacOSX15*.sdk; do \
 	[ -f "$$sdk/usr/lib/libEndpointSecurity.tbd" ] && echo "$$sdk" && break; \
 done 2>/dev/null)
+SYSROOT_FLAG =
 ifdef MACOS_SDK
-CFLAGS    += -isysroot $(MACOS_SDK)
-OBJCFLAGS += -isysroot $(MACOS_SDK)
-LDFLAGS   += -isysroot $(MACOS_SDK)
+SYSROOT_FLAG = -isysroot $(MACOS_SDK)
+CFLAGS      += $(SYSROOT_FLAG)
+OBJCFLAGS   += $(SYSROOT_FLAG)
+LDFLAGS     += $(SYSROOT_FLAG)
 endif
 ESF_TBD := $(if $(MACOS_SDK),$(shell test -f "$(MACOS_SDK)/usr/lib/libEndpointSecurity.tbd" && echo 1 || echo 0),0)
 LDFLAGS_ESF  = $(LDFLAGS)
@@ -137,13 +144,18 @@ $(DAEMON_BIN): src/daemon/onvaultd.c $(ALL_C_OBJ) $(KEYSTORE_OBJ) $(ESF_M_OBJ) $
 	$(CC) $(OBJCFLAGS) $(INCLUDES) -o $@ $^ $(LDFLAGS_GUI) $(LDFLAGS_ESF) $(FUSE_LDFLAGS)
 
 TEST_VAULT_BIN = tests/test_vault
+TEST_KEYSTORE_STUB = tests/keystore_stub.o
 
-# Test binaries
-$(TEST_BIN): tests/test_crypto.c $(COMMON_OBJ) $(AUTH_OBJ) $(KEYSTORE_OBJ)
-	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^ $(LDFLAGS)
+# Test keystore stub (in-memory, no Keychain popups)
+$(TEST_KEYSTORE_STUB): tests/keystore_stub.c
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
-$(TEST_VAULT_BIN): tests/test_vault.c $(COMMON_OBJ) $(FUSE_OBJ) $(ESF_C_OBJ) $(AUTH_OBJ) $(KEYSTORE_OBJ)
-	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^ $(LDFLAGS) $(FUSE_LDFLAGS)
+# Test binaries (use stub keystore — no Keychain/iCloud access)
+$(TEST_BIN): tests/test_crypto.c $(COMMON_OBJ) $(AUTH_OBJ) $(TEST_KEYSTORE_STUB)
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^ $(TEST_LDFLAGS)
+
+$(TEST_VAULT_BIN): tests/test_vault.c $(COMMON_OBJ) $(FUSE_OBJ) $(ESF_C_OBJ) $(AUTH_OBJ) $(TEST_KEYSTORE_STUB)
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^ $(TEST_LDFLAGS) $(FUSE_LDFLAGS)
 
 # Run tests
 test: $(TEST_BIN) $(TEST_VAULT_BIN)
