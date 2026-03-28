@@ -8,7 +8,6 @@
 :root {
     color-scheme: dark;
     --bg: #0d0d0d;
-    --panel: rgba(18, 18, 18, 0.98);
     --card: rgba(26, 26, 26, 0.96);
     --card-hover: rgba(34, 34, 34, 0.98);
     --border: rgba(255, 255, 255, 0.08);
@@ -29,157 +28,63 @@
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body {
     font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui, sans-serif;
-    background: var(--bg);
-    color: var(--text);
-    width: 300px;
-    min-height: 200px;
-    font-size: 12px;
+    background: var(--bg); color: var(--text);
+    width: 300px; font-size: 12px;
     -webkit-font-smoothing: antialiased;
-    overflow-x: hidden;
+    overflow: hidden;
 }
-
-/* Header */
 .header {
     display: flex; align-items: center; justify-content: space-between;
-    padding: 14px 16px 10px;
-    border-bottom: 1px solid var(--border);
+    padding: 14px 16px 10px; border-bottom: 1px solid var(--border);
 }
-.header .logo {
-    display: flex; align-items: center; gap: 8px;
-    font-weight: 600; font-size: 13px;
-}
+.header .logo { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 13px; }
 .header .logo svg { width: 18px; height: 18px; }
-.status-badge {
-    font-size: 10px; padding: 3px 8px; border-radius: 20px;
-    font-weight: 500;
-}
-.status-badge.locked { background: var(--red-dim); color: var(--red); }
-.status-badge.unlocked { background: var(--green-dim); color: var(--green); }
-
-/* Section */
-.section { padding: 8px 12px; }
-.section-title {
-    font-size: 10px; font-weight: 600; text-transform: uppercase;
-    letter-spacing: 0.5px; color: var(--text-muted); padding: 4px 4px 6px;
-}
-
-/* Vault cards */
-.vault-card {
-    background: var(--card); border-radius: var(--radius);
-    padding: 10px 12px; margin-bottom: 6px;
-    border: 1px solid var(--border);
-    cursor: pointer; transition: background 0.15s;
-}
+.badge { font-size: 10px; padding: 3px 8px; border-radius: 20px; font-weight: 500; }
+.badge.locked { background: var(--red-dim); color: var(--red); }
+.badge.unlocked { background: var(--green-dim); color: var(--green); }
+.section { padding: 8px 12px 4px; }
+.section-title { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); padding: 4px 4px 6px; }
+.vault-card { background: var(--card); border-radius: var(--radius); padding: 10px 12px; margin-bottom: 6px; border: 1px solid var(--border); cursor: pointer; transition: background 0.15s; }
 .vault-card:hover { background: var(--card-hover); }
-.vault-card .vault-row {
-    display: flex; align-items: center; justify-content: space-between;
-}
-.vault-card .vault-name {
-    font-weight: 600; font-size: 12px;
-    display: flex; align-items: center; gap: 6px;
-}
-.vault-card .vault-name .icon { font-size: 14px; }
-.vault-card .vault-source {
-    font-size: 10px; color: var(--text-muted); margin-top: 2px;
-    font-family: 'SF Mono', Menlo, monospace;
-}
-.vault-card .vault-status {
-    font-size: 10px; padding: 2px 6px; border-radius: 4px; font-weight: 500;
-}
-.vault-card .vault-status.mounted { background: var(--green-dim); color: var(--green); }
-.vault-card .vault-status.locked { background: var(--red-dim); color: var(--red); }
-
-/* Vault detail panel (hidden by default) */
-.vault-detail {
-    display: none; margin-top: 8px; padding-top: 8px;
-    border-top: 1px solid var(--border);
-}
-.vault-card.expanded .vault-detail { display: block; }
-.vault-actions {
-    display: flex; gap: 4px; flex-wrap: wrap;
-}
-.vault-actions button {
-    font-size: 10px; padding: 4px 10px; border-radius: var(--radius-sm);
-    border: 1px solid var(--border); background: transparent;
-    color: var(--text-soft); cursor: pointer; transition: all 0.15s;
-    font-family: inherit;
-}
-.vault-actions button:hover {
-    background: var(--blue-dim); color: var(--blue); border-color: rgba(59, 130, 246, 0.3);
-}
-.vault-actions button.danger:hover {
-    background: var(--red-dim); color: var(--red); border-color: rgba(239, 68, 68, 0.3);
-}
-
-/* Denial cards */
-.denial-card {
-    background: var(--card); border-radius: var(--radius-sm);
-    padding: 8px 10px; margin-bottom: 4px;
-    border: 1px solid var(--border); font-size: 11px;
-    display: flex; align-items: center; justify-content: space-between;
-}
+.vault-row { display: flex; align-items: center; justify-content: space-between; }
+.vault-name { font-weight: 600; font-size: 12px; display: flex; align-items: center; gap: 6px; }
+.vault-name .icon { font-size: 14px; }
+.vault-source { font-size: 10px; color: var(--text-muted); margin-top: 2px; font-family: 'SF Mono', Menlo, monospace; }
+.vault-status { font-size: 10px; padding: 2px 6px; border-radius: 4px; font-weight: 500; }
+.vault-status.mounted { background: var(--green-dim); color: var(--green); }
+.vault-status.locked { background: var(--red-dim); color: var(--red); }
+.vault-detail { display: none; }
+.vault-card.expanded .vault-detail { display: block; padding-top: 8px; margin-top: 8px; border-top: 1px solid var(--border); }
+.vault-actions { display: flex; gap: 4px; flex-wrap: wrap; }
+.vault-actions button { font-size: 10px; padding: 4px 10px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: transparent; color: var(--text-soft); cursor: pointer; transition: all 0.15s; font-family: inherit; }
+.vault-actions button:hover { background: var(--blue-dim); color: var(--blue); border-color: rgba(59, 130, 246, 0.3); }
+.vault-actions button.danger:hover { background: var(--red-dim); color: var(--red); border-color: rgba(239, 68, 68, 0.3); }
+.denial-card { background: var(--card); border-radius: var(--radius-sm); padding: 8px 10px; margin-bottom: 4px; border: 1px solid var(--border); font-size: 11px; display: flex; align-items: center; justify-content: space-between; }
 .denial-info { flex: 1; }
 .denial-proc { font-weight: 600; color: var(--orange); }
 .denial-file { font-size: 10px; color: var(--text-muted); font-family: 'SF Mono', Menlo, monospace; }
 .denial-time { font-size: 9px; color: var(--text-muted); white-space: nowrap; margin-left: 8px; }
-.denial-allow {
-    font-size: 9px; padding: 2px 6px; border-radius: 4px;
-    border: 1px solid rgba(34, 197, 94, 0.3); background: var(--green-dim);
-    color: var(--green); cursor: pointer; margin-left: 6px; font-family: inherit;
-}
-
-/* Empty state */
-.empty {
-    text-align: center; padding: 16px; color: var(--text-muted); font-size: 11px;
-}
-
-/* Action buttons */
-.action-bar {
-    display: flex; gap: 6px; padding: 8px 12px;
-    border-top: 1px solid var(--border);
-}
-.action-bar button {
-    flex: 1; padding: 8px; border-radius: var(--radius-sm);
-    border: 1px solid var(--border); background: var(--card);
-    color: var(--text-soft); cursor: pointer; font-size: 11px;
-    font-weight: 500; transition: all 0.15s; font-family: inherit;
-}
-.action-bar button:hover {
-    background: var(--card-hover); color: var(--text);
-}
-.action-bar button.primary {
-    background: var(--blue-dim); color: var(--blue);
-    border-color: rgba(59, 130, 246, 0.25);
-}
-.action-bar button.primary:hover {
-    background: rgba(59, 130, 246, 0.2); border-color: rgba(59, 130, 246, 0.4);
-}
-
-/* Footer */
-.footer {
-    display: flex; align-items: center; justify-content: space-between;
-    padding: 8px 16px; border-top: 1px solid var(--border);
-    font-size: 10px; color: var(--text-muted);
-}
-.footer a { color: var(--text-muted); text-decoration: none; }
-.footer a:hover { color: var(--text-soft); }
-
-/* Refresh spinner */
+.denial-allow { font-size: 9px; padding: 2px 6px; border-radius: 4px; border: 1px solid rgba(34, 197, 94, 0.3); background: var(--green-dim); color: var(--green); cursor: pointer; margin-left: 6px; font-family: inherit; }
+.action-bar { display: flex; gap: 6px; padding: 8px 12px; border-top: 1px solid var(--border); }
+.action-bar button { flex: 1; padding: 8px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: var(--card); color: var(--text-soft); cursor: pointer; font-size: 11px; font-weight: 500; transition: all 0.15s; font-family: inherit; }
+.action-bar button:hover { background: var(--card-hover); color: var(--text); }
+.action-bar button.primary { background: var(--blue-dim); color: var(--blue); border-color: rgba(59, 130, 246, 0.25); }
+.action-bar button.primary:hover { background: rgba(59, 130, 246, 0.2); border-color: rgba(59, 130, 246, 0.4); }
+.footer { display: flex; align-items: center; justify-content: space-between; padding: 8px 16px; border-top: 1px solid var(--border); font-size: 10px; color: var(--text-muted); }
 @keyframes spin { to { transform: rotate(360deg); } }
 .spinning { animation: spin 1s linear infinite; display: inline-block; }
-
-/* No vaults state */
-.add-vault-prompt {
-    text-align: center; padding: 20px 16px;
-}
-.add-vault-prompt .icon { font-size: 28px; margin-bottom: 8px; }
-.add-vault-prompt p { color: var(--text-muted); margin-bottom: 12px; font-size: 11px; }
-.add-vault-prompt button {
-    padding: 8px 20px; border-radius: var(--radius-sm);
-    background: var(--green-dim); color: var(--green);
-    border: 1px solid rgba(34, 197, 94, 0.3);
-    cursor: pointer; font-size: 12px; font-weight: 500; font-family: inherit;
-}
+.empty-state { text-align: center; padding: 20px 16px; }
+.empty-state .icon { font-size: 28px; margin-bottom: 8px; }
+.empty-state p { color: var(--text-muted); margin-bottom: 4px; font-size: 11px; }
+/* Toast notification (replaces browser alerts) */
+.toast { position: fixed; bottom: 40px; left: 50%; transform: translateX(-50%); background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px 16px; font-size: 11px; color: var(--green); opacity: 0; transition: opacity 0.3s; pointer-events: none; z-index: 100; white-space: nowrap; }
+.toast.show { opacity: 1; }
+.toast.error { color: var(--red); }
+/* Input row for inline allow/deny */
+.input-row { display: flex; gap: 4px; margin-top: 6px; }
+.input-row input { flex: 1; padding: 4px 8px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: rgba(0,0,0,0.3); color: var(--text); font-size: 10px; font-family: 'SF Mono', Menlo, monospace; outline: none; }
+.input-row input:focus { border-color: rgba(59, 130, 246, 0.5); }
+.input-row button { padding: 4px 8px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: var(--green-dim); color: var(--green); font-size: 10px; cursor: pointer; font-family: inherit; }
 </style>
 </head>
 <body>
@@ -192,7 +97,7 @@ body {
         </svg>
         onvault
     </div>
-    <span class="status-badge locked" id="statusBadge">Locked</span>
+    <span class="badge locked" id="statusBadge">Locked</span>
 </div>
 
 <div id="vaultSection" class="section">
@@ -206,29 +111,40 @@ body {
 </div>
 
 <div class="action-bar">
-    <button class="primary" onclick="addVault()">+ Add Vault</button>
+    <button class="primary" onclick="copyCmd('onvault vault add &lt;path&gt; --smart')">+ Add Vault</button>
     <button onclick="viewPolicies()">Policies</button>
     <button onclick="refresh()" id="refreshBtn">Refresh</button>
 </div>
 
 <div class="footer">
     <span>onvault 0.1.0</span>
-    <span id="lastUpdate">—</span>
+    <span id="lastUpdate"></span>
 </div>
+
+<div class="toast" id="toast"></div>
 
 <script>
 const API = window.location.origin;
 let data = { locked: true, vault_count: 0, vaults: [] };
 let denials = [];
+let expandedVaults = new Set();
+
+function toast(msg, isError) {
+    const t = document.getElementById('toast');
+    t.textContent = msg;
+    t.className = 'toast show' + (isError ? ' error' : '');
+    setTimeout(() => { t.className = 'toast'; }, 2500);
+}
+
+function copyCmd(cmd) {
+    navigator.clipboard.writeText(cmd).then(() => toast('Copied: ' + cmd)).catch(() => toast(cmd));
+}
 
 async function fetchData() {
     try {
-        const [statusRes, denialsRes] = await Promise.all([
-            fetch(API + '/api/status'),
-            fetch(API + '/api/denials')
-        ]);
-        data = await statusRes.json();
-        denials = await denialsRes.json();
+        const [s, d] = await Promise.all([fetch(API + '/api/status'), fetch(API + '/api/denials')]);
+        data = await s.json();
+        denials = await d.json();
     } catch (e) {
         data = { locked: true, vault_count: 0, vaults: [] };
         denials = [];
@@ -237,99 +153,119 @@ async function fetchData() {
 }
 
 function timeAgo(ts) {
-    const secs = Math.floor(Date.now() / 1000) - ts;
-    if (secs < 60) return secs + 's ago';
-    if (secs < 3600) return Math.floor(secs / 60) + 'm ago';
-    return Math.floor(secs / 3600) + 'h ago';
+    const s = Math.floor(Date.now() / 1000) - ts;
+    if (s < 60) return s + 's';
+    if (s < 3600) return Math.floor(s / 60) + 'm';
+    return Math.floor(s / 3600) + 'h';
 }
 
 function render() {
-    // Status badge
     const badge = document.getElementById('statusBadge');
-    if (data.locked) {
-        badge.className = 'status-badge locked';
-        badge.textContent = 'Locked';
-    } else {
-        badge.className = 'status-badge unlocked';
-        badge.textContent = data.vault_count + ' vault(s)';
-    }
+    badge.className = 'badge ' + (data.locked ? 'locked' : 'unlocked');
+    badge.textContent = data.locked ? 'Locked' : data.vault_count + ' vault(s)';
 
-    // Vaults
-    const vaultList = document.getElementById('vaultList');
+    const vl = document.getElementById('vaultList');
     if (data.vaults.length === 0) {
-        vaultList.innerHTML = '<div class="add-vault-prompt">' +
-            '<div class="icon">🔒</div>' +
-            '<p>No vaults configured yet.<br>Protect your first directory.</p>' +
-            '</div>';
+        vl.innerHTML = '<div class="empty-state"><div class="icon">' + (data.locked ? '🔒' : '🛡️') + '</div>' +
+            '<p>' + (data.locked ? 'Locked. Run onvault unlock.' : 'No vaults yet.') + '</p></div>';
     } else {
-        vaultList.innerHTML = data.vaults.map(v =>
-            '<div class="vault-card" onclick="toggleVault(this)">' +
-                '<div class="vault-row">' +
-                    '<div class="vault-name">' +
-                        '<span class="icon">' + (v.mounted ? '🔓' : '🔒') + '</span>' +
-                        v.id +
-                    '</div>' +
-                    '<span class="vault-status ' + (v.mounted ? 'mounted' : 'locked') + '">' +
-                        (v.mounted ? 'Active' : 'Locked') +
-                    '</span>' +
-                '</div>' +
+        vl.innerHTML = data.vaults.map(v => {
+            const exp = expandedVaults.has(v.id) ? ' expanded' : '';
+            return '<div class="vault-card' + exp + '" onclick="toggle(\'' + v.id + '\')">' +
+                '<div class="vault-row"><div class="vault-name"><span class="icon">' +
+                (v.mounted ? '🔓' : '🔒') + '</span>' + v.id + '</div>' +
+                '<span class="vault-status ' + (v.mounted ? 'mounted' : 'locked') + '">' +
+                (v.mounted ? 'Active' : 'Locked') + '</span></div>' +
                 '<div class="vault-source">' + v.source + '</div>' +
                 '<div class="vault-detail">' +
-                    '<div class="vault-actions">' +
-                        '<button onclick="event.stopPropagation();viewRules(\'' + v.id + '\')">View Rules</button>' +
-                        '<button onclick="event.stopPropagation();allowProcess(\'' + v.id + '\')">Allow Process</button>' +
-                        '<button onclick="event.stopPropagation();denyProcess(\'' + v.id + '\')">Deny Process</button>' +
-                        '<button class="danger" onclick="event.stopPropagation();removeVault(\'' + v.id + '\')">Remove</button>' +
-                    '</div>' +
+                '<div class="vault-actions">' +
+                '<button onclick="event.stopPropagation();copyCmd(\'onvault rules ' + v.id + '\')">Rules</button>' +
+                '<button onclick="event.stopPropagation();showAllow(\'' + v.id + '\')">Allow</button>' +
+                '<button onclick="event.stopPropagation();showDeny(\'' + v.id + '\')">Deny</button>' +
+                '<button class="danger" onclick="event.stopPropagation();copyCmd(\'onvault vault remove ' + v.id + '\')">Remove</button>' +
                 '</div>' +
-            '</div>'
-        ).join('');
+                '<div class="input-row" id="allow-' + v.id + '" style="display:none">' +
+                '<input placeholder="/usr/bin/process" id="allow-input-' + v.id + '">' +
+                '<button onclick="event.stopPropagation();doAllow(\'' + v.id + '\')">Allow</button>' +
+                '</div>' +
+                '<div class="input-row" id="deny-' + v.id + '" style="display:none">' +
+                '<input placeholder="/usr/bin/process" id="deny-input-' + v.id + '">' +
+                '<button onclick="event.stopPropagation();doDeny(\'' + v.id + '\')">Deny</button>' +
+                '</div>' +
+                '</div></div>';
+        }).join('');
     }
 
-    // Denials
-    const denialSection = document.getElementById('denialSection');
-    const denialList = document.getElementById('denialList');
+    const ds = document.getElementById('denialSection');
+    const dl = document.getElementById('denialList');
     if (denials.length > 0) {
-        denialSection.style.display = 'block';
-        denialList.innerHTML = denials.slice(-5).reverse().map(d =>
-            '<div class="denial-card">' +
-                '<div class="denial-info">' +
-                    '<span class="denial-proc">' + d.process + '</span>' +
-                    ' → ' + d.vault +
-                    '<div class="denial-file">' + d.file + '</div>' +
-                '</div>' +
-                '<span class="denial-time">' + timeAgo(d.time) + '</span>' +
-                '<button class="denial-allow" onclick="allowDenied(\'' + d.path + '\',\'' + d.vault + '\')">Allow</button>' +
+        ds.style.display = 'block';
+        dl.innerHTML = denials.slice(-5).reverse().map(d =>
+            '<div class="denial-card"><div class="denial-info">' +
+            '<span class="denial-proc">' + d.process + '</span> \u2192 ' + d.vault +
+            '<div class="denial-file">' + d.file + '</div></div>' +
+            '<span class="denial-time">' + timeAgo(d.time) + '</span>' +
+            '<button class="denial-allow" onclick="copyCmd(\'onvault allow ' + d.path + ' ' + d.vault + '\')">Allow</button>' +
             '</div>'
         ).join('');
     } else {
-        denialSection.style.display = 'none';
+        ds.style.display = 'none';
     }
 
-    document.getElementById('lastUpdate').textContent =
-        new Date().toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+    document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+    notifyResize();
 }
 
-function toggleVault(el) { el.classList.toggle('expanded'); }
+function toggle(id) {
+    if (expandedVaults.has(id)) expandedVaults.delete(id); else expandedVaults.add(id);
+    render();
+}
+
+function showAllow(id) {
+    const el = document.getElementById('allow-' + id);
+    el.style.display = el.style.display === 'none' ? 'flex' : 'none';
+    document.getElementById('deny-' + id).style.display = 'none';
+}
+
+function showDeny(id) {
+    const el = document.getElementById('deny-' + id);
+    el.style.display = el.style.display === 'none' ? 'flex' : 'none';
+    document.getElementById('allow-' + id).style.display = 'none';
+}
+
+function doAllow(id) {
+    const input = document.getElementById('allow-input-' + id);
+    const path = input.value.trim();
+    if (!path) return;
+    copyCmd('onvault allow ' + path + ' ' + id);
+    input.value = '';
+    document.getElementById('allow-' + id).style.display = 'none';
+}
+
+function doDeny(id) {
+    const input = document.getElementById('deny-input-' + id);
+    const path = input.value.trim();
+    if (!path) return;
+    copyCmd('onvault deny ' + path + ' ' + id);
+    input.value = '';
+    document.getElementById('deny-' + id).style.display = 'none';
+}
 
 async function refresh() {
     const btn = document.getElementById('refreshBtn');
-    btn.innerHTML = '<span class="spinning">↻</span>';
+    btn.innerHTML = '<span class="spinning">\u21bb</span>';
     await fetchData();
     btn.textContent = 'Refresh';
 }
 
-function addVault() { alert('Use CLI: onvault vault add <path> --smart'); }
 function viewPolicies() { window.open(API + '/api/policies', '_blank'); }
-function viewRules(id) { alert('Use CLI: onvault rules ' + id); }
-function allowProcess(id) { alert('Use CLI: onvault allow <process_path> ' + id); }
-function denyProcess(id) { alert('Use CLI: onvault deny <process_path> ' + id); }
-function removeVault(id) { alert('Use CLI: onvault vault remove ' + id); }
-function allowDenied(path, vault) { alert('Use CLI: onvault allow ' + path + ' ' + vault); }
 
-// Auto-refresh
+function notifyResize() {
+    try { window.webkit.messageHandlers.resize.postMessage(document.body.scrollHeight); } catch(e) {}
+}
+
 fetchData();
-setInterval(fetchData, 5000);
+window._refreshInterval = setInterval(fetchData, 5000);
 </script>
 </body>
 </html>

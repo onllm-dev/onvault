@@ -47,7 +47,7 @@ static int g_menu_vault_count = 0;
 
 /* --- Menu bar delegate --- */
 
-@interface OnVaultMenuBarDelegate : NSObject <NSApplicationDelegate, UNUserNotificationCenterDelegate>
+@interface OnVaultMenuBarDelegate : NSObject <NSApplicationDelegate, UNUserNotificationCenterDelegate, WKNavigationDelegate, WKScriptMessageHandler>
 @property (strong, nonatomic) NSStatusItem *statusItem;
 @property (strong, nonatomic) NSPopover *popover;
 @property (strong, nonatomic) WKWebView *webView;
@@ -66,8 +66,6 @@ static int g_menu_vault_count = 0;
     self.statusItem = [[NSStatusBar systemStatusBar]
                         statusItemWithLength:NSVariableStatusItemLength];
     self.statusItem.button.title = @"🔒";
-    self.statusItem.button.action = @selector(togglePopover:);
-    self.statusItem.button.target = self;
 
     /* Read HTTP port from file */
     self.httpPort = 0;
@@ -84,25 +82,34 @@ static int g_menu_vault_count = 0;
         }
     }
 
-    /* Create WKWebView popover */
+    /* Create WKWebView for popover with dynamic sizing */
     WKWebViewConfiguration *config = [[WKWebViewConfiguration alloc] init];
-    self.webView = [[WKWebView alloc] initWithFrame:NSMakeRect(0, 0, 300, 420) configuration:config];
+    WKUserContentController *ucc = [[WKUserContentController alloc] init];
+    [ucc addScriptMessageHandler:self name:@"resize"];
+    config.userContentController = ucc;
+    self.webView = [[WKWebView alloc] initWithFrame:NSMakeRect(0, 0, 300, 100) configuration:config];
     self.webView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    self.webView.navigationDelegate = self;
+    /* Transparent background so it blends with popover */
+    [self.webView setValue:@NO forKey:@"drawsBackground"];
 
     NSViewController *vc = [[NSViewController alloc] init];
     vc.view = self.webView;
-    vc.preferredContentSize = NSMakeSize(300, 420);
+    vc.preferredContentSize = NSMakeSize(300, 100);
 
     self.popover = [[NSPopover alloc] init];
-    self.popover.contentSize = NSMakeSize(300, 420);
+    self.popover.contentSize = NSMakeSize(300, 100);
     self.popover.behavior = NSPopoverBehaviorTransient;
+    self.popover.animates = YES;
     self.popover.contentViewController = vc;
 
-    /* Load the web UI */
-    [self loadWebUI];
+    /* Handle click: use button action + target.
+     * Critical: do NOT set statusItem.menu — it overrides the action. */
+    self.statusItem.button.action = @selector(togglePopover:);
+    self.statusItem.button.target = self;
 
-    /* Also build the fallback NSMenu (right-click) */
-    [self rebuildMenu];
+    /* Load the web UI now so it's ready when user clicks */
+    [self loadWebUI];
 
     /* Start periodic refresh of vault status */
     [NSTimer scheduledTimerWithTimeInterval:5.0
@@ -200,6 +207,37 @@ static int g_menu_vault_count = 0;
             }
         }
     }
+}
+
+/* WKScriptMessageHandler — receive resize messages from JS */
+- (void)userContentController:(WKUserContentController *)ucc
+       didReceiveScriptMessage:(WKScriptMessage *)message {
+    (void)ucc;
+    if ([message.name isEqualToString:@"resize"]) {
+        CGFloat height = [message.body doubleValue];
+        if (height < 150) height = 150;
+        if (height > 600) height = 600;
+        self.popover.contentSize = NSMakeSize(300, height);
+        self.popover.contentViewController.preferredContentSize = NSMakeSize(300, height);
+    }
+}
+
+/* WKNavigationDelegate — resize popover based on content height */
+- (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation {
+    (void)navigation;
+    /* Query the actual content height from the DOM */
+    [webView evaluateJavaScript:@"document.body.scrollHeight"
+              completionHandler:^(id result, NSError *error) {
+        if (error || !result) return;
+        CGFloat contentHeight = [result doubleValue];
+        if (contentHeight < 150) contentHeight = 150;
+        if (contentHeight > 600) contentHeight = 600;
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.popover.contentSize = NSMakeSize(300, contentHeight);
+            self.popover.contentViewController.preferredContentSize = NSMakeSize(300, contentHeight);
+        });
+    }];
 }
 
 - (void)refreshVaultStatus {
@@ -429,7 +467,9 @@ static int g_menu_vault_count = 0;
     quitItem.target = self;
     [menu addItem:quitItem];
 
-    self.statusItem.menu = menu;
+    /* Don't assign menu to statusItem — we use the popover on click instead.
+     * The NSMenu is kept as a fallback if popover isn't available. */
+    (void)menu;
 }
 
 /* --- Actions --- */
