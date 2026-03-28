@@ -893,10 +893,10 @@ static void handle_http_client(int client_fd)
         char resp_json[ONVAULT_IPC_MAX_MSG] = {0};
 
         if (strcmp(path, "/api/vault/add") == 0) {
-            /* Body: path to protect */
+            /* Body: path to protect (requires unlocked daemon) */
             if (!g_master_key_loaded) {
                 snprintf(resp_json, sizeof(resp_json),
-                         "{\"ok\":false,\"msg\":\"Unlock required\"}");
+                         "{\"ok\":false,\"msg\":\"Unlock required. Click Lock/Unlock button first.\"}");
             } else if (body[0] == '\0') {
                 snprintf(resp_json, sizeof(resp_json),
                          "{\"ok\":false,\"msg\":\"Path required\"}");
@@ -908,6 +908,19 @@ static void handle_http_client(int client_fd)
                 while (alen > 0 && (add_path[alen-1] == '\n' || add_path[alen-1] == '\r' || add_path[alen-1] == ' '))
                     add_path[--alen] = '\0';
 
+                /* Auto-create directory if it doesn't exist */
+                struct stat add_st;
+                if (stat(add_path, &add_st) != 0) {
+                    if (mkdir(add_path, 0700) != 0) {
+                        snprintf(resp_json, sizeof(resp_json),
+                                 "{\"ok\":false,\"msg\":\"Cannot create directory: %s\"}", add_path);
+                        http_respond(client_fd, 200, "application/json",
+                                     resp_json, strlen(resp_json));
+                        close(client_fd);
+                        return;
+                    }
+                }
+
                 int rc = onvault_vault_add(&g_master_key, add_path, NULL);
                 if (rc == ONVAULT_OK) {
                     char vid[64];
@@ -916,8 +929,13 @@ static void handle_http_client(int client_fd)
                     snprintf(resp_json, sizeof(resp_json),
                              "{\"ok\":true,\"msg\":\"Vault added: %s\"}", add_path);
                 } else {
+                    const char *err_msg = "Unknown error";
+                    if (rc == ONVAULT_ERR_NOT_FOUND) err_msg = "Path not found";
+                    else if (rc == ONVAULT_ERR_ALREADY_EXISTS) err_msg = "Vault already exists";
+                    else if (rc == ONVAULT_ERR_INVALID) err_msg = "Invalid path";
+                    else if (rc == ONVAULT_ERR_IO) err_msg = "I/O error";
                     snprintf(resp_json, sizeof(resp_json),
-                             "{\"ok\":false,\"msg\":\"Failed (err=%d)\"}", rc);
+                             "{\"ok\":false,\"msg\":\"%s: %s\"}", err_msg, add_path);
                 }
             }
             http_respond(client_fd, 200, "application/json",
@@ -957,8 +975,72 @@ static void handle_http_client(int client_fd)
             http_respond(client_fd, 200, "application/json",
                          resp_json, strlen(resp_json));
 
+        } else if (strcmp(path, "/api/unlock") == 0) {
+            /* Body: passphrase */
+            if (g_master_key_loaded) {
+                snprintf(resp_json, sizeof(resp_json),
+                         "{\"ok\":true,\"msg\":\"Already unlocked\"}");
+            } else {
+                char pass[256];
+                strlcpy(pass, body, sizeof(pass));
+                size_t pl = strlen(pass);
+                while (pl > 0 && (pass[pl-1] == '\n' || pass[pl-1] == '\r'))
+                    pass[--pl] = '\0';
+
+                onvault_key_t mk;
+                int urc = onvault_auth_unlock(pass, &mk);
+                onvault_memzero(pass, sizeof(pass));
+
+                if (urc == ONVAULT_OK) {
+                    onvault_mlock(&g_master_key, sizeof(g_master_key));
+                    memcpy(&g_master_key, &mk, sizeof(g_master_key));
+                    onvault_key_wipe(&mk, sizeof(mk));
+                    g_master_key_loaded = 1;
+
+                    /* Initialize audit logging */
+                    if (!g_log_initialized) {
+                        onvault_key_t config_key;
+                        onvault_mlock(&config_key, sizeof(config_key));
+                        onvault_derive_config_key(&g_master_key, &config_key);
+                        if (onvault_log_init(&config_key) == ONVAULT_OK)
+                            g_log_initialized = 1;
+                        onvault_key_wipe(&config_key, sizeof(config_key));
+                    }
+
+                    snprintf(resp_json, sizeof(resp_json),
+                             "{\"ok\":true,\"msg\":\"Unlocked\"}");
+                } else {
+                    onvault_key_wipe(&mk, sizeof(mk));
+                    snprintf(resp_json, sizeof(resp_json),
+                             "{\"ok\":false,\"msg\":\"Wrong passphrase\"}");
+                }
+            }
+            http_respond(client_fd, 200, "application/json",
+                         resp_json, strlen(resp_json));
+
+        } else if (strcmp(path, "/api/lock") == 0) {
+            /* Body: passphrase — verify before locking */
+            char pass[256];
+            strlcpy(pass, body, sizeof(pass));
+            size_t pl = strlen(pass);
+            while (pl > 0 && (pass[pl-1] == '\n' || pass[pl-1] == '\r'))
+                pass[--pl] = '\0';
+
+            int vrc = onvault_auth_verify_passphrase(pass);
+            onvault_memzero(pass, sizeof(pass));
+
+            if (vrc == ONVAULT_OK) {
+                g_running = 0;
+                snprintf(resp_json, sizeof(resp_json),
+                         "{\"ok\":true,\"msg\":\"Locked. Daemon stopping.\"}");
+            } else {
+                snprintf(resp_json, sizeof(resp_json),
+                         "{\"ok\":false,\"msg\":\"Wrong passphrase\"}");
+            }
+            http_respond(client_fd, 200, "application/json",
+                         resp_json, strlen(resp_json));
+
         } else if (strcmp(path, "/api/vault/remove") == 0) {
-            /* Body: vault_id — requires auth proof (not implemented via HTTP, use CLI) */
             snprintf(resp_json, sizeof(resp_json),
                      "{\"ok\":false,\"msg\":\"Use CLI: onvault vault remove (passphrase required)\"}");
             http_respond(client_fd, 200, "application/json",
@@ -1137,31 +1219,33 @@ static const char *get_menubar_html(void)
     "<body>\n\n<div class=\"header\">\n    <div class=\"logo\">\n        <svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\">\n            <rect x=\"3\" y=\"11\" width=\"18\" height=\"11\" rx=\"2\" ry=\"2\"/>\n            <path d=\"M7 11V7a5 5 0 0 1 10 0v4\"/>\n        </svg>\n        onvault\n    </div>\n"
     "    <span class=\"badge locked\" id=\"statusBadge\">Locked</span>\n</div>\n\n<div id=\"vaultSection\" class=\"section\">\n    <div class=\"section-title\">Vaults</div>\n    <div id=\"vaultList\"></div>\n</div>\n\n<div id=\"denialSection\" class=\"section\" style=\"display:none\">\n    <div class=\"section-title\">Recent Denials</div>\n    <div id=\"denialList\"></div>\n</div>\n\n"
     "<div id=\"addVaultPanel\" style=\"display:none; padding: 8px 12px;\">\n    <div class=\"section-title\">Add Vault</div>\n    <div class=\"input-row\">\n        <input placeholder=\"~/.ssh or /path/to/dir\" id=\"addVaultInput\">\n        <button onclick=\"doAddVault()\">Protect</button>\n    </div>\n</div>\n\n<div class=\"action-bar\">\n"
-    "    <button class=\"primary\" onclick=\"promptAddVault()\">+ Add Vault</button>\n    <button onclick=\"viewPolicies()\">Policies</button>\n    <button onclick=\"refresh()\" id=\"refreshBtn\">Refresh</button>\n</div>\n\n<div class=\"footer\">\n    <span>onvault 0.1.0</span>\n    <span id=\"lastUpdate\"></span>\n</div>\n\n<div class=\"toast\" id=\"toast\"></div>\n\n"
-    "<div class=\"panel-overlay\" id=\"panelOverlay\" onclick=\"hidePanel()\">\n    <div class=\"panel\" onclick=\"event.stopPropagation()\">\n        <div class=\"panel-header\">\n            <span id=\"panelTitle\"></span>\n            <button onclick=\"hidePanel()\" style=\"background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:14px\">✕</button>\n        </div>\n"
-    "        <pre class=\"panel-body\" id=\"panelBody\"></pre>\n    </div>\n</div>\n\n<script>\nconst API = window.location.origin;\nlet data = { locked: true, vault_count: 0, vaults: [] };\nlet denials = [];\nlet expandedVaults = new Set();\n\nfunction toast(msg, isError) {\n    const t = document.getElementById('toast');\n    t.textContent = msg;\n"
-    "    t.className = 'toast show' + (isError ? ' error' : '');\n    setTimeout(() => { t.className = 'toast'; }, 2500);\n}\n\nfunction copyCmd(cmd) {\n    navigator.clipboard.writeText(cmd).then(() => toast('Copied: ' + cmd)).catch(() => toast(cmd));\n}\n\nasync function fetchData() {\n    try {\n        const [s, d] = await Promise.all([fetch(API + '/api/status'), fetch(API + '/api/denials')]);\n"
-    "        data = await s.json();\n        denials = await d.json();\n    } catch (e) {\n        data = { locked: true, vault_count: 0, vaults: [] };\n        denials = [];\n    }\n    render();\n}\n\nfunction timeAgo(ts) {\n    const s = Math.floor(Date.now() / 1000) - ts;\n    if (s < 60) return s + 's';\n    if (s < 3600) return Math.floor(s / 60) + 'm';\n    return Math.floor(s / 3600) + 'h';\n"
-    "}\n\nfunction render() {\n    const badge = document.getElementById('statusBadge');\n    badge.className = 'badge ' + (data.locked ? 'locked' : 'unlocked');\n    badge.textContent = data.locked ? 'Locked' : data.vault_count + ' vault(s)';\n\n    const vl = document.getElementById('vaultList');\n    if (data.vaults.length === 0) {\n"
-    "        vl.innerHTML = '<div class=\"empty-state\"><div class=\"icon\">' + (data.locked ? '🔒' : '🛡️') + '</div>' +\n            '<p>' + (data.locked ? 'Locked. Run onvault unlock.' : 'No vaults yet.') + '</p></div>';\n    } else {\n        vl.innerHTML = data.vaults.map(v => {\n            const exp = expandedVaults.has(v.id) ? ' expanded' : '';\n"
-    "            return '<div class=\"vault-card' + exp + '\" onclick=\"toggle(\\'' + v.id + '\\')\">' +\n                '<div class=\"vault-row\"><div class=\"vault-name\"><span class=\"icon\">' +\n                (v.mounted ? '🔓' : '🔒') + '</span>' + v.id + '</div>' +\n                '<span class=\"vault-status ' + (v.mounted ? 'mounted' : 'locked') + '\">' +\n"
-    "                (v.mounted ? 'Active' : 'Locked') + '</span></div>' +\n                '<div class=\"vault-source\">' + v.source + '</div>' +\n                '<div class=\"vault-detail\">' +\n                '<div class=\"vault-actions\">' +\n                '<button onclick=\"event.stopPropagation();viewRules(\\'' + v.id + '\\')\">Rules</button>' +\n"
-    "                '<button onclick=\"event.stopPropagation();showAllow(\\'' + v.id + '\\')\">Allow</button>' +\n                '<button onclick=\"event.stopPropagation();showDeny(\\'' + v.id + '\\')\">Deny</button>' +\n                '<button class=\"danger\" onclick=\"event.stopPropagation();toast(\\'Use CLI: onvault vault remove ' + v.id + '\\')\">Remove</button>' +\n                '</div>' +\n"
-    "                '<div class=\"input-row\" id=\"allow-' + v.id + '\" style=\"display:none\">' +\n                '<input placeholder=\"/usr/bin/process\" id=\"allow-input-' + v.id + '\">' +\n                '<button onclick=\"event.stopPropagation();doAllow(\\'' + v.id + '\\')\">Allow</button>' +\n                '</div>' +\n"
-    "                '<div class=\"input-row\" id=\"deny-' + v.id + '\" style=\"display:none\">' +\n                '<input placeholder=\"/usr/bin/process\" id=\"deny-input-' + v.id + '\">' +\n                '<button onclick=\"event.stopPropagation();doDeny(\\'' + v.id + '\\')\">Deny</button>' +\n                '</div></div>';\n        }).join('');\n    }\n\n"
-    "    const ds = document.getElementById('denialSection');\n    const dl = document.getElementById('denialList');\n    if (denials.length > 0) {\n        ds.style.display = 'block';\n        dl.innerHTML = denials.slice(-5).reverse().map(d =>\n            '<div class=\"denial-card\"><div class=\"denial-info\">' +\n"
-    "            '<span class=\"denial-proc\">' + d.process + '</span> \\u2192 ' + d.vault +\n            '<div class=\"denial-file\">' + d.file + '</div></div>' +\n            '<span class=\"denial-time\">' + timeAgo(d.time) + '</span>' +\n            '<button class=\"denial-allow\" onclick=\"quickAllow(\\'' + d.path + '\\',\\'' + d.vault + '\\')\">Allow</button>' +\n            '</div>'\n"
-    "        ).join('');\n    } else {\n        ds.style.display = 'none';\n    }\n\n    document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});\n    notifyResize();\n}\n\nfunction toggle(id) {\n    if (expandedVaults.has(id)) expandedVaults.delete(id); else expandedVaults.add(id);\n    render();\n}\n\nfunction showAllow(id) {\n"
-    "    const el = document.getElementById('allow-' + id);\n    el.style.display = el.style.display === 'none' ? 'flex' : 'none';\n    document.getElementById('deny-' + id).style.display = 'none';\n}\n\nfunction showDeny(id) {\n    const el = document.getElementById('deny-' + id);\n    el.style.display = el.style.display === 'none' ? 'flex' : 'none';\n"
-    "    document.getElementById('allow-' + id).style.display = 'none';\n}\n\nasync function doAllow(id) {\n    const input = document.getElementById('allow-input-' + id);\n    const proc = input.value.trim();\n    if (!proc) return;\n    try {\n        const r = await fetch(API + '/api/allow', { method: 'POST', body: proc + '\\n' + id });\n        const j = await r.json();\n"
-    "        toast(j.msg, !j.ok);\n    } catch(e) { toast('Failed to allow', true); }\n    input.value = '';\n    document.getElementById('allow-' + id).style.display = 'none';\n    fetchData();\n}\n\nasync function doDeny(id) {\n    const input = document.getElementById('deny-input-' + id);\n    const proc = input.value.trim();\n    if (!proc) return;\n    try {\n"
-    "        const r = await fetch(API + '/api/deny', { method: 'POST', body: proc + '\\n' + id });\n        const j = await r.json();\n        toast(j.msg, !j.ok);\n    } catch(e) { toast('Failed to deny', true); }\n    input.value = '';\n    document.getElementById('deny-' + id).style.display = 'none';\n    fetchData();\n}\n\nfunction promptAddVault() {\n"
-    "    const panel = document.getElementById('addVaultPanel');\n    panel.style.display = panel.style.display === 'none' ? 'block' : 'none';\n    if (panel.style.display === 'block') {\n        document.getElementById('addVaultInput').focus();\n    }\n    notifyResize();\n}\n\nasync function doAddVault() {\n    const input = document.getElementById('addVaultInput');\n"
-    "    const path = input.value.trim();\n    if (!path) return;\n    try {\n        const r = await fetch(API + '/api/vault/add', { method: 'POST', body: path });\n        const j = await r.json();\n        toast(j.msg, !j.ok);\n    } catch(e) { toast('Failed to add vault', true); }\n    input.value = '';\n    document.getElementById('addVaultPanel').style.display = 'none';\n    fetchData();\n}\n\n"
-    "async function viewRules(id) {\n    try {\n        const r = await fetch(API + '/api/rules?vault=' + id);\n        const text = await r.text();\n        showPanel('Rules: ' + id, text);\n    } catch(e) { toast('Failed to load rules', true); }\n}\n\nasync function quickAllow(proc, vault) {\n    try {\n        const r = await fetch(API + '/api/allow', { method: 'POST', body: proc + '\\n"
-    "' + vault });\n        const j = await r.json();\n        toast(j.msg, !j.ok);\n    } catch(e) { toast('Failed', true); }\n    fetchData();\n}\n\nasync function refresh() {\n    const btn = document.getElementById('refreshBtn');\n    btn.innerHTML = '<span class=\"spinning\">\\u21bb</span>';\n    await fetchData();\n    btn.textContent = 'Refresh';\n}\n\nasync function viewPolicies() {\n"
-    "    try {\n        const r = await fetch(API + '/api/policies');\n        showPanel('All Policies', await r.text());\n    } catch(e) { toast('Failed to load policies', true); }\n}\n\nfunction showPanel(title, body) {\n    document.getElementById('panelTitle').textContent = title;\n    document.getElementById('panelBody').textContent = body;\n"
-    "    document.getElementById('panelOverlay').className = 'panel-overlay show';\n}\n\nfunction hidePanel() {\n    document.getElementById('panelOverlay').className = 'panel-overlay';\n}\n\nfunction notifyResize() {\n    try { window.webkit.messageHandlers.resize.postMessage(document.body.scrollHeight); } catch(e) {}\n}\n\nfetchData();\nwindow._refreshInterval = setInterval(fetchData, 5000);\n"
-    "</script>\n</body>\n</html>\n"
+    "    <button class=\"primary\" onclick=\"promptAddVault()\">+ Add Vault</button>\n    <button onclick=\"viewPolicies()\">Policies</button>\n    <button id=\"lockBtn\" onclick=\"doLockUnlock()\">Lock</button>\n    <button onclick=\"refresh()\" id=\"refreshBtn\">Refresh</button>\n</div>\n\n<div class=\"footer\">\n    <span>onvault 0.1.0</span>\n    <span id=\"lastUpdate\"></span>\n</div>\n\n"
+    "<div class=\"toast\" id=\"toast\"></div>\n\n<div class=\"panel-overlay\" id=\"panelOverlay\" onclick=\"hidePanel()\">\n    <div class=\"panel\" onclick=\"event.stopPropagation()\">\n        <div class=\"panel-header\">\n            <span id=\"panelTitle\"></span>\n"
+    "            <button onclick=\"hidePanel()\" style=\"background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:14px\">✕</button>\n        </div>\n        <pre class=\"panel-body\" id=\"panelBody\"></pre>\n        <div id=\"panelAuth\" style=\"display:none;padding:10px 12px;border-top:1px solid var(--border)\">\n            <div class=\"input-row\">\n"
+    "                <input type=\"password\" placeholder=\"Passphrase\" id=\"panelPassInput\">\n                <button id=\"panelAuthBtn\" onclick=\"panelAuthSubmit()\">Confirm</button>\n            </div>\n        </div>\n    </div>\n</div>\n\n<script>\nvar API = window.location.origin;\nvar data = { locked: true, vault_count: 0, vaults: [] };\nvar denials = [];\nvar expandedVaults = {};\n"
+    "var pendingAuthAction = null;\n\nfunction toast(msg, isError) {\n    var t = document.getElementById('toast');\n    t.textContent = msg;\n    t.className = 'toast show' + (isError ? ' error' : '');\n    setTimeout(function() { t.className = 'toast'; }, 2500);\n}\n\nfunction postAPI(path, body) {\n    return fetch(API + path, { method: 'POST', body: body }).then(function(r) { return r.json(); });\n"
+    "}\n\nfunction fetchData() {\n    return Promise.all([\n        fetch(API + '/api/status').then(function(r) { return r.json(); }),\n        fetch(API + '/api/denials').then(function(r) { return r.json(); })\n    ]).then(function(results) {\n        data = results[0];\n        denials = results[1];\n        render();\n    }).catch(function() {\n"
+    "        data = { locked: true, vault_count: 0, vaults: [] };\n        denials = [];\n        render();\n    });\n}\n\nfunction timeAgo(ts) {\n    var s = Math.floor(Date.now() / 1000) - ts;\n    if (s < 60) return s + 's';\n    if (s < 3600) return Math.floor(s / 60) + 'm';\n    return Math.floor(s / 3600) + 'h';\n}\n\nfunction render() {\n    var badge = document.getElementById('statusBadge');\n"
+    "    badge.className = 'badge ' + (data.locked ? 'locked' : 'unlocked');\n    badge.textContent = data.locked ? 'Locked' : data.vault_count + ' vault(s)';\n\n    var vl = document.getElementById('vaultList');\n    if (data.vaults.length === 0) {\n        vl.innerHTML = '<div class=\"empty-state\"><div class=\"icon\">' + (data.locked ? '🔒' : '🛡️') + '</div>' +\n"
+    "            '<p>' + (data.locked ? 'Locked — click Unlock below.' : 'No vaults yet. Click + Add Vault.') + '</p></div>';\n    } else {\n        vl.innerHTML = data.vaults.map(function(v) {\n            var exp = expandedVaults[v.id] ? ' expanded' : '';\n            return '<div class=\"vault-card' + exp + '\" onclick=\"toggle(\\'' + v.id + '\\')\">' +\n"
+    "                '<div class=\"vault-row\"><div class=\"vault-name\"><span class=\"icon\">' +\n                (v.mounted ? '🔓' : '🔒') + '</span>' + v.id + '</div>' +\n                '<span class=\"vault-status ' + (v.mounted ? 'mounted' : 'locked') + '\">' +\n                (v.mounted ? 'Active' : 'Locked') + '</span></div>' +\n"
+    "                '<div class=\"vault-source\">' + v.source + '</div>' +\n                '<div class=\"vault-detail\">' +\n                '<div class=\"vault-actions\">' +\n                '<button onclick=\"event.stopPropagation();viewRules(\\'' + v.id + '\\')\">Rules</button>' +\n"
+    "                '<button onclick=\"event.stopPropagation();showInput(\\'allow\\',\\'' + v.id + '\\')\">Allow</button>' +\n                '<button onclick=\"event.stopPropagation();showInput(\\'deny\\',\\'' + v.id + '\\')\">Deny</button>' +\n                '<button class=\"danger\" onclick=\"event.stopPropagation();toast(\\'Use CLI: onvault vault remove ' + v.id + '\\')\">Remove</button>' +\n"
+    "                '</div>' +\n                '<div class=\"input-row\" id=\"allow-' + v.id + '\" style=\"display:none\">' +\n                '<input placeholder=\"/usr/bin/process\" id=\"allow-input-' + v.id + '\">' +\n                '<button onclick=\"event.stopPropagation();doRule(\\'allow\\',\\'' + v.id + '\\')\">Allow</button>' +\n                '</div>' +\n"
+    "                '<div class=\"input-row\" id=\"deny-' + v.id + '\" style=\"display:none\">' +\n                '<input placeholder=\"/usr/bin/process\" id=\"deny-input-' + v.id + '\">' +\n                '<button onclick=\"event.stopPropagation();doRule(\\'deny\\',\\'' + v.id + '\\')\">Deny</button>' +\n                '</div></div>';\n        }).join('');\n    }\n\n"
+    "    var ds = document.getElementById('denialSection');\n    var dl = document.getElementById('denialList');\n    if (denials.length > 0) {\n        ds.style.display = 'block';\n        dl.innerHTML = denials.slice(-5).reverse().map(function(d) {\n            return '<div class=\"denial-card\"><div class=\"denial-info\">' +\n"
+    "                '<span class=\"denial-proc\">' + d.process + '</span> \\u2192 ' + d.vault +\n                '<div class=\"denial-file\">' + d.file + '</div></div>' +\n                '<span class=\"denial-time\">' + timeAgo(d.time) + '</span>' +\n                '<button class=\"denial-allow\" onclick=\"quickAllow(\\'' + d.path + '\\',\\'' + d.vault + '\\')\">Allow</button></div>';\n"
+    "        }).join('');\n    } else { ds.style.display = 'none'; }\n\n    var lockBtn = document.getElementById('lockBtn');\n    if (lockBtn) lockBtn.textContent = data.locked ? 'Unlock' : 'Lock';\n\n    document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});\n    notifyResize();\n}\n\nfunction toggle(id) {\n"
+    "    expandedVaults[id] = !expandedVaults[id];\n    render();\n}\n\nfunction showInput(type, id) {\n    var el = document.getElementById(type + '-' + id);\n    var other = type === 'allow' ? 'deny' : 'allow';\n    el.style.display = el.style.display === 'none' ? 'flex' : 'none';\n    document.getElementById(other + '-' + id).style.display = 'none';\n}\n\nfunction doRule(type, id) {\n"
+    "    var input = document.getElementById(type + '-input-' + id);\n    var proc = input.value.trim();\n    if (!proc) return;\n    postAPI('/api/' + type, proc + '\\n' + id).then(function(j) {\n        toast(j.msg, !j.ok);\n    }).catch(function() { toast('Failed', true); });\n    input.value = '';\n    document.getElementById(type + '-' + id).style.display = 'none';\n"
+    "    setTimeout(fetchData, 300);\n}\n\nfunction promptAddVault() {\n    var panel = document.getElementById('addVaultPanel');\n    panel.style.display = panel.style.display === 'none' ? 'block' : 'none';\n    if (panel.style.display === 'block') document.getElementById('addVaultInput').focus();\n    notifyResize();\n}\n\nfunction doAddVault() {\n"
+    "    var input = document.getElementById('addVaultInput');\n    var path = input.value.trim();\n    if (!path) return;\n    postAPI('/api/vault/add', path).then(function(j) {\n        toast(j.msg, !j.ok);\n    }).catch(function() { toast('Failed to add vault', true); });\n    input.value = '';\n    document.getElementById('addVaultPanel').style.display = 'none';\n    setTimeout(fetchData, 300);\n"
+    "}\n\nfunction viewRules(id) {\n    fetch(API + '/api/rules?vault=' + id).then(function(r) { return r.text(); }).then(function(text) {\n        showPanel('Rules: ' + id, text);\n    }).catch(function() { toast('Failed to load rules', true); });\n}\n\nfunction quickAllow(proc, vault) {\n    postAPI('/api/allow', proc + '\\n' + vault).then(function(j) {\n        toast(j.msg, !j.ok);\n"
+    "    }).catch(function() { toast('Failed', true); });\n    setTimeout(fetchData, 300);\n}\n\nfunction refresh() {\n    var btn = document.getElementById('refreshBtn');\n    btn.innerHTML = '<span class=\"spinning\">\\u21bb</span>';\n    fetchData().then(function() { btn.textContent = 'Refresh'; });\n}\n\nfunction doLockUnlock() {\n    if (data.locked) {\n"
+    "        showPanel('Unlock', 'Enter your passphrase to unlock all vaults.');\n        pendingAuthAction = 'unlock';\n    } else {\n        showPanel('Lock All Vaults', 'Enter your passphrase to lock and unmount all vaults.');\n        pendingAuthAction = 'lock';\n    }\n    document.getElementById('panelAuth').style.display = 'block';\n    document.getElementById('panelPassInput').value = '';\n"
+    "    setTimeout(function() { document.getElementById('panelPassInput').focus(); }, 100);\n}\n\nfunction panelAuthSubmit() {\n    var pass = document.getElementById('panelPassInput').value;\n    if (!pass) return;\n    document.getElementById('panelPassInput').value = '';\n    postAPI('/api/' + pendingAuthAction, pass).then(function(j) {\n        toast(j.msg, !j.ok);\n"
+    "    }).catch(function() { toast('Failed', true); });\n    hidePanel();\n    pendingAuthAction = null;\n    setTimeout(fetchData, 500);\n}\n\nfunction viewPolicies() {\n    fetch(API + '/api/policies').then(function(r) { return r.text(); }).then(function(text) {\n        showPanel('All Policies', text);\n    }).catch(function() { toast('Failed to load policies', true); });\n}\n\n"
+    "function showPanel(title, body) {\n    document.getElementById('panelTitle').textContent = title;\n    document.getElementById('panelBody').textContent = body || '';\n    document.getElementById('panelAuth').style.display = 'none';\n    document.getElementById('panelOverlay').className = 'panel-overlay show';\n}\n\nfunction hidePanel() {\n"
+    "    document.getElementById('panelOverlay').className = 'panel-overlay';\n}\n\nfunction notifyResize() {\n    try { window.webkit.messageHandlers.resize.postMessage(document.body.scrollHeight); } catch(e) {}\n}\n\nfetchData();\nwindow._refreshInterval = setInterval(fetchData, 5000);\n</script>\n</body>\n</html>\n"
     ;
 }

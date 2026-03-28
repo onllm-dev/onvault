@@ -127,6 +127,7 @@ body {
 <div class="action-bar">
     <button class="primary" onclick="promptAddVault()">+ Add Vault</button>
     <button onclick="viewPolicies()">Policies</button>
+    <button id="lockBtn" onclick="doLockUnlock()">Lock</button>
     <button onclick="refresh()" id="refreshBtn">Refresh</button>
 </div>
 
@@ -144,57 +145,67 @@ body {
             <button onclick="hidePanel()" style="background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:14px">✕</button>
         </div>
         <pre class="panel-body" id="panelBody"></pre>
+        <div id="panelAuth" style="display:none;padding:10px 12px;border-top:1px solid var(--border)">
+            <div class="input-row">
+                <input type="password" placeholder="Passphrase" id="panelPassInput">
+                <button id="panelAuthBtn" onclick="panelAuthSubmit()">Confirm</button>
+            </div>
+        </div>
     </div>
 </div>
 
 <script>
-const API = window.location.origin;
-let data = { locked: true, vault_count: 0, vaults: [] };
-let denials = [];
-let expandedVaults = new Set();
+var API = window.location.origin;
+var data = { locked: true, vault_count: 0, vaults: [] };
+var denials = [];
+var expandedVaults = {};
+var pendingAuthAction = null;
 
 function toast(msg, isError) {
-    const t = document.getElementById('toast');
+    var t = document.getElementById('toast');
     t.textContent = msg;
     t.className = 'toast show' + (isError ? ' error' : '');
-    setTimeout(() => { t.className = 'toast'; }, 2500);
+    setTimeout(function() { t.className = 'toast'; }, 2500);
 }
 
-function copyCmd(cmd) {
-    navigator.clipboard.writeText(cmd).then(() => toast('Copied: ' + cmd)).catch(() => toast(cmd));
+function postAPI(path, body) {
+    return fetch(API + path, { method: 'POST', body: body }).then(function(r) { return r.json(); });
 }
 
-async function fetchData() {
-    try {
-        const [s, d] = await Promise.all([fetch(API + '/api/status'), fetch(API + '/api/denials')]);
-        data = await s.json();
-        denials = await d.json();
-    } catch (e) {
+function fetchData() {
+    return Promise.all([
+        fetch(API + '/api/status').then(function(r) { return r.json(); }),
+        fetch(API + '/api/denials').then(function(r) { return r.json(); })
+    ]).then(function(results) {
+        data = results[0];
+        denials = results[1];
+        render();
+    }).catch(function() {
         data = { locked: true, vault_count: 0, vaults: [] };
         denials = [];
-    }
-    render();
+        render();
+    });
 }
 
 function timeAgo(ts) {
-    const s = Math.floor(Date.now() / 1000) - ts;
+    var s = Math.floor(Date.now() / 1000) - ts;
     if (s < 60) return s + 's';
     if (s < 3600) return Math.floor(s / 60) + 'm';
     return Math.floor(s / 3600) + 'h';
 }
 
 function render() {
-    const badge = document.getElementById('statusBadge');
+    var badge = document.getElementById('statusBadge');
     badge.className = 'badge ' + (data.locked ? 'locked' : 'unlocked');
     badge.textContent = data.locked ? 'Locked' : data.vault_count + ' vault(s)';
 
-    const vl = document.getElementById('vaultList');
+    var vl = document.getElementById('vaultList');
     if (data.vaults.length === 0) {
         vl.innerHTML = '<div class="empty-state"><div class="icon">' + (data.locked ? '🔒' : '🛡️') + '</div>' +
-            '<p>' + (data.locked ? 'Locked. Run onvault unlock.' : 'No vaults yet.') + '</p></div>';
+            '<p>' + (data.locked ? 'Locked — click Unlock below.' : 'No vaults yet. Click + Add Vault.') + '</p></div>';
     } else {
-        vl.innerHTML = data.vaults.map(v => {
-            const exp = expandedVaults.has(v.id) ? ' expanded' : '';
+        vl.innerHTML = data.vaults.map(function(v) {
+            var exp = expandedVaults[v.id] ? ' expanded' : '';
             return '<div class="vault-card' + exp + '" onclick="toggle(\'' + v.id + '\')">' +
                 '<div class="vault-row"><div class="vault-name"><span class="icon">' +
                 (v.mounted ? '🔓' : '🔒') + '</span>' + v.id + '</div>' +
@@ -204,143 +215,138 @@ function render() {
                 '<div class="vault-detail">' +
                 '<div class="vault-actions">' +
                 '<button onclick="event.stopPropagation();viewRules(\'' + v.id + '\')">Rules</button>' +
-                '<button onclick="event.stopPropagation();showAllow(\'' + v.id + '\')">Allow</button>' +
-                '<button onclick="event.stopPropagation();showDeny(\'' + v.id + '\')">Deny</button>' +
+                '<button onclick="event.stopPropagation();showInput(\'allow\',\'' + v.id + '\')">Allow</button>' +
+                '<button onclick="event.stopPropagation();showInput(\'deny\',\'' + v.id + '\')">Deny</button>' +
                 '<button class="danger" onclick="event.stopPropagation();toast(\'Use CLI: onvault vault remove ' + v.id + '\')">Remove</button>' +
                 '</div>' +
                 '<div class="input-row" id="allow-' + v.id + '" style="display:none">' +
                 '<input placeholder="/usr/bin/process" id="allow-input-' + v.id + '">' +
-                '<button onclick="event.stopPropagation();doAllow(\'' + v.id + '\')">Allow</button>' +
+                '<button onclick="event.stopPropagation();doRule(\'allow\',\'' + v.id + '\')">Allow</button>' +
                 '</div>' +
                 '<div class="input-row" id="deny-' + v.id + '" style="display:none">' +
                 '<input placeholder="/usr/bin/process" id="deny-input-' + v.id + '">' +
-                '<button onclick="event.stopPropagation();doDeny(\'' + v.id + '\')">Deny</button>' +
+                '<button onclick="event.stopPropagation();doRule(\'deny\',\'' + v.id + '\')">Deny</button>' +
                 '</div></div>';
         }).join('');
     }
 
-    const ds = document.getElementById('denialSection');
-    const dl = document.getElementById('denialList');
+    var ds = document.getElementById('denialSection');
+    var dl = document.getElementById('denialList');
     if (denials.length > 0) {
         ds.style.display = 'block';
-        dl.innerHTML = denials.slice(-5).reverse().map(d =>
-            '<div class="denial-card"><div class="denial-info">' +
-            '<span class="denial-proc">' + d.process + '</span> \u2192 ' + d.vault +
-            '<div class="denial-file">' + d.file + '</div></div>' +
-            '<span class="denial-time">' + timeAgo(d.time) + '</span>' +
-            '<button class="denial-allow" onclick="quickAllow(\'' + d.path + '\',\'' + d.vault + '\')">Allow</button>' +
-            '</div>'
-        ).join('');
-    } else {
-        ds.style.display = 'none';
-    }
+        dl.innerHTML = denials.slice(-5).reverse().map(function(d) {
+            return '<div class="denial-card"><div class="denial-info">' +
+                '<span class="denial-proc">' + d.process + '</span> \u2192 ' + d.vault +
+                '<div class="denial-file">' + d.file + '</div></div>' +
+                '<span class="denial-time">' + timeAgo(d.time) + '</span>' +
+                '<button class="denial-allow" onclick="quickAllow(\'' + d.path + '\',\'' + d.vault + '\')">Allow</button></div>';
+        }).join('');
+    } else { ds.style.display = 'none'; }
+
+    var lockBtn = document.getElementById('lockBtn');
+    if (lockBtn) lockBtn.textContent = data.locked ? 'Unlock' : 'Lock';
 
     document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
     notifyResize();
 }
 
 function toggle(id) {
-    if (expandedVaults.has(id)) expandedVaults.delete(id); else expandedVaults.add(id);
+    expandedVaults[id] = !expandedVaults[id];
     render();
 }
 
-function showAllow(id) {
-    const el = document.getElementById('allow-' + id);
+function showInput(type, id) {
+    var el = document.getElementById(type + '-' + id);
+    var other = type === 'allow' ? 'deny' : 'allow';
     el.style.display = el.style.display === 'none' ? 'flex' : 'none';
-    document.getElementById('deny-' + id).style.display = 'none';
+    document.getElementById(other + '-' + id).style.display = 'none';
 }
 
-function showDeny(id) {
-    const el = document.getElementById('deny-' + id);
-    el.style.display = el.style.display === 'none' ? 'flex' : 'none';
-    document.getElementById('allow-' + id).style.display = 'none';
-}
-
-async function doAllow(id) {
-    const input = document.getElementById('allow-input-' + id);
-    const proc = input.value.trim();
+function doRule(type, id) {
+    var input = document.getElementById(type + '-input-' + id);
+    var proc = input.value.trim();
     if (!proc) return;
-    try {
-        const r = await fetch(API + '/api/allow', { method: 'POST', body: proc + '\n' + id });
-        const j = await r.json();
+    postAPI('/api/' + type, proc + '\n' + id).then(function(j) {
         toast(j.msg, !j.ok);
-    } catch(e) { toast('Failed to allow', true); }
+    }).catch(function() { toast('Failed', true); });
     input.value = '';
-    document.getElementById('allow-' + id).style.display = 'none';
-    fetchData();
-}
-
-async function doDeny(id) {
-    const input = document.getElementById('deny-input-' + id);
-    const proc = input.value.trim();
-    if (!proc) return;
-    try {
-        const r = await fetch(API + '/api/deny', { method: 'POST', body: proc + '\n' + id });
-        const j = await r.json();
-        toast(j.msg, !j.ok);
-    } catch(e) { toast('Failed to deny', true); }
-    input.value = '';
-    document.getElementById('deny-' + id).style.display = 'none';
-    fetchData();
+    document.getElementById(type + '-' + id).style.display = 'none';
+    setTimeout(fetchData, 300);
 }
 
 function promptAddVault() {
-    const panel = document.getElementById('addVaultPanel');
+    var panel = document.getElementById('addVaultPanel');
     panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
-    if (panel.style.display === 'block') {
-        document.getElementById('addVaultInput').focus();
-    }
+    if (panel.style.display === 'block') document.getElementById('addVaultInput').focus();
     notifyResize();
 }
 
-async function doAddVault() {
-    const input = document.getElementById('addVaultInput');
-    const path = input.value.trim();
+function doAddVault() {
+    var input = document.getElementById('addVaultInput');
+    var path = input.value.trim();
     if (!path) return;
-    try {
-        const r = await fetch(API + '/api/vault/add', { method: 'POST', body: path });
-        const j = await r.json();
+    postAPI('/api/vault/add', path).then(function(j) {
         toast(j.msg, !j.ok);
-    } catch(e) { toast('Failed to add vault', true); }
+    }).catch(function() { toast('Failed to add vault', true); });
     input.value = '';
     document.getElementById('addVaultPanel').style.display = 'none';
-    fetchData();
+    setTimeout(fetchData, 300);
 }
 
-async function viewRules(id) {
-    try {
-        const r = await fetch(API + '/api/rules?vault=' + id);
-        const text = await r.text();
+function viewRules(id) {
+    fetch(API + '/api/rules?vault=' + id).then(function(r) { return r.text(); }).then(function(text) {
         showPanel('Rules: ' + id, text);
-    } catch(e) { toast('Failed to load rules', true); }
+    }).catch(function() { toast('Failed to load rules', true); });
 }
 
-async function quickAllow(proc, vault) {
-    try {
-        const r = await fetch(API + '/api/allow', { method: 'POST', body: proc + '\n' + vault });
-        const j = await r.json();
+function quickAllow(proc, vault) {
+    postAPI('/api/allow', proc + '\n' + vault).then(function(j) {
         toast(j.msg, !j.ok);
-    } catch(e) { toast('Failed', true); }
-    fetchData();
+    }).catch(function() { toast('Failed', true); });
+    setTimeout(fetchData, 300);
 }
 
-async function refresh() {
-    const btn = document.getElementById('refreshBtn');
+function refresh() {
+    var btn = document.getElementById('refreshBtn');
     btn.innerHTML = '<span class="spinning">\u21bb</span>';
-    await fetchData();
-    btn.textContent = 'Refresh';
+    fetchData().then(function() { btn.textContent = 'Refresh'; });
 }
 
-async function viewPolicies() {
-    try {
-        const r = await fetch(API + '/api/policies');
-        showPanel('All Policies', await r.text());
-    } catch(e) { toast('Failed to load policies', true); }
+function doLockUnlock() {
+    if (data.locked) {
+        showPanel('Unlock', 'Enter your passphrase to unlock all vaults.');
+        pendingAuthAction = 'unlock';
+    } else {
+        showPanel('Lock All Vaults', 'Enter your passphrase to lock and unmount all vaults.');
+        pendingAuthAction = 'lock';
+    }
+    document.getElementById('panelAuth').style.display = 'block';
+    document.getElementById('panelPassInput').value = '';
+    setTimeout(function() { document.getElementById('panelPassInput').focus(); }, 100);
+}
+
+function panelAuthSubmit() {
+    var pass = document.getElementById('panelPassInput').value;
+    if (!pass) return;
+    document.getElementById('panelPassInput').value = '';
+    postAPI('/api/' + pendingAuthAction, pass).then(function(j) {
+        toast(j.msg, !j.ok);
+    }).catch(function() { toast('Failed', true); });
+    hidePanel();
+    pendingAuthAction = null;
+    setTimeout(fetchData, 500);
+}
+
+function viewPolicies() {
+    fetch(API + '/api/policies').then(function(r) { return r.text(); }).then(function(text) {
+        showPanel('All Policies', text);
+    }).catch(function() { toast('Failed to load policies', true); });
 }
 
 function showPanel(title, body) {
     document.getElementById('panelTitle').textContent = title;
-    document.getElementById('panelBody').textContent = body;
+    document.getElementById('panelBody').textContent = body || '';
+    document.getElementById('panelAuth').style.display = 'none';
     document.getElementById('panelOverlay').className = 'panel-overlay show';
 }
 
