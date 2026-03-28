@@ -308,6 +308,10 @@ int onvault_vault_remove(const onvault_key_t *master_key,
     if (!master_key || !vault_id)
         return ONVAULT_ERR_INVALID;
 
+    /* Validate vault_id */
+    if (!validate_vault_id(vault_id))
+        return ONVAULT_ERR_INVALID;
+
     char vault_dir[PATH_MAX], mount_dir[PATH_MAX], source_path[PATH_MAX];
     onvault_vault_get_paths(vault_id, vault_dir, mount_dir, source_path);
 

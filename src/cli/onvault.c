@@ -188,10 +188,18 @@ static int cmd_vault_add(const char *path)
         return 1;
     }
 
+    /* Resolve to absolute path before sending to daemon
+     * (daemon may have a different CWD) */
+    char resolved[PATH_MAX];
+    if (!realpath(path, resolved)) {
+        fprintf(stderr, "Path not found: %s\n", path);
+        return 1;
+    }
+
     char response[ONVAULT_IPC_MAX_MSG];
     uint32_t resp_len = sizeof(response) - 1;
     int rc = onvault_ipc_send(IPC_CMD_VAULT_ADD,
-                               path, (uint32_t)strlen(path) + 1,
+                               resolved, (uint32_t)strlen(resolved) + 1,
                                response, &resp_len);
 
     if (rc == ONVAULT_ERR_AUTH) {
@@ -313,6 +321,11 @@ int main(int argc, char *argv[])
 
     if (strcmp(cmd, "allow") == 0 && argc >= 4)
         return cmd_allow(argv[2], argv[3]);
+
+    if (strcmp(cmd, "version") == 0 || strcmp(cmd, "--version") == 0 || strcmp(cmd, "-v") == 0) {
+        printf("onvault %s\n", ONVAULT_VERSION);
+        return 0;
+    }
 
     if (strcmp(cmd, "help") == 0 || strcmp(cmd, "--help") == 0 || strcmp(cmd, "-h") == 0) {
         usage();

@@ -1,12 +1,16 @@
 # onvault — Seamless File Encryption & Access Control for macOS
 # Makefile
 
+VERSION  = $(shell cat VERSION 2>/dev/null || echo 0.0.0)
+
 CC       = clang
 CFLAGS   = -Wall -Wextra -Werror -pedantic -std=c17 -O2
 CFLAGS  += -mmacosx-version-min=15.0
+CFLAGS  += -DONVAULT_VERSION='"$(VERSION)"'
 
 OBJCFLAGS = -Wall -Wextra -Werror -O2 -fobjc-arc
 OBJCFLAGS += -mmacosx-version-min=15.0
+OBJCFLAGS += -DONVAULT_VERSION='"$(VERSION)"'
 
 # Homebrew paths
 BREW_PREFIX  = $(shell brew --prefix 2>/dev/null || echo /opt/homebrew)

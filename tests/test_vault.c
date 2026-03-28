@@ -23,6 +23,7 @@
 #include "log.h"
 #include "../auth/auth.h"
 #include "../fuse/encrypt.h"
+#include "../fuse/vault.h"
 #include "../esf/policy.h"
 
 #include <stdio.h>
@@ -479,6 +480,210 @@ static int test_full_pipeline(void)
     return ok;
 }
 
+/* --- Vault add/remove lifecycle --- */
+
+static int test_vault_add_remove(void)
+{
+    /* Create a mock sensitive directory with multiple files */
+    char src_dir[PATH_MAX];
+    snprintf(src_dir, PATH_MAX, "%s/mock_ssh", g_test_dir);
+    mkdir(src_dir, 0700);
+
+    /* Create files with known content */
+    const char *files[] = {"id_rsa", "id_rsa.pub", "config", "known_hosts"};
+    const char *contents[] = {
+        "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBg...",
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFake user@host",
+        "Host github.com\n  User git\n  IdentityFile ~/.ssh/id_rsa\n",
+        "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFake"
+    };
+
+    for (int i = 0; i < 4; i++) {
+        char fpath[PATH_MAX];
+        snprintf(fpath, PATH_MAX, "%s/%s", src_dir, files[i]);
+        FILE *f = fopen(fpath, "w");
+        if (!f) return 0;
+        fprintf(f, "%s", contents[i]);
+        fclose(f);
+    }
+
+    /* Also create a subdirectory with a file */
+    char subdir[PATH_MAX];
+    snprintf(subdir, PATH_MAX, "%s/keys", src_dir);
+    mkdir(subdir, 0700);
+    char subfile[PATH_MAX];
+    snprintf(subfile, PATH_MAX, "%s/deploy.pem", subdir);
+    FILE *sf = fopen(subfile, "w");
+    fprintf(sf, "deploy key content here");
+    fclose(sf);
+
+    /* Generate master key and add vault */
+    onvault_key_t master_key;
+    onvault_random_bytes(master_key.data, ONVAULT_KEY_SIZE);
+
+    /* Set data dir for this test */
+    char data_dir[PATH_MAX];
+    onvault_get_data_dir(data_dir);
+    char vaults_dir[PATH_MAX], mnt_dir[PATH_MAX];
+    snprintf(vaults_dir, PATH_MAX, "%s/vaults", data_dir);
+    snprintf(mnt_dir, PATH_MAX, "%s/mnt", data_dir);
+    mkdir(vaults_dir, 0700);
+    mkdir(mnt_dir, 0700);
+
+    int rc = onvault_vault_add(&master_key, src_dir, "test_ssh");
+    if (rc != ONVAULT_OK) {
+        fprintf(stderr, "vault_add failed: %d\n", rc);
+        onvault_memzero(master_key.data, ONVAULT_KEY_SIZE);
+        return 0;
+    }
+
+    /* Verify: original path should now be a symlink */
+    struct stat lst;
+    if (lstat(src_dir, &lst) != 0 || !S_ISLNK(lst.st_mode)) {
+        fprintf(stderr, "source not a symlink after vault_add\n");
+        onvault_memzero(master_key.data, ONVAULT_KEY_SIZE);
+        return 0;
+    }
+
+    /* Verify: encrypted files exist in vault directory */
+    char vault_dir[PATH_MAX];
+    snprintf(vault_dir, PATH_MAX, "%s/vaults/test_ssh", data_dir);
+    for (int i = 0; i < 4; i++) {
+        char enc_path[PATH_MAX];
+        snprintf(enc_path, PATH_MAX, "%s/%s", vault_dir, files[i]);
+        struct stat est;
+        if (stat(enc_path, &est) != 0) {
+            fprintf(stderr, "encrypted file missing: %s\n", files[i]);
+            onvault_memzero(master_key.data, ONVAULT_KEY_SIZE);
+            return 0;
+        }
+
+        /* Verify nonce xattr exists */
+        onvault_nonce_t nonce;
+        if (onvault_file_nonce_load(enc_path, &nonce) != ONVAULT_OK) {
+            fprintf(stderr, "nonce xattr missing: %s\n", files[i]);
+            onvault_memzero(master_key.data, ONVAULT_KEY_SIZE);
+            return 0;
+        }
+
+        /* Verify ciphertext doesn't contain plaintext */
+        FILE *ef = fopen(enc_path, "rb");
+        char ebuf[512];
+        size_t en = fread(ebuf, 1, sizeof(ebuf), ef);
+        fclose(ef);
+        if (en > 0 && strstr(ebuf, contents[i]) != NULL) {
+            fprintf(stderr, "plaintext found in encrypted file: %s\n", files[i]);
+            onvault_memzero(master_key.data, ONVAULT_KEY_SIZE);
+            return 0;
+        }
+    }
+
+    /* Verify subdirectory encrypted too */
+    char enc_subfile[PATH_MAX];
+    snprintf(enc_subfile, PATH_MAX, "%s/keys/deploy.pem", vault_dir);
+    struct stat sst;
+    if (stat(enc_subfile, &sst) != 0) {
+        fprintf(stderr, "encrypted subdir file missing\n");
+        onvault_memzero(master_key.data, ONVAULT_KEY_SIZE);
+        return 0;
+    }
+
+    /* Now remove the vault — should decrypt back to original location */
+    rc = onvault_vault_remove(&master_key, "test_ssh");
+    if (rc != ONVAULT_OK) {
+        fprintf(stderr, "vault_remove failed: %d\n", rc);
+        onvault_memzero(master_key.data, ONVAULT_KEY_SIZE);
+        return 0;
+    }
+
+    /* Verify: original path is now a regular directory (not symlink) */
+    if (lstat(src_dir, &lst) != 0 || !S_ISDIR(lst.st_mode) || S_ISLNK(lst.st_mode)) {
+        fprintf(stderr, "source not restored to directory after vault_remove\n");
+        onvault_memzero(master_key.data, ONVAULT_KEY_SIZE);
+        return 0;
+    }
+
+    /* Verify: decrypted content matches original */
+    for (int i = 0; i < 4; i++) {
+        char fpath[PATH_MAX];
+        snprintf(fpath, PATH_MAX, "%s/%s", src_dir, files[i]);
+        FILE *f = fopen(fpath, "r");
+        if (!f) {
+            fprintf(stderr, "decrypted file missing: %s\n", files[i]);
+            onvault_memzero(master_key.data, ONVAULT_KEY_SIZE);
+            return 0;
+        }
+        char rbuf[512];
+        size_t rn = fread(rbuf, 1, sizeof(rbuf), f);
+        fclose(f);
+        rbuf[rn] = '\0';
+        if (strcmp(rbuf, contents[i]) != 0) {
+            fprintf(stderr, "content mismatch after roundtrip: %s\n", files[i]);
+            onvault_memzero(master_key.data, ONVAULT_KEY_SIZE);
+            return 0;
+        }
+    }
+
+    /* Verify subdirectory file roundtrip */
+    FILE *dsf = fopen(subfile, "r");
+    if (!dsf) {
+        onvault_memzero(master_key.data, ONVAULT_KEY_SIZE);
+        return 0;
+    }
+    char dbuf[256];
+    size_t dn = fread(dbuf, 1, sizeof(dbuf), dsf);
+    fclose(dsf);
+    dbuf[dn] = '\0';
+    if (strcmp(dbuf, "deploy key content here") != 0) {
+        onvault_memzero(master_key.data, ONVAULT_KEY_SIZE);
+        return 0;
+    }
+
+    onvault_memzero(master_key.data, ONVAULT_KEY_SIZE);
+
+    /* Cleanup vault remnants */
+    cleanup_path(vault_dir);
+    char mnt_vault[PATH_MAX];
+    snprintf(mnt_vault, PATH_MAX, "%s/mnt/test_ssh", data_dir);
+    rmdir(mnt_vault);
+
+    return 1;
+}
+
+/* --- Path traversal rejection --- */
+
+static int test_vault_id_validation(void)
+{
+    onvault_key_t master_key;
+    onvault_random_bytes(master_key.data, ONVAULT_KEY_SIZE);
+
+    /* Create a real dir for the source */
+    char src_dir[PATH_MAX];
+    snprintf(src_dir, PATH_MAX, "%s/traverse_test", g_test_dir);
+    mkdir(src_dir, 0700);
+    char fpath[PATH_MAX];
+    snprintf(fpath, PATH_MAX, "%s/data.txt", src_dir);
+    FILE *f = fopen(fpath, "w");
+    fprintf(f, "test");
+    fclose(f);
+
+    /* Path traversal attempts should be rejected */
+    int rc = onvault_vault_add(&master_key, src_dir, "../../etc");
+    if (rc != ONVAULT_ERR_INVALID) return 0;
+
+    rc = onvault_vault_add(&master_key, src_dir, "../passwd");
+    if (rc != ONVAULT_ERR_INVALID) return 0;
+
+    rc = onvault_vault_add(&master_key, src_dir, "a/b/c");
+    if (rc != ONVAULT_ERR_INVALID) return 0;
+
+    /* Valid vault IDs should be accepted */
+    /* (but we don't actually add — just verify the validation) */
+
+    onvault_memzero(master_key.data, ONVAULT_KEY_SIZE);
+    return 1;
+}
+
 int main(void)
 {
     printf("onvault end-to-end test suite\n");
@@ -504,6 +709,10 @@ int main(void)
 
     printf("\nEncrypted logging:\n");
     TEST(encrypted_log);
+
+    printf("\nVault lifecycle:\n");
+    TEST(vault_add_remove);
+    TEST(vault_id_validation);
 
     printf("\nFull pipeline:\n");
     TEST(full_pipeline);

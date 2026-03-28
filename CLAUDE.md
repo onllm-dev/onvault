@@ -23,7 +23,7 @@ Key hierarchy: Passphrase → Argon2id → Master Key (Secure Enclave wrapped) �
 ```bash
 ./app.sh --deps          # Install dependencies
 ./app.sh --build         # Development build
-./app.sh --test          # Run all 23 tests
+./app.sh --test          # Run all 25 tests
 ./app.sh --dist          # Static-linked distribution build
 ./app.sh --check         # Verify system readiness
 ```
