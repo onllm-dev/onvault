@@ -1062,6 +1062,16 @@ static void handle_http_client(int client_fd)
     close(client_fd);
 }
 
+/* Thread wrapper for HTTP client handling */
+static void *handle_http_client_thread(void *arg)
+{
+    int *fd_ptr = (int *)arg;
+    int fd = *fd_ptr;
+    free(fd_ptr);
+    handle_http_client(fd);
+    return NULL;
+}
+
 /* HTTP accept loop — runs on background thread */
 static void *http_accept_loop(void *arg)
 {
@@ -1082,8 +1092,23 @@ static void *http_accept_loop(void *arg)
             int client_fd = accept(g_http_sock,
                                     (struct sockaddr *)&client_addr,
                                     &client_len);
-            if (client_fd >= 0)
-                handle_http_client(client_fd);
+            if (client_fd >= 0) {
+                /* Handle each HTTP request in a new thread to avoid
+                 * blocking on slow operations (Argon2id ~2-3s) */
+                int *fd_ptr = malloc(sizeof(int));
+                if (fd_ptr) {
+                    *fd_ptr = client_fd;
+                    pthread_t ht;
+                    if (pthread_create(&ht, NULL, (void *(*)(void *))handle_http_client_thread, fd_ptr) == 0) {
+                        pthread_detach(ht);
+                    } else {
+                        handle_http_client(client_fd);
+                        free(fd_ptr);
+                    }
+                } else {
+                    handle_http_client(client_fd);
+                }
+            }
         }
     }
     return NULL;
@@ -1237,15 +1262,16 @@ static const char *get_menubar_html(void)
     "                '<span class=\"denial-proc\">' + d.process + '</span> \\u2192 ' + d.vault +\n                '<div class=\"denial-file\">' + d.file + '</div></div>' +\n                '<span class=\"denial-time\">' + timeAgo(d.time) + '</span>' +\n                '<button class=\"denial-allow\" onclick=\"quickAllow(\\'' + d.path + '\\',\\'' + d.vault + '\\')\">Allow</button></div>';\n"
     "        }).join('');\n    } else { ds.style.display = 'none'; }\n\n    var lockBtn = document.getElementById('lockBtn');\n    if (lockBtn) lockBtn.textContent = data.locked ? 'Unlock' : 'Lock';\n\n    document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});\n    notifyResize();\n}\n\nfunction toggle(id) {\n"
     "    expandedVaults[id] = !expandedVaults[id];\n    render();\n}\n\nfunction showInput(type, id) {\n    var el = document.getElementById(type + '-' + id);\n    var other = type === 'allow' ? 'deny' : 'allow';\n    el.style.display = el.style.display === 'none' ? 'flex' : 'none';\n    document.getElementById(other + '-' + id).style.display = 'none';\n}\n\nfunction doRule(type, id) {\n"
-    "    var input = document.getElementById(type + '-input-' + id);\n    var proc = input.value.trim();\n    if (!proc) return;\n    postAPI('/api/' + type, proc + '\\n' + id).then(function(j) {\n        toast(j.msg, !j.ok);\n    }).catch(function() { toast('Failed', true); });\n    input.value = '';\n    document.getElementById(type + '-' + id).style.display = 'none';\n"
-    "    setTimeout(fetchData, 300);\n}\n\nfunction promptAddVault() {\n    var panel = document.getElementById('addVaultPanel');\n    panel.style.display = panel.style.display === 'none' ? 'block' : 'none';\n    if (panel.style.display === 'block') document.getElementById('addVaultInput').focus();\n    notifyResize();\n}\n\nfunction doAddVault() {\n"
-    "    var input = document.getElementById('addVaultInput');\n    var path = input.value.trim();\n    if (!path) return;\n    postAPI('/api/vault/add', path).then(function(j) {\n        toast(j.msg, !j.ok);\n    }).catch(function() { toast('Failed to add vault', true); });\n    input.value = '';\n    document.getElementById('addVaultPanel').style.display = 'none';\n    setTimeout(fetchData, 300);\n"
-    "}\n\nfunction viewRules(id) {\n    fetch(API + '/api/rules?vault=' + id).then(function(r) { return r.text(); }).then(function(text) {\n        showPanel('Rules: ' + id, text);\n    }).catch(function() { toast('Failed to load rules', true); });\n}\n\nfunction quickAllow(proc, vault) {\n    postAPI('/api/allow', proc + '\\n' + vault).then(function(j) {\n        toast(j.msg, !j.ok);\n"
-    "    }).catch(function() { toast('Failed', true); });\n    setTimeout(fetchData, 300);\n}\n\nfunction refresh() {\n    var btn = document.getElementById('refreshBtn');\n    btn.innerHTML = '<span class=\"spinning\">\\u21bb</span>';\n    fetchData().then(function() { btn.textContent = 'Refresh'; });\n}\n\nfunction doLockUnlock() {\n    if (data.locked) {\n"
-    "        showPanel('Unlock', 'Enter your passphrase to unlock all vaults.');\n        pendingAuthAction = 'unlock';\n    } else {\n        showPanel('Lock All Vaults', 'Enter your passphrase to lock and unmount all vaults.');\n        pendingAuthAction = 'lock';\n    }\n    document.getElementById('panelAuth').style.display = 'block';\n    document.getElementById('panelPassInput').value = '';\n"
-    "    setTimeout(function() { document.getElementById('panelPassInput').focus(); }, 100);\n}\n\nfunction panelAuthSubmit() {\n    var pass = document.getElementById('panelPassInput').value;\n    if (!pass) return;\n    document.getElementById('panelPassInput').value = '';\n    postAPI('/api/' + pendingAuthAction, pass).then(function(j) {\n        toast(j.msg, !j.ok);\n"
-    "    }).catch(function() { toast('Failed', true); });\n    hidePanel();\n    pendingAuthAction = null;\n    setTimeout(fetchData, 500);\n}\n\nfunction viewPolicies() {\n    fetch(API + '/api/policies').then(function(r) { return r.text(); }).then(function(text) {\n        showPanel('All Policies', text);\n    }).catch(function() { toast('Failed to load policies', true); });\n}\n\n"
-    "function showPanel(title, body) {\n    document.getElementById('panelTitle').textContent = title;\n    document.getElementById('panelBody').textContent = body || '';\n    document.getElementById('panelAuth').style.display = 'none';\n    document.getElementById('panelOverlay').className = 'panel-overlay show';\n}\n\nfunction hidePanel() {\n"
-    "    document.getElementById('panelOverlay').className = 'panel-overlay';\n}\n\nfunction notifyResize() {\n    try { window.webkit.messageHandlers.resize.postMessage(document.body.scrollHeight); } catch(e) {}\n}\n\nfetchData();\nwindow._refreshInterval = setInterval(fetchData, 5000);\n</script>\n</body>\n</html>\n"
+    "    var input = document.getElementById(type + '-input-' + id);\n    var proc = input.value.trim();\n    if (!proc) return;\n    input.value = '';\n    document.getElementById(type + '-' + id).style.display = 'none';\n    postAPI('/api/' + type, proc + '\\n' + id).then(function(j) {\n        toast(j.msg, !j.ok);\n        fetchData();\n    }).catch(function() { toast('Failed', true); });\n}\n\n"
+    "function promptAddVault() {\n    var panel = document.getElementById('addVaultPanel');\n    panel.style.display = panel.style.display === 'none' ? 'block' : 'none';\n    if (panel.style.display === 'block') document.getElementById('addVaultInput').focus();\n    notifyResize();\n}\n\nfunction doAddVault() {\n    var input = document.getElementById('addVaultInput');\n"
+    "    var path = input.value.trim();\n    if (!path) return;\n    input.value = '';\n    document.getElementById('addVaultPanel').style.display = 'none';\n    postAPI('/api/vault/add', path).then(function(j) {\n        toast(j.msg, !j.ok);\n        fetchData();\n    }).catch(function() { toast('Failed to add vault', true); });\n}\n\nfunction viewRules(id) {\n"
+    "    fetch(API + '/api/rules?vault=' + id).then(function(r) { return r.text(); }).then(function(text) {\n        showPanel('Rules: ' + id, text);\n    }).catch(function() { toast('Failed to load rules', true); });\n}\n\nfunction quickAllow(proc, vault) {\n    postAPI('/api/allow', proc + '\\n' + vault).then(function(j) {\n        toast(j.msg, !j.ok);\n        fetchData();\n"
+    "    }).catch(function() { toast('Failed', true); });\n}\n\nfunction refresh() {\n    var btn = document.getElementById('refreshBtn');\n    btn.innerHTML = '<span class=\"spinning\">\\u21bb</span>';\n    fetchData().then(function() { btn.textContent = 'Refresh'; });\n}\n\nfunction doLockUnlock() {\n    if (data.locked) {\n        showPanel('Unlock', 'Enter your passphrase to unlock all vaults.');\n"
+    "        pendingAuthAction = 'unlock';\n    } else {\n        showPanel('Lock All Vaults', 'Enter your passphrase to lock and unmount all vaults.');\n        pendingAuthAction = 'lock';\n    }\n    document.getElementById('panelAuth').style.display = 'block';\n    document.getElementById('panelPassInput').value = '';\n"
+    "    setTimeout(function() { document.getElementById('panelPassInput').focus(); }, 100);\n}\n\nfunction panelAuthSubmit() {\n    var pass = document.getElementById('panelPassInput').value;\n    if (!pass) return;\n    document.getElementById('panelPassInput').value = '';\n    var action = pendingAuthAction;\n    pendingAuthAction = null;\n\n    /* Show loading state */\n"
+    "    document.getElementById('panelBody').textContent = 'Authenticating...';\n    document.getElementById('panelAuth').style.display = 'none';\n\n    postAPI('/api/' + action, pass).then(function(j) {\n        toast(j.msg, !j.ok);\n        hidePanel();\n        fetchData();\n    }).catch(function() {\n        toast('Failed — try again', true);\n        hidePanel();\n    });\n}\n\n"
+    "function viewPolicies() {\n    fetch(API + '/api/policies').then(function(r) { return r.text(); }).then(function(text) {\n        showPanel('All Policies', text);\n    }).catch(function() { toast('Failed to load policies', true); });\n}\n\nfunction showPanel(title, body) {\n    document.getElementById('panelTitle').textContent = title;\n"
+    "    document.getElementById('panelBody').textContent = body || '';\n    document.getElementById('panelAuth').style.display = 'none';\n    document.getElementById('panelOverlay').className = 'panel-overlay show';\n}\n\nfunction hidePanel() {\n    document.getElementById('panelOverlay').className = 'panel-overlay';\n}\n\nfunction notifyResize() {\n"
+    "    try { window.webkit.messageHandlers.resize.postMessage(document.body.scrollHeight); } catch(e) {}\n}\n\nfetchData();\nwindow._refreshInterval = setInterval(fetchData, 5000);\n</script>\n</body>\n</html>\n"
     ;
 }

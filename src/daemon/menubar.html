@@ -266,12 +266,12 @@ function doRule(type, id) {
     var input = document.getElementById(type + '-input-' + id);
     var proc = input.value.trim();
     if (!proc) return;
-    postAPI('/api/' + type, proc + '\n' + id).then(function(j) {
-        toast(j.msg, !j.ok);
-    }).catch(function() { toast('Failed', true); });
     input.value = '';
     document.getElementById(type + '-' + id).style.display = 'none';
-    setTimeout(fetchData, 300);
+    postAPI('/api/' + type, proc + '\n' + id).then(function(j) {
+        toast(j.msg, !j.ok);
+        fetchData();
+    }).catch(function() { toast('Failed', true); });
 }
 
 function promptAddVault() {
@@ -285,12 +285,12 @@ function doAddVault() {
     var input = document.getElementById('addVaultInput');
     var path = input.value.trim();
     if (!path) return;
-    postAPI('/api/vault/add', path).then(function(j) {
-        toast(j.msg, !j.ok);
-    }).catch(function() { toast('Failed to add vault', true); });
     input.value = '';
     document.getElementById('addVaultPanel').style.display = 'none';
-    setTimeout(fetchData, 300);
+    postAPI('/api/vault/add', path).then(function(j) {
+        toast(j.msg, !j.ok);
+        fetchData();
+    }).catch(function() { toast('Failed to add vault', true); });
 }
 
 function viewRules(id) {
@@ -302,8 +302,8 @@ function viewRules(id) {
 function quickAllow(proc, vault) {
     postAPI('/api/allow', proc + '\n' + vault).then(function(j) {
         toast(j.msg, !j.ok);
+        fetchData();
     }).catch(function() { toast('Failed', true); });
-    setTimeout(fetchData, 300);
 }
 
 function refresh() {
@@ -329,12 +329,21 @@ function panelAuthSubmit() {
     var pass = document.getElementById('panelPassInput').value;
     if (!pass) return;
     document.getElementById('panelPassInput').value = '';
-    postAPI('/api/' + pendingAuthAction, pass).then(function(j) {
-        toast(j.msg, !j.ok);
-    }).catch(function() { toast('Failed', true); });
-    hidePanel();
+    var action = pendingAuthAction;
     pendingAuthAction = null;
-    setTimeout(fetchData, 500);
+
+    /* Show loading state */
+    document.getElementById('panelBody').textContent = 'Authenticating...';
+    document.getElementById('panelAuth').style.display = 'none';
+
+    postAPI('/api/' + action, pass).then(function(j) {
+        toast(j.msg, !j.ok);
+        hidePanel();
+        fetchData();
+    }).catch(function() {
+        toast('Failed — try again', true);
+        hidePanel();
+    });
 }
 
 function viewPolicies() {
