@@ -43,6 +43,31 @@ int onvault_auth_check_session(onvault_key_t *master_key_out);
 int onvault_auth_lock(void);
 
 /*
+ * Verify a passphrase without performing a full unlock.
+ * Used for auth-gating destructive operations (lock, vault remove).
+ * Returns ONVAULT_OK if passphrase is correct.
+ */
+int onvault_auth_verify_passphrase(const char *passphrase);
+
+/*
+ * Compute a challenge-response proof for IPC auth.
+ * proof = SHA-256(Argon2id(passphrase, salt) || nonce)
+ * The nonce must be obtained from the daemon via IPC_CMD_AUTH_CHALLENGE.
+ * proof_out: 32-byte output buffer
+ */
+int onvault_auth_compute_proof(const char *passphrase,
+                                const uint8_t *nonce, size_t nonce_len,
+                                uint8_t *proof_out);
+
+/*
+ * Verify a challenge-response proof against the stored master key.
+ * proof = SHA-256(master_key || nonce)
+ * Returns ONVAULT_OK if valid.
+ */
+int onvault_auth_verify_proof(const uint8_t *proof,
+                               const uint8_t *nonce, size_t nonce_len);
+
+/*
  * Check if onvault has been initialized (salt + wrapped key exist).
  * Returns 1 if initialized, 0 if not.
  */

@@ -60,6 +60,21 @@ int onvault_policy_add_rule(const char *vault_id,
                              onvault_rule_action_t action);
 
 /*
+ * Get rules for a vault as a human-readable string.
+ * buf: output buffer
+ * buf_len: buffer size
+ * Returns number of rules found, or -1 on error.
+ */
+int onvault_policy_get_rules(const char *vault_id, char *buf, size_t buf_len);
+
+/*
+ * Get all policies as a human-readable string.
+ * buf: output buffer
+ * buf_len: buffer size
+ */
+int onvault_policy_show(char *buf, size_t buf_len);
+
+/*
  * Clear all policies (shutdown).
  */
 void onvault_policy_clear(void);

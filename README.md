@@ -80,20 +80,23 @@ onvaultd --no-gui &         # headless (servers, CI)
 onvault unlock
 
 # 4. Protect directories — encrypts files, creates symlink
-onvault vault add ~/.ssh    # encrypt SSH keys
-onvault vault add ~/.aws    # encrypt AWS credentials
+onvault vault add ~/.ssh --smart  # encrypt + auto-populate allowlist
+onvault vault add ~/.aws --smart  # encrypt AWS credentials
 
-# 5. Status — see what's protected
+# 5. Interactive configuration
+onvault configure             # manage vaults, rules, logs (passphrase required)
+
+# 6. Status — see what's protected
 onvault status
 
-# 6. Lock — unmount vaults, wipe keys from memory, stop daemon
+# 7. Lock — unmount vaults, wipe keys from memory (passphrase required)
 onvault lock
 ```
 
 ### What Happens When You Add a Vault
 
 ```
-onvault vault add ~/.ssh
+onvault vault add ~/.ssh --smart
 ```
 
 1. Files in `~/.ssh/` are encrypted (AES-256-XTS) and moved to `~/.onvault/vaults/ssh/`
@@ -102,7 +105,38 @@ onvault vault add ~/.ssh
 4. When unlocked: FUSE mount decrypts on-the-fly. `ssh`, `git`, etc. work normally.
 5. When locked or daemon stops: FUSE unmounts. `~/.ssh` symlink points to nothing. Files are ciphertext.
 
-To undo: `onvault vault remove ssh` decrypts everything back to the original location.
+To undo: `onvault vault remove ssh` decrypts everything back to the original location (passphrase required).
+
+### Auth-Gated Operations
+
+Destructive operations require passphrase verification to prevent unauthorized disabling of protection. A malicious script running as your user **cannot** disable onvault without knowing your passphrase:
+
+| Operation | Auth Required |
+|-----------|--------------|
+| `onvault lock` | Passphrase |
+| `onvault vault remove` | Passphrase |
+| `onvault configure` | Passphrase |
+| Menu bar Lock/Remove | Passphrase (secure dialog) |
+| `onvault unlock` | Passphrase |
+| `onvault vault add` | Session (must be unlocked) |
+| `onvault allow/deny` | Session (must be unlocked) |
+| `onvault status/rules/log` | No auth (read-only) |
+
+The passphrase proof is verified by the daemon via SHA-256(Argon2id(passphrase, salt)) — the passphrase itself never travels over the IPC socket.
+
+### Smart Defaults
+
+Pass `--smart` when adding a vault for a known directory to auto-populate an allowlist of verified binaries:
+
+| Path | Auto-allowed |
+|------|-------------|
+| `~/.ssh` | ssh, scp, sftp, ssh-add, ssh-agent, ssh-keygen, git |
+| `~/.aws` | aws, terraform, pulumi |
+| `~/.kube` | kubectl, helm, k9s |
+| `~/.gnupg` | gpg, gpg2, gpg-agent, git |
+| `~/.docker` | docker, Docker.app |
+
+Only binaries that exist on your system are added. Each binary is hash-verified.
 
 ### Managing Access Policies
 
@@ -113,13 +147,35 @@ Only processes in the allowlist can read your encrypted files. Everything else i
 onvault allow /usr/bin/vim ssh
 onvault allow /opt/homebrew/bin/gh ssh
 
+# Deny a specific binary
+onvault deny /usr/bin/python3 ssh
+
+# View rules for a vault
+onvault rules ssh
+
+# View all policies across vaults
+onvault policy show
+
 # See what processes access a path (learning mode — observe for 24h)
 onvault vault watch ~/.ssh
 onvault vault suggest ssh
 
-# View denied access attempts
+# View audit log (all events or denied only)
+onvault log
 onvault log --denied
 ```
+
+### Menu Bar
+
+The daemon shows a menu bar icon with full vault management:
+
+- **Vault list** — see all vaults with status (locked/unlocked)
+- **Add Vault** — folder picker to protect a new directory
+- **Remove Vault** — decrypt and unprotect (per-vault submenu)
+- **View Rules** — see which processes are allowed per vault
+- **Recent Denials** — last 5 denied access attempts with process details
+- **Quick Allow** — grant access to a denied process directly from the menu
+- **Lock/Unlock All** — toggle vault access
 
 ### Version
 

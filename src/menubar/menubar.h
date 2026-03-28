@@ -26,8 +26,13 @@ void onvault_menubar_set_vault_count(int count);
 
 /*
  * Show a denial notification.
+ * process_name: short name (e.g., "python3")
+ * process_path: full path (e.g., "/usr/bin/python3") — used for allow rules
+ * file_path: file that was accessed
+ * vault_id: which vault
  */
 void onvault_menubar_notify_deny(const char *process_name,
+                                   const char *process_path,
                                    const char *file_path,
                                    const char *vault_id);
 

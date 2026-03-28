@@ -54,6 +54,7 @@ LDFLAGS_GUI  = $(LDFLAGS)
 LDFLAGS_GUI += -framework Cocoa
 LDFLAGS_GUI += -framework UserNotifications
 LDFLAGS_GUI += -framework LocalAuthentication
+LDFLAGS_GUI += -framework WebKit
 
 # Find the newest macOS SDK that has EndpointSecurity
 MACOS_SDK := $(shell for sdk in /Library/Developer/CommandLineTools/SDKs/MacOSX26*.sdk /Library/Developer/CommandLineTools/SDKs/MacOSX15*.sdk; do \
@@ -178,7 +179,7 @@ dist: $(ALL_C_OBJ) $(KEYSTORE_OBJ) $(ESF_M_OBJ) $(MENUBAR_OBJ) $(TOUCHID_OBJ)
 	$(CC) $(OBJCFLAGS) $(INCLUDES) -o $(DAEMON_BIN) src/daemon/onvaultd.c \
 		$(ALL_C_OBJ) $(KEYSTORE_OBJ) $(ESF_M_OBJ) $(MENUBAR_OBJ) $(TOUCHID_OBJ) \
 		$(STATIC_LDFLAGS) -framework Cocoa -framework UserNotifications \
-		-framework LocalAuthentication $(FUSE_LDFLAGS) \
+		-framework LocalAuthentication -framework WebKit $(FUSE_LDFLAGS) \
 		$(if $(filter 1,$(ESF_TBD)),-lEndpointSecurity -lbsm)
 	@echo ""
 	@echo "=== Distribution build complete ==="

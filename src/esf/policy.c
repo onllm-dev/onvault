@@ -223,6 +223,103 @@ int onvault_policy_add_rule(const char *vault_id,
     return ONVAULT_ERR_NOT_FOUND;
 }
 
+int onvault_policy_get_rules(const char *vault_id, char *buf, size_t buf_len)
+{
+    if (!vault_id || !buf || buf_len == 0)
+        return -1;
+
+    pthread_rwlock_rdlock(&g_policy_lock);
+
+    const onvault_vault_policy_t *policy = NULL;
+    for (int i = 0; i < g_policy_count; i++) {
+        if (strcmp(g_policies[i].vault_id, vault_id) == 0) {
+            policy = &g_policies[i];
+            break;
+        }
+    }
+
+    if (!policy) {
+        pthread_rwlock_unlock(&g_policy_lock);
+        snprintf(buf, buf_len, "No policy found for vault: %s\n", vault_id);
+        return -1;
+    }
+
+    int off = 0;
+    off += snprintf(buf + off, buf_len - (size_t)off,
+                    "Vault: %s (mount: %s)\n", policy->vault_id, policy->mount_path);
+
+    const char *mode_str = "codesign_preferred";
+    if (policy->verify_mode == VERIFY_HASH_ONLY) mode_str = "hash_only";
+    else if (policy->verify_mode == VERIFY_CODESIGN_REQUIRED) mode_str = "codesign_required";
+    off += snprintf(buf + off, buf_len - (size_t)off,
+                    "Verification: %s\n", mode_str);
+    off += snprintf(buf + off, buf_len - (size_t)off,
+                    "Rules (%d):\n", policy->rule_count);
+
+    for (int i = 0; i < policy->rule_count; i++) {
+        const onvault_rule_t *r = &policy->rules[i];
+        const char *action = (r->action == RULE_ALLOW) ? "ALLOW" : "DENY";
+        off += snprintf(buf + off, buf_len - (size_t)off,
+                        "  [%d] %s %s", i + 1, action, r->process_path);
+        if (r->use_team_id && r->team_id[0])
+            off += snprintf(buf + off, buf_len - (size_t)off,
+                            " (team: %s)", r->team_id);
+        if (r->use_hash)
+            off += snprintf(buf + off, buf_len - (size_t)off, " [hash verified]");
+        off += snprintf(buf + off, buf_len - (size_t)off, "\n");
+    }
+
+    if (policy->rule_count == 0)
+        off += snprintf(buf + off, buf_len - (size_t)off,
+                        "  (none — all access denied by default)\n");
+
+    int count = policy->rule_count;
+    pthread_rwlock_unlock(&g_policy_lock);
+    return count;
+}
+
+int onvault_policy_show(char *buf, size_t buf_len)
+{
+    if (!buf || buf_len == 0)
+        return ONVAULT_ERR_INVALID;
+
+    pthread_rwlock_rdlock(&g_policy_lock);
+
+    int off = 0;
+    off += snprintf(buf + off, buf_len - (size_t)off,
+                    "Policies (%d vault(s)):\n\n", g_policy_count);
+
+    for (int i = 0; i < g_policy_count; i++) {
+        const onvault_vault_policy_t *p = &g_policies[i];
+        const char *mode_str = "codesign_preferred";
+        if (p->verify_mode == VERIFY_HASH_ONLY) mode_str = "hash_only";
+        else if (p->verify_mode == VERIFY_CODESIGN_REQUIRED) mode_str = "codesign_required";
+
+        off += snprintf(buf + off, buf_len - (size_t)off,
+                        "[%s] mount=%s verify=%s escalation=%s\n",
+                        p->vault_id, p->mount_path, mode_str,
+                        p->allow_escalated ? "allowed" : "denied");
+
+        for (int j = 0; j < p->rule_count; j++) {
+            const onvault_rule_t *r = &p->rules[j];
+            const char *action = (r->action == RULE_ALLOW) ? "ALLOW" : "DENY";
+            off += snprintf(buf + off, buf_len - (size_t)off,
+                            "  %s %s\n", action, r->process_path);
+        }
+        if (p->rule_count == 0)
+            off += snprintf(buf + off, buf_len - (size_t)off,
+                            "  (no rules — default deny)\n");
+        off += snprintf(buf + off, buf_len - (size_t)off, "\n");
+    }
+
+    if (g_policy_count == 0)
+        off += snprintf(buf + off, buf_len - (size_t)off,
+                        "No vaults configured.\n");
+
+    pthread_rwlock_unlock(&g_policy_lock);
+    return ONVAULT_OK;
+}
+
 void onvault_policy_clear(void)
 {
     pthread_rwlock_wrlock(&g_policy_lock);

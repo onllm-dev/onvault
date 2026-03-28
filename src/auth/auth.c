@@ -296,6 +296,133 @@ int onvault_auth_lock(void)
     return ONVAULT_OK;
 }
 
+int onvault_auth_verify_passphrase(const char *passphrase)
+{
+    if (!passphrase)
+        return ONVAULT_ERR_INVALID;
+
+    char data_dir[PATH_MAX];
+    if (onvault_get_data_dir(data_dir) != ONVAULT_OK)
+        return ONVAULT_ERR_IO;
+
+    /* Read salt */
+    char salt_path[PATH_MAX];
+    snprintf(salt_path, PATH_MAX, "%s/salt", data_dir);
+    uint8_t salt[ONVAULT_SALT_SIZE];
+    size_t salt_len = ONVAULT_SALT_SIZE;
+    if (read_file(salt_path, salt, &salt_len) != ONVAULT_OK)
+        return ONVAULT_ERR_NOT_FOUND;
+
+    /* Derive key from passphrase */
+    onvault_key_t derived;
+    onvault_mlock(&derived, sizeof(derived));
+    if (onvault_argon2_derive(passphrase, salt, &derived) != ONVAULT_OK) {
+        onvault_key_wipe(&derived, sizeof(derived));
+        return ONVAULT_ERR_CRYPTO;
+    }
+
+    /* Load stored master key */
+    onvault_key_t stored_key;
+    onvault_mlock(&stored_key, sizeof(stored_key));
+    if (onvault_keystore_load_master_key(&stored_key) != ONVAULT_OK) {
+        onvault_key_wipe(&derived, sizeof(derived));
+        onvault_key_wipe(&stored_key, sizeof(stored_key));
+        return ONVAULT_ERR_KEYCHAIN;
+    }
+
+    /* Constant-time comparison */
+    volatile uint8_t diff = 0;
+    for (int i = 0; i < ONVAULT_KEY_SIZE; i++)
+        diff |= derived.data[i] ^ stored_key.data[i];
+
+    onvault_key_wipe(&derived, sizeof(derived));
+    onvault_key_wipe(&stored_key, sizeof(stored_key));
+
+    return diff ? ONVAULT_ERR_AUTH : ONVAULT_OK;
+}
+
+int onvault_auth_compute_proof(const char *passphrase,
+                                const uint8_t *nonce, size_t nonce_len,
+                                uint8_t *proof_out)
+{
+    if (!passphrase || !nonce || !nonce_len || !proof_out)
+        return ONVAULT_ERR_INVALID;
+
+    char data_dir[PATH_MAX];
+    if (onvault_get_data_dir(data_dir) != ONVAULT_OK)
+        return ONVAULT_ERR_IO;
+
+    /* Read salt */
+    char salt_path[PATH_MAX];
+    snprintf(salt_path, PATH_MAX, "%s/salt", data_dir);
+    uint8_t salt[ONVAULT_SALT_SIZE];
+    size_t salt_len = ONVAULT_SALT_SIZE;
+    if (read_file(salt_path, salt, &salt_len) != ONVAULT_OK)
+        return ONVAULT_ERR_NOT_FOUND;
+
+    /* Derive key from passphrase */
+    onvault_key_t derived;
+    onvault_mlock(&derived, sizeof(derived));
+    if (onvault_argon2_derive(passphrase, salt, &derived) != ONVAULT_OK) {
+        onvault_key_wipe(&derived, sizeof(derived));
+        return ONVAULT_ERR_CRYPTO;
+    }
+
+    /* Proof = SHA-256(derived_key || nonce) — nonce prevents replay */
+    uint8_t preimage[ONVAULT_KEY_SIZE + ONVAULT_HASH_SIZE];
+    memcpy(preimage, derived.data, ONVAULT_KEY_SIZE);
+    memcpy(preimage + ONVAULT_KEY_SIZE, nonce,
+           nonce_len > ONVAULT_HASH_SIZE ? ONVAULT_HASH_SIZE : nonce_len);
+    size_t preimage_len = ONVAULT_KEY_SIZE +
+        (nonce_len > ONVAULT_HASH_SIZE ? ONVAULT_HASH_SIZE : nonce_len);
+
+    onvault_hash_t hash;
+    onvault_sha256(preimage, preimage_len, &hash);
+    memcpy(proof_out, hash.data, ONVAULT_HASH_SIZE);
+
+    onvault_key_wipe(&derived, sizeof(derived));
+    onvault_memzero(preimage, sizeof(preimage));
+    onvault_memzero(&hash, sizeof(hash));
+    return ONVAULT_OK;
+}
+
+int onvault_auth_verify_proof(const uint8_t *proof,
+                               const uint8_t *nonce, size_t nonce_len)
+{
+    if (!proof || !nonce || !nonce_len)
+        return ONVAULT_ERR_INVALID;
+
+    /* Load stored master key */
+    onvault_key_t stored_key;
+    onvault_mlock(&stored_key, sizeof(stored_key));
+    if (onvault_keystore_load_master_key(&stored_key) != ONVAULT_OK) {
+        onvault_key_wipe(&stored_key, sizeof(stored_key));
+        return ONVAULT_ERR_KEYCHAIN;
+    }
+
+    /* Compute expected = SHA-256(master_key || nonce) */
+    uint8_t preimage[ONVAULT_KEY_SIZE + ONVAULT_HASH_SIZE];
+    memcpy(preimage, stored_key.data, ONVAULT_KEY_SIZE);
+    memcpy(preimage + ONVAULT_KEY_SIZE, nonce,
+           nonce_len > ONVAULT_HASH_SIZE ? ONVAULT_HASH_SIZE : nonce_len);
+    size_t preimage_len = ONVAULT_KEY_SIZE +
+        (nonce_len > ONVAULT_HASH_SIZE ? ONVAULT_HASH_SIZE : nonce_len);
+
+    onvault_key_wipe(&stored_key, sizeof(stored_key));
+
+    onvault_hash_t expected;
+    onvault_sha256(preimage, preimage_len, &expected);
+    onvault_memzero(preimage, sizeof(preimage));
+
+    /* Constant-time comparison */
+    volatile uint8_t diff = 0;
+    for (int i = 0; i < ONVAULT_HASH_SIZE; i++)
+        diff |= proof[i] ^ expected.data[i];
+
+    onvault_memzero(&expected, sizeof(expected));
+    return diff ? ONVAULT_ERR_AUTH : ONVAULT_OK;
+}
+
 int onvault_auth_is_initialized(void)
 {
     char data_dir[PATH_MAX];

@@ -29,6 +29,7 @@ typedef enum {
     IPC_CMD_WATCH_SUGGEST,
     IPC_CMD_ROTATE_KEYS,
     IPC_CMD_LOG,
+    IPC_CMD_AUTH_CHALLENGE,  /* Request a nonce for challenge-response auth */
 } onvault_ipc_cmd_t;
 
 /* IPC message header */
