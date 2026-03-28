@@ -146,7 +146,16 @@ static int cmd_unlock(void)
     }
 
     onvault_key_wipe(&master_key, sizeof(master_key));
-    printf("Unlocked. Vaults are now accessible.\n");
+
+    /* Notify daemon to load the master key from session */
+    char response[ONVAULT_IPC_MAX_MSG];
+    uint32_t resp_len = sizeof(response) - 1;
+    int ipc_rc = onvault_ipc_send(IPC_CMD_UNLOCK, NULL, 0, response, &resp_len);
+    if (ipc_rc != ONVAULT_OK) {
+        printf("Unlocked (daemon not running — start with: onvaultd)\n");
+    } else {
+        printf("Unlocked. Vaults are now accessible.\n");
+    }
     return 0;
 }
 

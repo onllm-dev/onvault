@@ -22,14 +22,16 @@
 
 /* Keychain labels and tags */
 static const char *kSEKeyLabel    = "com.onvault.se-key";
+static const char *kSWKeyLabel    = "com.onvault.sw-key";
 static const char *kWrappedLabel  = "com.onvault.master-key-wrapped";
+static int g_using_software_key   = 0;
 
-/* --- Secure Enclave key management --- */
+/* --- EC key management (Secure Enclave with software fallback) --- */
 
-static SecKeyRef get_or_create_se_key(void)
+static SecKeyRef find_existing_key(void)
 {
-    /* Try to find existing SE key */
-    NSDictionary *query = @{
+    /* Try SE key first */
+    NSDictionary *seQuery = @{
         (__bridge id)kSecClass:               (__bridge id)kSecClassKey,
         (__bridge id)kSecAttrKeyType:         (__bridge id)kSecAttrKeyTypeECSECPrimeRandom,
         (__bridge id)kSecAttrKeySizeInBits:   @256,
@@ -37,14 +39,33 @@ static SecKeyRef get_or_create_se_key(void)
         (__bridge id)kSecReturnRef:           @YES,
         (__bridge id)kSecAttrTokenID:         (__bridge id)kSecAttrTokenIDSecureEnclave,
     };
-
     SecKeyRef key = NULL;
-    OSStatus status = SecItemCopyMatching((__bridge CFDictionaryRef)query, (CFTypeRef *)&key);
-
-    if (status == errSecSuccess && key)
+    if (SecItemCopyMatching((__bridge CFDictionaryRef)seQuery, (CFTypeRef *)&key) == errSecSuccess && key)
         return key;
 
-    /* Create new SE key */
+    /* Try software key */
+    NSDictionary *swQuery = @{
+        (__bridge id)kSecClass:               (__bridge id)kSecClassKey,
+        (__bridge id)kSecAttrKeyType:         (__bridge id)kSecAttrKeyTypeECSECPrimeRandom,
+        (__bridge id)kSecAttrKeySizeInBits:   @256,
+        (__bridge id)kSecAttrLabel:           @(kSWKeyLabel),
+        (__bridge id)kSecReturnRef:           @YES,
+    };
+    if (SecItemCopyMatching((__bridge CFDictionaryRef)swQuery, (CFTypeRef *)&key) == errSecSuccess && key) {
+        g_using_software_key = 1;
+        return key;
+    }
+
+    return NULL;
+}
+
+static SecKeyRef get_or_create_se_key(void)
+{
+    /* Check for existing key (SE or software) */
+    SecKeyRef key = find_existing_key();
+    if (key) return key;
+
+    /* Try creating SE key first */
     SecAccessControlRef access = SecAccessControlCreateWithFlags(
         kCFAllocatorDefault,
         kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
@@ -52,31 +73,57 @@ static SecKeyRef get_or_create_se_key(void)
         NULL
     );
 
-    if (!access)
-        return NULL;
+    if (access) {
+        NSDictionary *seAttrs = @{
+            (__bridge id)kSecAttrKeyType:         (__bridge id)kSecAttrKeyTypeECSECPrimeRandom,
+            (__bridge id)kSecAttrKeySizeInBits:   @256,
+            (__bridge id)kSecAttrTokenID:         (__bridge id)kSecAttrTokenIDSecureEnclave,
+            (__bridge id)kSecPrivateKeyAttrs: @{
+                (__bridge id)kSecAttrIsPermanent:    @YES,
+                (__bridge id)kSecAttrLabel:          @(kSEKeyLabel),
+                (__bridge id)kSecAttrAccessControl:  (__bridge id)access,
+            },
+        };
 
-    NSDictionary *attrs = @{
+        CFErrorRef error = NULL;
+        key = SecKeyCreateRandomKey((__bridge CFDictionaryRef)seAttrs, &error);
+        CFRelease(access);
+
+        if (key && !error) {
+            fprintf(stderr, "onvault: using Secure Enclave for key protection\n");
+            return key;
+        }
+        if (key) CFRelease(key);
+        if (error) CFRelease(error);
+    }
+
+    /* SE unavailable — fall back to software EC key in Keychain */
+    fprintf(stderr, "onvault: Secure Enclave unavailable, using software key "
+                    "(less secure — sign with Apple Developer ID for SE support)\n");
+
+    NSDictionary *swAttrs = @{
         (__bridge id)kSecAttrKeyType:         (__bridge id)kSecAttrKeyTypeECSECPrimeRandom,
         (__bridge id)kSecAttrKeySizeInBits:   @256,
-        (__bridge id)kSecAttrTokenID:         (__bridge id)kSecAttrTokenIDSecureEnclave,
         (__bridge id)kSecPrivateKeyAttrs: @{
             (__bridge id)kSecAttrIsPermanent:    @YES,
-            (__bridge id)kSecAttrLabel:          @(kSEKeyLabel),
-            (__bridge id)kSecAttrAccessControl:  (__bridge id)access,
+            (__bridge id)kSecAttrLabel:          @(kSWKeyLabel),
+            (__bridge id)kSecAttrAccessible:     (__bridge id)kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
         },
     };
 
-    CFErrorRef error = NULL;
-    key = SecKeyCreateRandomKey((__bridge CFDictionaryRef)attrs, &error);
+    CFErrorRef swError = NULL;
+    key = SecKeyCreateRandomKey((__bridge CFDictionaryRef)swAttrs, &swError);
 
-    CFRelease(access);
-
-    if (error) {
+    if (swError) {
         if (key) CFRelease(key);
-        CFRelease(error);
+        NSError *nsErr = (__bridge NSError *)swError;
+        fprintf(stderr, "onvault: software key creation failed: %s\n",
+                [[nsErr localizedDescription] UTF8String]);
+        CFRelease(swError);
         return NULL;
     }
 
+    g_using_software_key = 1;
     return key;
 }
 
@@ -401,6 +448,13 @@ int onvault_keystore_destroy(void)
         (__bridge id)kSecAttrTokenID: (__bridge id)kSecAttrTokenIDSecureEnclave,
     };
     SecItemDelete((__bridge CFDictionaryRef)delSE);
+
+    /* Delete software key */
+    NSDictionary *delSW = @{
+        (__bridge id)kSecClass:      (__bridge id)kSecClassKey,
+        (__bridge id)kSecAttrLabel:  @(kSWKeyLabel),
+    };
+    SecItemDelete((__bridge CFDictionaryRef)delSW);
 
     return ONVAULT_OK;
 }

@@ -175,6 +175,36 @@ static void handle_client(int client_fd)
         break;
     }
 
+    case IPC_CMD_UNLOCK: {
+        /* CLI has already verified passphrase and stored a session.
+         * Daemon loads the master key from session/Keychain. */
+        if (g_master_key_loaded) {
+            snprintf(resp_buf, sizeof(resp_buf), "Already unlocked\n");
+        } else {
+            int urc = onvault_auth_check_session(&g_master_key);
+            if (urc == ONVAULT_OK) {
+                g_master_key_loaded = 1;
+
+                /* Initialize audit logging */
+                if (!g_log_initialized) {
+                    onvault_key_t config_key;
+                    onvault_mlock(&config_key, sizeof(config_key));
+                    onvault_derive_config_key(&g_master_key, &config_key);
+                    if (onvault_log_init(&config_key) == ONVAULT_OK)
+                        g_log_initialized = 1;
+                    onvault_key_wipe(&config_key, sizeof(config_key));
+                }
+
+                snprintf(resp_buf, sizeof(resp_buf), "Unlocked\n");
+            } else {
+                resp.status = IPC_RESP_AUTH_REQUIRED;
+                snprintf(resp_buf, sizeof(resp_buf), "Unlock failed (err=%d)\n", urc);
+            }
+        }
+        resp.payload_len = (uint32_t)strlen(resp_buf);
+        break;
+    }
+
     case IPC_CMD_LOCK:
         /* Signal main loop to exit — cleanup happens there */
         g_running = 0;
