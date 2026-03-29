@@ -22,9 +22,14 @@ typedef struct {
 } onvault_vault_policy_t;
 
 /*
- * Load all policies. Called on daemon startup after decrypting config.
+ * Load all policies using the derived config key.
  */
-int onvault_policy_load(const char *config_path);
+int onvault_policy_load(const onvault_key_t *config_key);
+
+/*
+ * Persist all policies using the cached config key from the last load.
+ */
+int onvault_policy_save(void);
 
 /*
  * Add a policy for a vault.

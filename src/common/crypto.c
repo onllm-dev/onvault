@@ -5,10 +5,13 @@
 
 #include "crypto.h"
 #include "memwipe.h"
+#include <openssl/crypto.h>
 #include <openssl/evp.h>
+#include <openssl/hmac.h>
 #include <openssl/kdf.h>
 #include <openssl/rand.h>
 #include <openssl/err.h>
+#include <limits.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -20,9 +23,40 @@ int onvault_crypto_init(void)
 
 int onvault_random_bytes(uint8_t *buf, size_t len)
 {
+    if (!buf || len > (size_t)INT_MAX)
+        return ONVAULT_ERR_INVALID;
+
     if (RAND_bytes(buf, (int)len) != 1)
         return ONVAULT_ERR_CRYPTO;
     return ONVAULT_OK;
+}
+
+int onvault_hmac_sha256(const uint8_t *key, size_t key_len,
+                        const uint8_t *data, size_t data_len,
+                        uint8_t out[ONVAULT_HASH_SIZE])
+{
+    unsigned int out_len = ONVAULT_HASH_SIZE;
+
+    if (!key || !data || !out)
+        return ONVAULT_ERR_INVALID;
+    if (key_len > (size_t)INT_MAX || data_len > (size_t)INT_MAX)
+        return ONVAULT_ERR_INVALID;
+
+    if (HMAC(EVP_sha256(), key, (int)key_len, data, data_len, out, &out_len) == NULL)
+        return ONVAULT_ERR_CRYPTO;
+    if (out_len != ONVAULT_HASH_SIZE) {
+        onvault_memzero(out, ONVAULT_HASH_SIZE);
+        return ONVAULT_ERR_CRYPTO;
+    }
+
+    return ONVAULT_OK;
+}
+
+int onvault_constant_time_eq(const uint8_t *a, const uint8_t *b, size_t len)
+{
+    if (!a || !b)
+        return 0;
+    return CRYPTO_memcmp(a, b, len) == 0 ? 1 : 0;
 }
 
 /* --- AES-256-XTS --- */

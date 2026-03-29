@@ -4,56 +4,201 @@
  */
 
 #include "policy.h"
+#include "../auth/auth.h"
+#include "../common/config.h"
 #include "../common/hash.h"
 #include "../common/memwipe.h"
+#include "../fuse/vault.h"
 
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <pthread.h>
 
 /* In-memory policy store */
 #define MAX_VAULT_POLICIES 32
+#define ONVAULT_POLICY_STORE_VERSION 1
+
+typedef struct {
+    uint32_t version;
+    uint32_t count;
+} onvault_policy_store_header_t;
+
 static onvault_vault_policy_t g_policies[MAX_VAULT_POLICIES];
 static int g_policy_count = 0;
 static pthread_rwlock_t g_policy_lock = PTHREAD_RWLOCK_INITIALIZER;
+static onvault_key_t g_policy_config_key;
+static int g_policy_config_key_loaded = 0;
 
-int onvault_policy_load(const char *config_path)
+static void clear_policy_config_key(void)
 {
-    if (!config_path)
+    if (g_policy_config_key_loaded) {
+        onvault_key_wipe(&g_policy_config_key, sizeof(g_policy_config_key));
+        g_policy_config_key_loaded = 0;
+    }
+}
+
+static int set_policy_config_key(const onvault_key_t *config_key)
+{
+    if (!config_key)
         return ONVAULT_ERR_INVALID;
 
-    /*
-     * Policy is stored as a flat binary array of onvault_vault_policy_t
-     * encrypted with the config key. This function loads from the already-
-     * decrypted in-memory buffer passed by the daemon after decryption.
-     *
-     * The daemon calls onvault_policy_add_vault() for each vault after
-     * decrypting the config, so this function serves as a reload entry
-     * point that clears existing policies first.
-     */
+    clear_policy_config_key();
+    onvault_mlock(&g_policy_config_key, sizeof(g_policy_config_key));
+    memcpy(&g_policy_config_key, config_key, sizeof(g_policy_config_key));
+    g_policy_config_key_loaded = 1;
+    return ONVAULT_OK;
+}
+
+static int get_policy_path(char *path, size_t path_len)
+{
+    char data_dir[PATH_MAX];
+
+    if (!path || path_len == 0)
+        return ONVAULT_ERR_INVALID;
+    if (onvault_get_data_dir(data_dir) != ONVAULT_OK)
+        return ONVAULT_ERR_IO;
+
+    snprintf(path, path_len, "%s/policies.enc", data_dir);
+    return ONVAULT_OK;
+}
+
+static int policy_save_locked(void)
+{
+    char policy_path[PATH_MAX];
+    onvault_policy_store_header_t header;
+    uint8_t *blob = NULL;
+    size_t blob_len;
+    int rc;
+
+    if (!g_policy_config_key_loaded)
+        return ONVAULT_OK;
+
+    rc = get_policy_path(policy_path, sizeof(policy_path));
+    if (rc != ONVAULT_OK)
+        return rc;
+
+    blob_len = sizeof(header) +
+        (size_t)g_policy_count * sizeof(onvault_vault_policy_t);
+    blob = calloc(1, blob_len);
+    if (!blob)
+        return ONVAULT_ERR_MEMORY;
+
+    header.version = ONVAULT_POLICY_STORE_VERSION;
+    header.count = (uint32_t)g_policy_count;
+    memcpy(blob, &header, sizeof(header));
+    if (g_policy_count > 0) {
+        memcpy(blob + sizeof(header), g_policies,
+               (size_t)g_policy_count * sizeof(onvault_vault_policy_t));
+    }
+
+    rc = onvault_config_write(policy_path, &g_policy_config_key, blob, blob_len);
+    onvault_memzero(blob, blob_len);
+    free(blob);
+    return rc;
+}
+
+int onvault_policy_load(const onvault_key_t *config_key)
+{
+    char policy_path[PATH_MAX];
+    uint8_t *blob = NULL;
+    size_t blob_len = sizeof(onvault_policy_store_header_t) +
+        MAX_VAULT_POLICIES * sizeof(onvault_vault_policy_t);
+    onvault_policy_store_header_t header;
+    int rc;
+
+    if (!config_key)
+        return ONVAULT_ERR_INVALID;
+
+    rc = set_policy_config_key(config_key);
+    if (rc != ONVAULT_OK)
+        return rc;
+
     pthread_rwlock_wrlock(&g_policy_lock);
     onvault_memzero(g_policies, sizeof(g_policies));
     g_policy_count = 0;
     pthread_rwlock_unlock(&g_policy_lock);
 
+    rc = get_policy_path(policy_path, sizeof(policy_path));
+    if (rc != ONVAULT_OK)
+        return rc;
+
+    blob = malloc(blob_len);
+    if (!blob)
+        return ONVAULT_ERR_MEMORY;
+
+    rc = onvault_config_read(policy_path, &g_policy_config_key, blob, &blob_len);
+    if (rc == ONVAULT_ERR_NOT_FOUND) {
+        free(blob);
+        return ONVAULT_OK;
+    }
+    if (rc != ONVAULT_OK) {
+        free(blob);
+        return rc;
+    }
+    if (blob_len < sizeof(header)) {
+        onvault_memzero(blob, blob_len);
+        free(blob);
+        return ONVAULT_ERR_INVALID;
+    }
+
+    memcpy(&header, blob, sizeof(header));
+    if (header.version != ONVAULT_POLICY_STORE_VERSION ||
+        header.count > MAX_VAULT_POLICIES ||
+        blob_len != sizeof(header) +
+                   (size_t)header.count * sizeof(onvault_vault_policy_t)) {
+        onvault_memzero(blob, blob_len);
+        free(blob);
+        return ONVAULT_ERR_INVALID;
+    }
+
+    pthread_rwlock_wrlock(&g_policy_lock);
+    if (header.count > 0) {
+        memcpy(g_policies, blob + sizeof(header),
+               (size_t)header.count * sizeof(onvault_vault_policy_t));
+    }
+    g_policy_count = (int)header.count;
+    pthread_rwlock_unlock(&g_policy_lock);
+
+    onvault_memzero(blob, blob_len);
+    free(blob);
     return ONVAULT_OK;
+}
+
+int onvault_policy_save(void)
+{
+    int rc;
+
+    pthread_rwlock_rdlock(&g_policy_lock);
+    rc = policy_save_locked();
+    pthread_rwlock_unlock(&g_policy_lock);
+    return rc;
 }
 
 int onvault_policy_add_vault(const onvault_vault_policy_t *policy)
 {
-    if (!policy || g_policy_count >= MAX_VAULT_POLICIES)
+    int rc = ONVAULT_OK;
+
+    if (!policy)
         return ONVAULT_ERR_INVALID;
 
     pthread_rwlock_wrlock(&g_policy_lock);
+    if (g_policy_count >= MAX_VAULT_POLICIES) {
+        pthread_rwlock_unlock(&g_policy_lock);
+        return ONVAULT_ERR_INVALID;
+    }
     memcpy(&g_policies[g_policy_count], policy, sizeof(onvault_vault_policy_t));
     g_policy_count++;
+    rc = policy_save_locked();
     pthread_rwlock_unlock(&g_policy_lock);
 
-    return ONVAULT_OK;
+    return rc;
 }
 
 int onvault_policy_remove_vault(const char *vault_id)
 {
+    int rc = ONVAULT_ERR_NOT_FOUND;
+
     pthread_rwlock_wrlock(&g_policy_lock);
 
     for (int i = 0; i < g_policy_count; i++) {
@@ -61,13 +206,13 @@ int onvault_policy_remove_vault(const char *vault_id)
             for (int j = i; j < g_policy_count - 1; j++)
                 g_policies[j] = g_policies[j + 1];
             g_policy_count--;
-            pthread_rwlock_unlock(&g_policy_lock);
-            return ONVAULT_OK;
+            rc = policy_save_locked();
+            break;
         }
     }
 
     pthread_rwlock_unlock(&g_policy_lock);
-    return ONVAULT_ERR_NOT_FOUND;
+    return rc;
 }
 
 const onvault_vault_policy_t *onvault_policy_get_by_mount(const char *mount_path)
@@ -192,6 +337,8 @@ int onvault_policy_add_rule(const char *vault_id,
                              const char *process_path,
                              onvault_rule_action_t action)
 {
+    int rc = ONVAULT_OK;
+
     if (!vault_id || !process_path)
         return ONVAULT_ERR_INVALID;
 
@@ -214,8 +361,9 @@ int onvault_policy_add_rule(const char *vault_id,
             rule->use_hash = 1;
 
             g_policies[i].rule_count++;
+            rc = policy_save_locked();
             pthread_rwlock_unlock(&g_policy_lock);
-            return ONVAULT_OK;
+            return rc;
         }
     }
 
@@ -226,6 +374,7 @@ int onvault_policy_add_rule(const char *vault_id,
         strlcpy(new_policy->vault_id, vault_id, sizeof(new_policy->vault_id));
         new_policy->verify_mode = VERIFY_CODESIGN_PREFERRED;
         new_policy->allow_escalated = 0;
+        onvault_vault_get_paths(vault_id, NULL, new_policy->mount_path, NULL);
 
         onvault_rule_t *rule = &new_policy->rules[0];
         memset(rule, 0, sizeof(*rule));
@@ -236,8 +385,9 @@ int onvault_policy_add_rule(const char *vault_id,
         new_policy->rule_count = 1;
 
         g_policy_count++;
+        rc = policy_save_locked();
         pthread_rwlock_unlock(&g_policy_lock);
-        return ONVAULT_OK;
+        return rc;
     }
 
     pthread_rwlock_unlock(&g_policy_lock);
@@ -347,4 +497,5 @@ void onvault_policy_clear(void)
     onvault_memzero(g_policies, sizeof(g_policies));
     g_policy_count = 0;
     pthread_rwlock_unlock(&g_policy_lock);
+    clear_policy_config_key();
 }

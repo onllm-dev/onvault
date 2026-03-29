@@ -48,6 +48,7 @@ void onvault_fuse_set_policy_check(onvault_policy_check_fn fn)
 /* Per-mount context stored in fuse_context private_data */
 typedef struct {
     char           vault_dir[PATH_MAX];
+    char           mount_dir[PATH_MAX];
     onvault_key_t  vault_key;
 } onvault_fuse_ctx_t;
 
@@ -128,7 +129,7 @@ static int ov_open(const char *path, struct fuse_file_info *fi)
     /* Layer 2 policy check */
     if (g_policy_check) {
         pid_t caller = fuse_get_context()->pid;
-        if (g_policy_check(caller, path) != 0)
+        if (g_policy_check(caller, path, get_ctx()->mount_dir) != 0)
             return -EACCES;
     }
 
@@ -378,7 +379,7 @@ static int ov_create(const char *path, mode_t mode, struct fuse_file_info *fi)
     /* Layer 2 policy check */
     if (g_policy_check) {
         pid_t caller = fuse_get_context()->pid;
-        if (g_policy_check(caller, path) != 0)
+        if (g_policy_check(caller, path, get_ctx()->mount_dir) != 0)
             return -EACCES;
     }
 
@@ -416,7 +417,7 @@ static struct fuse_operations onvault_fuse_ops = {
 };
 
 int onvault_fuse_mount(const char *vault_id,
-                        const onvault_key_t *vault_key,
+                        onvault_key_t *vault_key,
                         const char *vault_dir,
                         const char *mount_dir)
 {
@@ -431,8 +432,10 @@ int onvault_fuse_mount(const char *vault_id,
         return ONVAULT_ERR_MEMORY;
 
     snprintf(ctx->vault_dir, PATH_MAX, "%s", vault_dir);
+    snprintf(ctx->mount_dir, PATH_MAX, "%s", mount_dir);
     memcpy(&ctx->vault_key, vault_key, sizeof(onvault_key_t));
     onvault_mlock(&ctx->vault_key, sizeof(ctx->vault_key));
+    onvault_key_wipe(vault_key, sizeof(*vault_key));
 
     /* FUSE args */
     char *argv[] = {
@@ -462,14 +465,15 @@ int onvault_fuse_mount(const char *vault_id,
  * ============================================================ */
 
 int onvault_fuse_mount(const char *vault_id,
-                        const onvault_key_t *vault_key,
+                        onvault_key_t *vault_key,
                         const char *vault_dir,
                         const char *mount_dir)
 {
     (void)vault_id;
-    (void)vault_key;
     (void)vault_dir;
     (void)mount_dir;
+    if (vault_key)
+        onvault_key_wipe(vault_key, sizeof(*vault_key));
     fprintf(stderr, "onvault: macFUSE not available. Install with: brew install --cask macfuse\n");
     return ONVAULT_ERR_IO;
 }

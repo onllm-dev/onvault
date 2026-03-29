@@ -62,12 +62,35 @@ static pthread_mutex_t g_denial_lock = PTHREAD_MUTEX_INITIALIZER;
 static volatile int g_running = 1;
 static onvault_key_t g_master_key;
 static int g_master_key_loaded = 0;
+static onvault_key_t g_config_key;
+static int g_config_key_loaded = 0;
+static int g_log_initialized = 0;
 
 /* Challenge-response nonce for auth-gated commands.
  * Single-use: invalidated after one verification attempt. */
 static uint8_t g_auth_nonce[ONVAULT_HASH_SIZE];
 static int g_nonce_valid = 0;
 static pthread_mutex_t g_nonce_lock = PTHREAD_MUTEX_INITIALIZER;
+
+#define MAX_MOUNTED_VAULTS 32
+
+typedef struct {
+    int active;
+    pthread_t thread;
+    char vault_id[64];
+    char mount_dir[PATH_MAX];
+} mounted_vault_t;
+
+typedef struct {
+    int slot;
+    char vault_id[64];
+    char vault_dir[PATH_MAX];
+    char mount_dir[PATH_MAX];
+    onvault_key_t vault_key;
+} mount_worker_arg_t;
+
+static mounted_vault_t g_mounted_vaults[MAX_MOUNTED_VAULTS];
+static pthread_mutex_t g_mount_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /*
  * Smart defaults: auto-populate allowlist when adding a vault.
@@ -155,13 +178,278 @@ static void apply_smart_defaults(const char *vault_id)
         onvault_policy_add_vault(&policy);
 }
 
+static void clear_loaded_keys(void)
+{
+    if (g_config_key_loaded) {
+        onvault_key_wipe(&g_config_key, sizeof(g_config_key));
+        g_config_key_loaded = 0;
+    }
+    if (g_master_key_loaded) {
+        onvault_key_wipe(&g_master_key, sizeof(g_master_key));
+        g_master_key_loaded = 0;
+    }
+}
+
+static int build_mount_path(const char *mount_dir,
+                            const char *file_path,
+                            char *out,
+                            size_t out_len)
+{
+    int n;
+
+    if (!mount_dir || !file_path || !out || out_len == 0)
+        return -1;
+
+    if (file_path[0] == '/')
+        n = snprintf(out, out_len, "%s%s", mount_dir, file_path);
+    else
+        n = snprintf(out, out_len, "%s/%s", mount_dir, file_path);
+
+    return (n < 0 || (size_t)n >= out_len) ? -1 : 0;
+}
+
+static int daemon_policy_check(pid_t pid,
+                               const char *file_path,
+                               const char *mount_dir)
+{
+    onvault_process_t process;
+    char mounted_path[PATH_MAX];
+
+    if (!g_master_key_loaded || !file_path || !mount_dir)
+        return -1;
+    if (onvault_esf_extract_process(pid, &process) != ONVAULT_OK ||
+        process.path[0] == '\0')
+        return -1;
+    if (build_mount_path(mount_dir, file_path, mounted_path, sizeof(mounted_path)) != 0)
+        return -1;
+
+    return onvault_policy_evaluate(&process, mounted_path, mount_dir) ? 0 : -1;
+}
+
+static void *mount_worker(void *arg)
+{
+    mount_worker_arg_t *worker = (mount_worker_arg_t *)arg;
+
+    if (!worker)
+        return NULL;
+
+    (void)onvault_fuse_mount(worker->vault_id, &worker->vault_key,
+                             worker->vault_dir, worker->mount_dir);
+    onvault_key_wipe(&worker->vault_key, sizeof(worker->vault_key));
+
+    pthread_mutex_lock(&g_mount_lock);
+    memset(&g_mounted_vaults[worker->slot], 0, sizeof(g_mounted_vaults[worker->slot]));
+    pthread_mutex_unlock(&g_mount_lock);
+
+    free(worker);
+    return NULL;
+}
+
+static int find_mount_slot_locked(const char *vault_id, const char *mount_dir)
+{
+    for (int i = 0; i < MAX_MOUNTED_VAULTS; i++) {
+        if (!g_mounted_vaults[i].active)
+            continue;
+        if ((vault_id && strcmp(g_mounted_vaults[i].vault_id, vault_id) == 0) ||
+            (mount_dir && strcmp(g_mounted_vaults[i].mount_dir, mount_dir) == 0))
+            return i;
+    }
+    return -1;
+}
+
+static int mount_vault_async(const char *vault_id,
+                             const char *vault_dir,
+                             const char *mount_dir)
+{
+    mount_worker_arg_t *worker = NULL;
+    int slot = -1;
+    int rc = ONVAULT_OK;
+
+    if (!vault_id || !vault_dir || !mount_dir || !g_master_key_loaded)
+        return ONVAULT_ERR_INVALID;
+    if (onvault_fuse_is_mounted(mount_dir))
+        return ONVAULT_OK;
+
+    worker = calloc(1, sizeof(*worker));
+    if (!worker)
+        return ONVAULT_ERR_MEMORY;
+
+    strlcpy(worker->vault_id, vault_id, sizeof(worker->vault_id));
+    strlcpy(worker->vault_dir, vault_dir, sizeof(worker->vault_dir));
+    strlcpy(worker->mount_dir, mount_dir, sizeof(worker->mount_dir));
+    onvault_mlock(&worker->vault_key, sizeof(worker->vault_key));
+    rc = onvault_derive_vault_key(&g_master_key, vault_id, &worker->vault_key);
+    if (rc != ONVAULT_OK) {
+        onvault_key_wipe(&worker->vault_key, sizeof(worker->vault_key));
+        free(worker);
+        return rc;
+    }
+
+    pthread_mutex_lock(&g_mount_lock);
+    slot = find_mount_slot_locked(vault_id, mount_dir);
+    if (slot >= 0) {
+        pthread_mutex_unlock(&g_mount_lock);
+        onvault_key_wipe(&worker->vault_key, sizeof(worker->vault_key));
+        free(worker);
+        return ONVAULT_OK;
+    }
+    for (int i = 0; i < MAX_MOUNTED_VAULTS; i++) {
+        if (!g_mounted_vaults[i].active) {
+            slot = i;
+            g_mounted_vaults[i].active = 1;
+            strlcpy(g_mounted_vaults[i].vault_id, vault_id, sizeof(g_mounted_vaults[i].vault_id));
+            strlcpy(g_mounted_vaults[i].mount_dir, mount_dir, sizeof(g_mounted_vaults[i].mount_dir));
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_mount_lock);
+
+    if (slot < 0) {
+        onvault_key_wipe(&worker->vault_key, sizeof(worker->vault_key));
+        free(worker);
+        return ONVAULT_ERR_MEMORY;
+    }
+
+    worker->slot = slot;
+    if (pthread_create(&g_mounted_vaults[slot].thread, NULL, mount_worker, worker) != 0) {
+        pthread_mutex_lock(&g_mount_lock);
+        memset(&g_mounted_vaults[slot], 0, sizeof(g_mounted_vaults[slot]));
+        pthread_mutex_unlock(&g_mount_lock);
+        onvault_key_wipe(&worker->vault_key, sizeof(worker->vault_key));
+        free(worker);
+        return ONVAULT_ERR_IO;
+    }
+    pthread_detach(g_mounted_vaults[slot].thread);
+
+    for (int tries = 0; tries < 50; tries++) {
+        if (onvault_fuse_is_mounted(mount_dir)) {
+            onvault_esf_add_monitored_path(mount_dir);
+            if (g_log_initialized)
+                onvault_log_write(LOG_VAULT_MOUNTED, vault_id, NULL, 0, mount_dir, "mounted");
+            return ONVAULT_OK;
+        }
+
+        pthread_mutex_lock(&g_mount_lock);
+        rc = g_mounted_vaults[slot].active ? ONVAULT_OK : ONVAULT_ERR_IO;
+        pthread_mutex_unlock(&g_mount_lock);
+        if (rc != ONVAULT_OK)
+            break;
+        usleep(100000);
+    }
+
+    return ONVAULT_ERR_IO;
+}
+
+static int mount_all_vaults(void)
+{
+    char ids[32][64];
+    int count = onvault_vault_list(ids, 32);
+
+    onvault_fuse_set_policy_check(daemon_policy_check);
+
+    for (int i = 0; i < count; i++) {
+        char vault_dir[PATH_MAX];
+        char mount_dir[PATH_MAX];
+
+        onvault_vault_get_paths(ids[i], vault_dir, mount_dir, NULL);
+        if (mount_vault_async(ids[i], vault_dir, mount_dir) != ONVAULT_OK)
+            return ONVAULT_ERR_IO;
+    }
+
+    return ONVAULT_OK;
+}
+
+static void unmount_vault(const char *vault_id, const char *mount_dir)
+{
+    if (!mount_dir)
+        return;
+
+    onvault_esf_remove_monitored_path(mount_dir);
+    if (g_log_initialized && vault_id)
+        onvault_log_write(LOG_VAULT_UNMOUNTED, vault_id, NULL, 0, mount_dir, "unmounted");
+    if (onvault_fuse_is_mounted(mount_dir))
+        onvault_fuse_unmount(mount_dir);
+
+    for (int tries = 0; tries < 50; tries++) {
+        int active;
+
+        pthread_mutex_lock(&g_mount_lock);
+        active = (find_mount_slot_locked(vault_id, mount_dir) >= 0);
+        pthread_mutex_unlock(&g_mount_lock);
+        if (!active)
+            break;
+        usleep(100000);
+    }
+}
+
+static void unmount_all_vaults(void)
+{
+    char ids[32][64];
+    int count = onvault_vault_list(ids, 32);
+
+    for (int i = 0; i < count; i++) {
+        char mount_dir[PATH_MAX];
+        onvault_vault_get_paths(ids[i], NULL, mount_dir, NULL);
+        unmount_vault(ids[i], mount_dir);
+    }
+}
+
+static int finish_unlock(const onvault_key_t *master_key)
+{
+    int rc;
+    int log_started = 0;
+
+    if (!master_key)
+        return ONVAULT_ERR_INVALID;
+    if (g_master_key_loaded)
+        return ONVAULT_OK;
+
+    onvault_mlock(&g_master_key, sizeof(g_master_key));
+    memcpy(&g_master_key, master_key, sizeof(g_master_key));
+    g_master_key_loaded = 1;
+
+    onvault_mlock(&g_config_key, sizeof(g_config_key));
+    rc = onvault_derive_config_key(&g_master_key, &g_config_key);
+    if (rc != ONVAULT_OK) {
+        clear_loaded_keys();
+        return rc;
+    }
+    g_config_key_loaded = 1;
+
+    rc = onvault_policy_load(&g_config_key);
+    if (rc != ONVAULT_OK) {
+        onvault_policy_clear();
+        clear_loaded_keys();
+        return rc;
+    }
+
+    if (!g_log_initialized) {
+        if (onvault_log_init(&g_config_key) == ONVAULT_OK) {
+            g_log_initialized = 1;
+            log_started = 1;
+        }
+    }
+
+    rc = mount_all_vaults();
+    if (rc != ONVAULT_OK) {
+        unmount_all_vaults();
+        if (log_started) {
+            onvault_log_close();
+            g_log_initialized = 0;
+        }
+        onvault_policy_clear();
+        clear_loaded_keys();
+        return rc;
+    }
+
+    return ONVAULT_OK;
+}
+
 static void signal_handler(int sig)
 {
     (void)sig;
     g_running = 0;
 }
-
-static int g_log_initialized = 0;
 
 static void cleanup(void)
 {
@@ -180,14 +468,7 @@ static void cleanup(void)
     }
 
     /* Unmount all vaults */
-    char ids[32][64];
-    int count = onvault_vault_list(ids, 32);
-    for (int i = 0; i < count; i++) {
-        char mount_dir[PATH_MAX];
-        onvault_vault_get_paths(ids[i], NULL, mount_dir, NULL);
-        if (onvault_fuse_is_mounted(mount_dir))
-            onvault_fuse_unmount(mount_dir);
-    }
+    unmount_all_vaults();
 
     /* Stop ESF */
     onvault_esf_stop();
@@ -195,11 +476,11 @@ static void cleanup(void)
     /* Clear policies */
     onvault_policy_clear();
 
-    /* Wipe master key */
-    if (g_master_key_loaded) {
-        onvault_key_wipe(&g_master_key, sizeof(g_master_key));
-        g_master_key_loaded = 0;
-    }
+    clear_loaded_keys();
+    pthread_mutex_lock(&g_nonce_lock);
+    g_nonce_valid = 0;
+    onvault_memzero(g_auth_nonce, sizeof(g_auth_nonce));
+    pthread_mutex_unlock(&g_nonce_lock);
 
     /* Stop IPC */
     onvault_ipc_server_stop();
@@ -285,7 +566,10 @@ static void handle_client(int client_fd)
             snprintf(resp_buf, sizeof(resp_buf), "Failed to add vault (err=%d)\n", rc);
         } else {
             char vid[64];
+            char vault_dir[PATH_MAX];
+            char mount_dir[PATH_MAX];
             onvault_vault_id_from_path(add_path, vid, sizeof(vid));
+            onvault_vault_get_paths(vid, vault_dir, mount_dir, NULL);
 
             int off = snprintf(resp_buf, sizeof(resp_buf), "Vault added: %s\n", add_path);
 
@@ -300,6 +584,13 @@ static void handle_client(int client_fd)
             } else {
                 off += snprintf(resp_buf + off, sizeof(resp_buf) - (size_t)off,
                                 "No smart defaults applied. Use --smart to auto-populate allowlist.\n");
+            }
+
+            rc = mount_vault_async(vid, vault_dir, mount_dir);
+            if (rc != ONVAULT_OK) {
+                resp.status = IPC_RESP_ERROR;
+                snprintf(resp_buf + off, sizeof(resp_buf) - (size_t)off,
+                         "Vault added but mount failed (err=%d)\n", rc);
             }
         }
         resp.payload_len = (uint32_t)strlen(resp_buf);
@@ -334,8 +625,8 @@ static void handle_client(int client_fd)
         onvault_memzero(g_auth_nonce, ONVAULT_HASH_SIZE);
         pthread_mutex_unlock(&g_nonce_lock);
 
-        int rm_auth = onvault_auth_verify_proof(
-            (const uint8_t *)payload, rm_nonce, ONVAULT_HASH_SIZE);
+        int rm_auth = onvault_auth_verify_proof_with_key(
+            (const uint8_t *)payload, rm_nonce, ONVAULT_HASH_SIZE, &g_master_key);
         onvault_memzero(rm_nonce, sizeof(rm_nonce));
         if (rm_auth != ONVAULT_OK) {
             resp.status = IPC_RESP_AUTH_REQUIRED;
@@ -344,6 +635,9 @@ static void handle_client(int client_fd)
             break;
         }
         const char *vault_id = payload + ONVAULT_HASH_SIZE;
+        char mount_dir[PATH_MAX];
+        onvault_vault_get_paths(vault_id, NULL, mount_dir, NULL);
+        unmount_vault(vault_id, mount_dir);
         int rc = onvault_vault_remove(&g_master_key, vault_id);
         if (rc != ONVAULT_OK) {
             resp.status = IPC_RESP_ERROR;
@@ -375,26 +669,20 @@ static void handle_client(int client_fd)
     }
 
     case IPC_CMD_UNLOCK: {
-        /* CLI has already verified passphrase and stored a session.
-         * Daemon loads the master key from session/Keychain. */
         if (g_master_key_loaded) {
             snprintf(resp_buf, sizeof(resp_buf), "Already unlocked\n");
         } else {
-            int urc = onvault_auth_check_session(&g_master_key);
+            onvault_key_t session_key;
+            int urc = onvault_auth_check_session(&session_key);
             if (urc == ONVAULT_OK) {
-                g_master_key_loaded = 1;
-
-                /* Initialize audit logging */
-                if (!g_log_initialized) {
-                    onvault_key_t config_key;
-                    onvault_mlock(&config_key, sizeof(config_key));
-                    onvault_derive_config_key(&g_master_key, &config_key);
-                    if (onvault_log_init(&config_key) == ONVAULT_OK)
-                        g_log_initialized = 1;
-                    onvault_key_wipe(&config_key, sizeof(config_key));
+                int frc = finish_unlock(&session_key);
+                onvault_key_wipe(&session_key, sizeof(session_key));
+                if (frc == ONVAULT_OK)
+                    snprintf(resp_buf, sizeof(resp_buf), "Unlocked\n");
+                else {
+                    resp.status = IPC_RESP_ERROR;
+                    snprintf(resp_buf, sizeof(resp_buf), "Unlock failed (err=%d)\n", frc);
                 }
-
-                snprintf(resp_buf, sizeof(resp_buf), "Unlocked\n");
             } else {
                 resp.status = IPC_RESP_AUTH_REQUIRED;
                 snprintf(resp_buf, sizeof(resp_buf), "Unlock failed (err=%d)\n", urc);
@@ -440,8 +728,11 @@ static void handle_client(int client_fd)
         onvault_memzero(g_auth_nonce, ONVAULT_HASH_SIZE);
         pthread_mutex_unlock(&g_nonce_lock);
 
-        int lock_auth = onvault_auth_verify_proof(
-            (const uint8_t *)payload, nonce_copy, ONVAULT_HASH_SIZE);
+        int lock_auth = g_master_key_loaded
+            ? onvault_auth_verify_proof_with_key(
+                (const uint8_t *)payload, nonce_copy, ONVAULT_HASH_SIZE, &g_master_key)
+            : onvault_auth_verify_proof(
+                (const uint8_t *)payload, nonce_copy, ONVAULT_HASH_SIZE);
         onvault_memzero(nonce_copy, sizeof(nonce_copy));
 
         if (lock_auth != ONVAULT_OK) {
@@ -924,10 +1215,20 @@ static void handle_http_client(int client_fd)
                 int rc = onvault_vault_add(&g_master_key, add_path, NULL);
                 if (rc == ONVAULT_OK) {
                     char vid[64];
+                    char vault_dir[PATH_MAX];
+                    char mount_dir[PATH_MAX];
                     onvault_vault_id_from_path(add_path, vid, sizeof(vid));
                     apply_smart_defaults(vid);
-                    snprintf(resp_json, sizeof(resp_json),
-                             "{\"ok\":true,\"msg\":\"Vault added: %s\"}", add_path);
+                    onvault_vault_get_paths(vid, vault_dir, mount_dir, NULL);
+                    rc = mount_vault_async(vid, vault_dir, mount_dir);
+                    if (rc == ONVAULT_OK) {
+                        snprintf(resp_json, sizeof(resp_json),
+                                 "{\"ok\":true,\"msg\":\"Vault added: %s\"}", add_path);
+                    } else {
+                        snprintf(resp_json, sizeof(resp_json),
+                                 "{\"ok\":false,\"msg\":\"Vault added but mount failed: %s\"}",
+                                 add_path);
+                    }
                 } else {
                     const char *err_msg = "Unknown error";
                     if (rc == ONVAULT_ERR_NOT_FOUND) err_msg = "Path not found";
@@ -988,27 +1289,20 @@ static void handle_http_client(int client_fd)
                     pass[--pl] = '\0';
 
                 onvault_key_t mk;
+                memset(&mk, 0, sizeof(mk));
                 int urc = onvault_auth_unlock(pass, &mk);
                 onvault_memzero(pass, sizeof(pass));
 
                 if (urc == ONVAULT_OK) {
-                    onvault_mlock(&g_master_key, sizeof(g_master_key));
-                    memcpy(&g_master_key, &mk, sizeof(g_master_key));
+                    int frc = finish_unlock(&mk);
                     onvault_key_wipe(&mk, sizeof(mk));
-                    g_master_key_loaded = 1;
-
-                    /* Initialize audit logging */
-                    if (!g_log_initialized) {
-                        onvault_key_t config_key;
-                        onvault_mlock(&config_key, sizeof(config_key));
-                        onvault_derive_config_key(&g_master_key, &config_key);
-                        if (onvault_log_init(&config_key) == ONVAULT_OK)
-                            g_log_initialized = 1;
-                        onvault_key_wipe(&config_key, sizeof(config_key));
+                    if (frc == ONVAULT_OK) {
+                        snprintf(resp_json, sizeof(resp_json),
+                                 "{\"ok\":true,\"msg\":\"Unlocked\"}");
+                    } else {
+                        snprintf(resp_json, sizeof(resp_json),
+                                 "{\"ok\":false,\"msg\":\"Unlock failed (err=%d)\"}", frc);
                     }
-
-                    snprintf(resp_json, sizeof(resp_json),
-                             "{\"ok\":true,\"msg\":\"Unlocked\"}");
                 } else {
                     onvault_key_wipe(&mk, sizeof(mk));
                     snprintf(resp_json, sizeof(resp_json),

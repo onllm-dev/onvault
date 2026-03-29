@@ -68,6 +68,15 @@ int onvault_auth_verify_proof(const uint8_t *proof,
                                const uint8_t *nonce, size_t nonce_len);
 
 /*
+ * Verify a challenge-response proof against an already-loaded master key.
+ * This avoids unnecessary keystore unwraps while the daemon is unlocked.
+ * Returns ONVAULT_OK if valid.
+ */
+int onvault_auth_verify_proof_with_key(const uint8_t *proof,
+                                        const uint8_t *nonce, size_t nonce_len,
+                                        const onvault_key_t *master_key);
+
+/*
  * Check if onvault has been initialized (salt + wrapped key exist).
  * Returns 1 if initialized, 0 if not.
  */

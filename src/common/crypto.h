@@ -82,6 +82,22 @@ int onvault_hkdf(const uint8_t *salt, size_t salt_len,
 int onvault_random_bytes(uint8_t *buf, size_t len);
 
 /*
+ * Compute HMAC-SHA256 over a message.
+ * key/key_len: HMAC key
+ * data/data_len: message
+ * out: 32-byte output buffer
+ */
+int onvault_hmac_sha256(const uint8_t *key, size_t key_len,
+                        const uint8_t *data, size_t data_len,
+                        uint8_t out[ONVAULT_HASH_SIZE]);
+
+/*
+ * Constant-time byte string comparison.
+ * Returns 1 when equal, 0 otherwise.
+ */
+int onvault_constant_time_eq(const uint8_t *a, const uint8_t *b, size_t len);
+
+/*
  * Derive a per-vault key from the master key.
  * master_key: 32-byte master key
  * vault_id: vault identifier string (e.g., "ssh")

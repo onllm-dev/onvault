@@ -17,7 +17,7 @@
  * Returns 0 on success (blocks until unmounted if foreground).
  */
 int onvault_fuse_mount(const char *vault_id,
-                        const onvault_key_t *vault_key,
+                        onvault_key_t *vault_key,
                         const char *vault_dir,
                         const char *mount_dir);
 
@@ -37,9 +37,11 @@ int onvault_fuse_is_mounted(const char *mount_dir);
 /*
  * Set the policy check callback for Layer 2 (ESF) integration.
  * The callback is called on every file open to verify process identity.
- * Returns pid of the calling process on deny, 0 on allow.
+ * Returns 0 on allow, non-zero on deny.
  */
-typedef int (*onvault_policy_check_fn)(pid_t pid, const char *file_path);
+typedef int (*onvault_policy_check_fn)(pid_t pid,
+                                        const char *file_path,
+                                        const char *mount_dir);
 void onvault_fuse_set_policy_check(onvault_policy_check_fn fn);
 
 #endif /* ONVAULT_FUSE_H */
