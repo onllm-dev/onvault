@@ -14,6 +14,9 @@
 #include <string.h>
 #include <unistd.h>
 #include <termios.h>
+#include <signal.h>
+#include <sys/stat.h>
+#include <mach-o/dyld.h>
 
 static void usage(void)
 {
@@ -21,6 +24,10 @@ static void usage(void)
         "onvault — Seamless File Encryption & Access Control for macOS\n"
         "\n"
         "Usage: onvault <command> [args]\n"
+        "\n"
+        "Daemon:\n"
+        "  start [--no-gui]              Start the daemon (menu bar + web UI)\n"
+        "  stop                          Stop the daemon\n"
         "\n"
         "Setup:\n"
         "  init                          First-time setup\n"
@@ -701,6 +708,155 @@ static int cmd_configure(void)
     return 0;
 }
 
+static int cmd_start(int no_gui)
+{
+    /* Find onvaultd in the same directory as this binary */
+    char self_path[PATH_MAX];
+    uint32_t self_len = sizeof(self_path);
+    if (_NSGetExecutablePath(self_path, &self_len) != 0) {
+        fprintf(stderr, "Cannot determine binary path.\n");
+        return 1;
+    }
+
+    /* Resolve symlinks */
+    char resolved[PATH_MAX];
+    if (!realpath(self_path, resolved)) {
+        fprintf(stderr, "Cannot resolve path.\n");
+        return 1;
+    }
+
+    /* Replace "onvault" with "onvaultd" in the path */
+    char *last_slash = strrchr(resolved, '/');
+    if (!last_slash) {
+        fprintf(stderr, "Invalid path.\n");
+        return 1;
+    }
+    snprintf(last_slash + 1, (size_t)(resolved + PATH_MAX - last_slash - 1), "onvaultd");
+
+    struct stat st;
+    if (stat(resolved, &st) != 0) {
+        fprintf(stderr, "Daemon binary not found: %s\n", resolved);
+        return 1;
+    }
+
+    /* Check if already running */
+    char data_dir[PATH_MAX];
+    if (onvault_get_data_dir(data_dir) == ONVAULT_OK) {
+        char pid_path[PATH_MAX];
+        snprintf(pid_path, PATH_MAX, "%s/onvaultd.pid", data_dir);
+        FILE *pf = fopen(pid_path, "r");
+        if (pf) {
+            pid_t existing = 0;
+            if (fscanf(pf, "%d", &existing) == 1 && existing > 0) {
+                if (kill(existing, 0) == 0) {
+                    printf("onvault daemon already running (pid %d)\n", existing);
+
+                    /* Show web UI URL */
+                    char port_path[PATH_MAX];
+                    snprintf(port_path, PATH_MAX, "%s/http.port", data_dir);
+                    FILE *portf = fopen(port_path, "r");
+                    if (portf) {
+                        int port = 0;
+                        if (fscanf(portf, "%d", &port) == 1)
+                            printf("Web UI: http://127.0.0.1:%d/menubar\n", port);
+                        fclose(portf);
+                    }
+                    fclose(pf);
+                    return 0;
+                }
+            }
+            fclose(pf);
+        }
+    }
+
+    /* Fork and exec onvaultd */
+    pid_t pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "Failed to fork.\n");
+        return 1;
+    }
+
+    if (pid == 0) {
+        /* Child: exec onvaultd */
+        if (no_gui)
+            execl(resolved, "onvaultd", "--no-gui", (char *)NULL);
+        else
+            execl(resolved, "onvaultd", (char *)NULL);
+        _exit(1); /* exec failed */
+    }
+
+    /* Parent: wait briefly and show status */
+    sleep(2);
+
+    char port_path[PATH_MAX];
+    if (onvault_get_data_dir(data_dir) == ONVAULT_OK) {
+        snprintf(port_path, PATH_MAX, "%s/http.port", data_dir);
+        FILE *portf = fopen(port_path, "r");
+        if (portf) {
+            int port = 0;
+            if (fscanf(portf, "%d", &port) == 1) {
+                printf("onvault started (pid %d)\n", pid);
+                printf("Web UI: http://127.0.0.1:%d/menubar\n", port);
+                printf("\nRun 'onvault unlock' to authenticate.\n");
+            }
+            fclose(portf);
+        } else {
+            printf("onvault started (pid %d)\n", pid);
+        }
+    }
+
+    return 0;
+}
+
+static int cmd_stop(void)
+{
+    char data_dir[PATH_MAX];
+    if (onvault_get_data_dir(data_dir) != ONVAULT_OK) {
+        fprintf(stderr, "Not initialized.\n");
+        return 1;
+    }
+
+    char pid_path[PATH_MAX];
+    snprintf(pid_path, PATH_MAX, "%s/onvaultd.pid", data_dir);
+    FILE *pf = fopen(pid_path, "r");
+    if (!pf) {
+        fprintf(stderr, "Daemon not running (no PID file).\n");
+        return 1;
+    }
+
+    pid_t daemon_pid = 0;
+    if (fscanf(pf, "%d", &daemon_pid) != 1 || daemon_pid <= 0) {
+        fclose(pf);
+        fprintf(stderr, "Invalid PID file.\n");
+        return 1;
+    }
+    fclose(pf);
+
+    if (kill(daemon_pid, 0) != 0) {
+        fprintf(stderr, "Daemon not running (stale PID %d).\n", daemon_pid);
+        unlink(pid_path);
+        return 1;
+    }
+
+    /* Send SIGTERM for graceful shutdown */
+    kill(daemon_pid, SIGTERM);
+    printf("Stopping onvault (pid %d)...\n", daemon_pid);
+
+    /* Wait up to 5 seconds for exit */
+    for (int i = 0; i < 10; i++) {
+        usleep(500000);
+        if (kill(daemon_pid, 0) != 0) {
+            printf("Stopped.\n");
+            return 0;
+        }
+    }
+
+    /* Force kill */
+    kill(daemon_pid, SIGKILL);
+    printf("Force stopped.\n");
+    return 0;
+}
+
 int main(int argc, char *argv[])
 {
     if (argc < 2) {
@@ -712,6 +868,16 @@ int main(int argc, char *argv[])
 
     if (strcmp(cmd, "init") == 0)
         return cmd_init();
+    if (strcmp(cmd, "start") == 0) {
+        int no_gui = 0;
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "--no-gui") == 0)
+                no_gui = 1;
+        }
+        return cmd_start(no_gui);
+    }
+    if (strcmp(cmd, "stop") == 0)
+        return cmd_stop();
     if (strcmp(cmd, "unlock") == 0)
         return cmd_unlock();
     if (strcmp(cmd, "lock") == 0)
