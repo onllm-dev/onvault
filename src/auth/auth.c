@@ -20,6 +20,8 @@
 
 /* Recovery key alphabet: unambiguous characters */
 static const char RECOVERY_ALPHABET[] = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+#define RECOVERY_ALPHABET_LEN ((int)(sizeof(RECOVERY_ALPHABET) - 1))
+#define RECOVERY_REJECTION_LIMIT 224
 
 #define ONVAULT_AUTH_BLOB_SIZE \
     (ONVAULT_GCM_IV_SIZE + ONVAULT_GCM_TAG_SIZE + ONVAULT_KEY_SIZE)
@@ -159,7 +161,12 @@ static void generate_recovery_key(char *out)
     onvault_random_bytes(random_bytes, ONVAULT_RECOVERY_LEN);
 
     for (int i = 0; i < ONVAULT_RECOVERY_LEN; i++) {
-        out[i] = RECOVERY_ALPHABET[random_bytes[i] % (sizeof(RECOVERY_ALPHABET) - 1)];
+        uint8_t r = random_bytes[i];
+        while (r >= RECOVERY_REJECTION_LIMIT) {
+            if (onvault_random_bytes(&r, 1) != ONVAULT_OK)
+                r = 0;
+        }
+        out[i] = RECOVERY_ALPHABET[r % RECOVERY_ALPHABET_LEN];
     }
     out[ONVAULT_RECOVERY_LEN] = '\0';
 

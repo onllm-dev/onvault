@@ -13,8 +13,8 @@
 ## Architecture
 
 Two-layer defense:
-- **Layer 1 (macFUSE):** Files encrypted at rest with AES-256-XTS. FUSE mount provides decrypted view only when daemon is running and user authenticated.
-- **Layer 2 (ESF):** Endpoint Security Framework controls which processes can access mounted plaintext. Comprehensive AUTH event subscription (AUTH_OPEN, AUTH_RENAME, AUTH_LINK, AUTH_UNLINK, AUTH_TRUNCATE, AUTH_EXEC).
+- **Layer 1 (macFUSE):** Files encrypted at rest with AES-256-XTS. FUSE mounts are brought up on unlock and torn down on lock/shutdown.
+- **Layer 2 (ESF):** Endpoint Security Framework controls which processes can access mounted plaintext when the build/runtime environment has the required entitlement and permissions. AUTH subscriptions cover OPEN, RENAME, LINK, UNLINK, TRUNCATE, and EXEC.
 
 Key hierarchy: Passphrase → Argon2id → Master Key (Secure Enclave wrapped) → Per-Vault Key (HKDF) → Per-File Key (HKDF + nonce xattr).
 
@@ -25,14 +25,16 @@ Key hierarchy: Passphrase → Argon2id → Master Key (Secure Enclave wrapped) �
 - **HTTP server** — localhost-only server for the web-based menu bar UI (port in `~/.onvault/http.port`)
 - **Menu bar** — WKWebView popover loading from the HTTP server (or NSApp event loop on main thread)
 
+Policy state persists at `~/.onvault/policies.enc` and is loaded after unlock alongside the audit log key.
+
 PID lock at `~/.onvault/onvaultd.pid` prevents multiple daemon instances.
 
 ### Auth-Gated IPC
 
-Destructive commands (lock, vault remove) use challenge-response auth:
+Destructive and policy-mutating IPC commands (lock, vault remove, allow, deny) use challenge-response auth:
 1. CLI requests nonce via `IPC_CMD_AUTH_CHALLENGE`
 2. CLI computes `SHA-256(Argon2id(passphrase, salt) || nonce)`
-3. Daemon verifies proof, nonce is single-use (invalidated after verification)
+3. Daemon verifies proof against a short-lived nonce bucket, then consumes the matching nonce
 
 Read-only IPC commands (rules, policy show, vault list) require `g_master_key_loaded` — must be unlocked.
 
@@ -41,13 +43,13 @@ Read-only IPC commands (rules, policy show, vault list) require `g_master_key_lo
 ```bash
 make clean && make       # Build (CLI + daemon + tests)
 make test                # Run all 25 tests (14 crypto + 11 vault)
-make dist                # Static-linked distribution build
+make dist                # Distribution build (macFUSE still required at runtime)
 ```
 
 ## Dependencies
 
 **Build-time (developer):** OpenSSL 3, libargon2, macFUSE, Xcode CLI Tools
-**Runtime (end user):** macFUSE only (everything else statically linked in dist builds)
+**Runtime (end user):** macFUSE. Dist builds still depend on the macFUSE runtime dylib.
 
 ## Code Structure
 
@@ -75,11 +77,11 @@ install/          — launchd plist, entitlements
 - **Memory safety:** All keys must be `mlock()`'d and `explicit_bzero()`'d after use via `memwipe.h`.
 - **ESF conditional:** ESF code is behind `#ifdef HAVE_ESF`. Builds with stub if SDK not available.
 - **FUSE conditional:** FUSE code is behind `#ifdef HAVE_MACFUSE`. Builds with stub if macFUSE not installed.
-- **Config encryption:** All onvault config/policies are AES-256-GCM encrypted with a config key derived from the master key.
+- **Config encryption:** All onvault config/policies are AES-256-GCM encrypted with a config key derived from the master key (`policies.enc`, logs, and other encrypted config blobs).
 - **Process verification:** Three modes — `codesign_preferred` (default), `hash_only`, `codesign_required`.
 - **Smart defaults:** Opt-in via `--smart` flag. Auto-populates allowlists for known vault types (ssh, aws, kube, gnupg, docker).
 - **Web UI JS:** Must use ES5 syntax (no async/await, use `.then()` chains). WKWebView on older macOS doesn't support top-level await.
-- **HTML embedding:** `src/daemon/menubar.html` is the source; it's embedded as a C string in `onvaultd.c` via a Python script during build.
+- **HTML embedding:** `src/daemon/menubar.html` is the source; regenerate the embedded C string in `onvaultd.c` with `python3 scripts/embed_menubar_html.py src/daemon/menubar.html src/daemon/onvaultd.c` after editing it.
 - **Test isolation:** Tests use `tests/keystore_stub.c` (in-memory keystore) to avoid Keychain/iCloud popups.
 
 ## IPC Protocol
@@ -88,15 +90,15 @@ Socket: `~/.onvault/onvault.sock` (umask 0177, owner-only)
 
 Commands: STATUS, UNLOCK, LOCK, VAULT_ADD, VAULT_REMOVE, VAULT_LIST, ALLOW, DENY, POLICY_SHOW, RULES, WATCH_START, WATCH_SUGGEST, ROTATE_KEYS, LOG, AUTH_CHALLENGE
 
-Auth-gated (need proof): LOCK, VAULT_REMOVE
-Session-gated (need unlock): VAULT_ADD, ALLOW, DENY, VAULT_LIST, RULES, POLICY_SHOW, LOG
+Auth-gated (need proof): LOCK, VAULT_REMOVE, ALLOW, DENY
+Session-gated (need unlock): VAULT_ADD, VAULT_LIST, RULES, POLICY_SHOW, LOG
 
 ## HTTP API (localhost only)
 
 GET endpoints: `/menubar`, `/api/status`, `/api/denials`, `/api/policies`, `/api/rules?vault=<id>`
 POST endpoints: `/api/unlock`, `/api/lock`, `/api/vault/add`, `/api/allow`, `/api/deny`
 
-All POST bodies are plain text. Thread-per-request to avoid blocking on Argon2id (~2-3s).
+All POST bodies are plain text. `/api/unlock` returns a short-lived HTTP bearer token; all other API endpoints require `Authorization: Bearer <token>` or `?token=<token>`. Thread-per-request avoids blocking on Argon2id (~2-3s).
 
 ## Git Rules
 

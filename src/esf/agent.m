@@ -17,11 +17,13 @@
 #include <stdio.h>
 #include <string.h>
 #include <libproc.h>
+#include <pthread.h>
 
 /* Monitored paths (vault mount points) */
 #define MAX_MONITORED_PATHS 64
 static char g_monitored_paths[MAX_MONITORED_PATHS][PATH_MAX];
 static int  g_monitored_count = 0;
+static pthread_rwlock_t g_path_lock = PTHREAD_RWLOCK_INITIALIZER;
 
 /* Deny callback */
 static onvault_deny_callback_fn g_deny_callback = NULL;
@@ -33,25 +35,34 @@ void onvault_esf_set_deny_callback(onvault_deny_callback_fn fn)
 
 int onvault_esf_add_monitored_path(const char *path)
 {
-    if (!path || g_monitored_count >= MAX_MONITORED_PATHS)
+    if (!path)
         return ONVAULT_ERR_INVALID;
 
+    pthread_rwlock_wrlock(&g_path_lock);
+    if (g_monitored_count >= MAX_MONITORED_PATHS) {
+        pthread_rwlock_unlock(&g_path_lock);
+        return ONVAULT_ERR_INVALID;
+    }
     strlcpy(g_monitored_paths[g_monitored_count], path, PATH_MAX);
     g_monitored_count++;
+    pthread_rwlock_unlock(&g_path_lock);
     return ONVAULT_OK;
 }
 
 int onvault_esf_remove_monitored_path(const char *path)
 {
+    pthread_rwlock_wrlock(&g_path_lock);
     for (int i = 0; i < g_monitored_count; i++) {
         if (strcmp(g_monitored_paths[i], path) == 0) {
             for (int j = i; j < g_monitored_count - 1; j++) {
                 memcpy(g_monitored_paths[j], g_monitored_paths[j + 1], PATH_MAX);
             }
             g_monitored_count--;
+            pthread_rwlock_unlock(&g_path_lock);
             return ONVAULT_OK;
         }
     }
+    pthread_rwlock_unlock(&g_path_lock);
     return ONVAULT_ERR_NOT_FOUND;
 }
 
@@ -84,15 +95,28 @@ int onvault_esf_extract_process(pid_t pid, onvault_process_t *proc)
 
 static es_client_t *g_esf_client = NULL;
 
-static const char *path_in_monitored_vault(const char *file_path)
+static int path_in_monitored_vault(const char *file_path,
+                                   char *vault_path,
+                                   size_t vault_path_len)
 {
+    int found = 0;
+
+    if (!file_path || !vault_path || vault_path_len == 0)
+        return 0;
+    vault_path[0] = '\0';
+
+    pthread_rwlock_rdlock(&g_path_lock);
     for (int i = 0; i < g_monitored_count; i++) {
         size_t len = strlen(g_monitored_paths[i]);
         if (strncmp(file_path, g_monitored_paths[i], len) == 0 &&
-            (file_path[len] == '/' || file_path[len] == '\0'))
-            return g_monitored_paths[i];
+            (file_path[len] == '/' || file_path[len] == '\0')) {
+            strlcpy(vault_path, g_monitored_paths[i], vault_path_len);
+            found = 1;
+            break;
+        }
     }
-    return NULL;
+    pthread_rwlock_unlock(&g_path_lock);
+    return found;
 }
 
 static void extract_process_info(const es_process_t *es_proc,
@@ -151,8 +175,8 @@ static void esf_handler(es_client_t *client, const es_message_t *msg)
         return;
     }
 
-    const char *vault_path = path_in_monitored_vault(file_path);
-    if (!vault_path) {
+    char vault_path[PATH_MAX];
+    if (!path_in_monitored_vault(file_path, vault_path, sizeof(vault_path))) {
         es_respond_auth_result(client, msg, ES_AUTH_RESULT_ALLOW, false);
         return;
     }
@@ -220,7 +244,9 @@ void onvault_esf_stop(void)
         es_delete_client(g_esf_client);
         g_esf_client = NULL;
     }
+    pthread_rwlock_wrlock(&g_path_lock);
     g_monitored_count = 0;
+    pthread_rwlock_unlock(&g_path_lock);
 }
 
 #else /* !HAVE_ESF */
@@ -242,7 +268,9 @@ int onvault_esf_start(void)
 
 void onvault_esf_stop(void)
 {
+    pthread_rwlock_wrlock(&g_path_lock);
     g_monitored_count = 0;
+    pthread_rwlock_unlock(&g_path_lock);
 }
 
 #endif /* HAVE_ESF */

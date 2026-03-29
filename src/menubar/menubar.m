@@ -131,11 +131,6 @@ static int g_menu_vault_count = 0;
         }];
 
         /* Register notification actions */
-        UNNotificationAction *allowOnce = [UNNotificationAction
-            actionWithIdentifier:@"ALLOW_ONCE"
-            title:@"Allow Once"
-            options:UNNotificationActionOptionNone];
-
         UNNotificationAction *allowAlways = [UNNotificationAction
             actionWithIdentifier:@"ALLOW_ALWAYS"
             title:@"Allow Always"
@@ -143,7 +138,7 @@ static int g_menu_vault_count = 0;
 
         UNNotificationCategory *denyCategory = [UNNotificationCategory
             categoryWithIdentifier:@"DENY"
-            actions:@[allowOnce, allowAlways]
+            actions:@[allowAlways]
             intentIdentifiers:@[]
             options:UNNotificationCategoryOptionNone];
 
@@ -272,20 +267,14 @@ static int g_menu_vault_count = 0;
         line = strtok(NULL, "\n");
     }
 
-    /* Detect lock state: if daemon responds to STATUS, it's running.
-     * If any vault exists, the daemon has been unlocked at some point. */
-    int daemon_unlocked = (g_menu_vault_count > 0) ? 1 : 0;
-    /* Also check: if the response starts with "onvaultd running", we're connected */
-    if (rc == ONVAULT_OK)
+    int daemon_unlocked = 0;
+    if (rc == ONVAULT_OK && strstr(response, "state=unlocked") != NULL)
         daemon_unlocked = 1;
 
     dispatch_async(dispatch_get_main_queue(), ^{
         self.vaultCount = g_menu_vault_count;
-        /* Update lock state based on daemon connectivity */
-        if (daemon_unlocked && self.isLocked) {
-            self.isLocked = NO;
-            self.statusItem.button.title = @"\U0001F513";
-        }
+        self.isLocked = daemon_unlocked ? NO : YES;
+        self.statusItem.button.title = daemon_unlocked ? @"\U0001F513" : @"\U0001F512";
         [self rebuildMenu];
     });
 }
@@ -487,9 +476,14 @@ static int g_menu_vault_count = 0;
     alert.accessoryView = input;
     [alert.window setInitialFirstResponder:input];
 
-    if ([alert runModal] != NSAlertFirstButtonReturn)
+    if ([alert runModal] != NSAlertFirstButtonReturn) {
+        input.stringValue = @"";
         return nil;
-    return input.stringValue;
+    }
+
+    NSString *value = [input.stringValue copy];
+    input.stringValue = @"";
+    return (value.length > 0) ? value : nil;
 }
 
 /* Helper: request challenge nonce from daemon and compute proof */
@@ -952,7 +946,7 @@ static int g_menu_vault_count = 0;
     [self rebuildMenu];
 }
 
-/* Handle notification actions (Allow Once / Allow Always) */
+/* Handle notification actions */
 - (void)userNotificationCenter:(UNUserNotificationCenter *)center
 didReceiveNotificationResponse:(UNNotificationResponse *)response
          withCompletionHandler:(void (^)(void))completionHandler
@@ -962,10 +956,7 @@ didReceiveNotificationResponse:(UNNotificationResponse *)response
     NSString *processPath = userInfo[@"process_path"];
     NSString *vaultId = userInfo[@"vault_id"];
 
-    if ([response.actionIdentifier isEqualToString:@"ALLOW_ONCE"]) {
-        NSLog(@"onvault: allow once %@ for %@", processPath, vaultId);
-        /* Allow Once: temporarily allow (logged but no persistent rule) */
-    } else if ([response.actionIdentifier isEqualToString:@"ALLOW_ALWAYS"]) {
+    if ([response.actionIdentifier isEqualToString:@"ALLOW_ALWAYS"]) {
         NSLog(@"onvault: allow always %@ for %@", processPath, vaultId);
         /* Allow Always: add persistent allow rule via IPC */
         NSString *passphrase = [self promptForPassphrase:@"Allow Process"];

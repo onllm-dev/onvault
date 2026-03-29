@@ -67,6 +67,8 @@ int onvault_aes_xts_encrypt(const onvault_xts_key_t *key,
 {
     if (!key || !tweak || !in || !out || len < 16)
         return ONVAULT_ERR_INVALID;
+    if (len > (size_t)INT_MAX)
+        return ONVAULT_ERR_INVALID;
 
     EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
     if (!ctx)
@@ -96,6 +98,8 @@ int onvault_aes_xts_decrypt(const onvault_xts_key_t *key,
                             const uint8_t *in, uint8_t *out, size_t len)
 {
     if (!key || !tweak || !in || !out || len < 16)
+        return ONVAULT_ERR_INVALID;
+    if (len > (size_t)INT_MAX)
         return ONVAULT_ERR_INVALID;
 
     EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
@@ -132,6 +136,8 @@ int onvault_aes_gcm_encrypt(const onvault_key_t *key,
                             uint8_t iv_out[ONVAULT_GCM_IV_SIZE])
 {
     if (!key || !in || !out || !tag || !iv_out)
+        return ONVAULT_ERR_INVALID;
+    if (aad_len > (size_t)INT_MAX || in_len > (size_t)INT_MAX)
         return ONVAULT_ERR_INVALID;
 
     /* Generate random IV if not provided */
@@ -191,6 +197,8 @@ int onvault_aes_gcm_decrypt(const onvault_key_t *key,
 {
     if (!key || !iv || !in || !out || !tag)
         return ONVAULT_ERR_INVALID;
+    if (aad_len > (size_t)INT_MAX || in_len > (size_t)INT_MAX)
+        return ONVAULT_ERR_INVALID;
 
     EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
     if (!ctx)
@@ -244,6 +252,10 @@ int onvault_hkdf(const uint8_t *salt, size_t salt_len,
                  uint8_t *okm, size_t okm_len)
 {
     if (!ikm || !okm || okm_len == 0)
+        return ONVAULT_ERR_INVALID;
+    if (okm_len > 16320)
+        return ONVAULT_ERR_INVALID;
+    if (salt_len > (size_t)INT_MAX || ikm_len > (size_t)INT_MAX || info_len > (size_t)INT_MAX)
         return ONVAULT_ERR_INVALID;
 
     EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, NULL);

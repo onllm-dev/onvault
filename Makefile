@@ -44,7 +44,7 @@ TEST_LDFLAGS  = -L$(OPENSSL_DIR)/lib -lcrypto
 TEST_LDFLAGS += -L$(ARGON2_DIR)/lib -largon2
 TEST_LDFLAGS += $(SYSROOT_FLAG)
 
-# Static linking (distribution) — no Homebrew needed by end users
+# Distribution linking (OpenSSL/Argon2 static; macFUSE remains a runtime dependency)
 STATIC_LDFLAGS  = $(OPENSSL_DIR)/lib/libcrypto.a
 STATIC_LDFLAGS += $(ARGON2_DIR)/lib/libargon2.a
 STATIC_LDFLAGS += -framework Security
@@ -166,7 +166,7 @@ test: $(TEST_BIN) $(TEST_VAULT_BIN)
 	@echo "=== Running vault tests ==="
 	./$(TEST_VAULT_BIN)
 
-# Distribution build (static linking — no Homebrew needed by end users)
+# Distribution build (OpenSSL/Argon2 static; macFUSE still required at runtime)
 .PHONY: dist install uninstall
 
 dist: LDFLAGS = $(STATIC_LDFLAGS)
@@ -184,13 +184,12 @@ dist: $(ALL_C_OBJ) $(KEYSTORE_OBJ) $(ESF_M_OBJ) $(MENUBAR_OBJ) $(TOUCHID_OBJ)
 	@echo ""
 	@echo "=== Distribution build complete ==="
 	@echo "Binaries: onvault, onvaultd"
-	@echo "No Homebrew dependencies required for end users."
-	@echo "Users only need: macFUSE (brew install --cask macfuse)"
+	@echo "Runtime dependency: macFUSE (brew install --cask macfuse)"
 	@echo ""
 	@# Verify no homebrew dylib dependencies
 	@echo "Dynamic library dependencies:"
-	@otool -L $(CLI_BIN) | grep -v "/usr/lib\|/System\|@rpath" || echo "  (none — all static)"
-	@otool -L $(DAEMON_BIN) | grep -v "/usr/lib\|/System\|@rpath" || echo "  (none — all static)"
+	@otool -L $(CLI_BIN) | grep -v "/usr/lib\|/System\|@rpath" || echo "  (none beyond system libraries)"
+	@otool -L $(DAEMON_BIN) | grep -v "/usr/lib\|/System\|@rpath" || echo "  (none beyond system libraries)"
 
 install: dist
 	install -m 755 $(CLI_BIN) /usr/local/bin/onvault

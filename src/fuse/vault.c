@@ -204,10 +204,17 @@ static int remove_directory(const char *path)
         if (lstat(full, &st) != 0)
             continue;
 
-        if (S_ISDIR(st.st_mode))
-            remove_directory(full);
-        else
-            unlink(full);
+        if (S_ISDIR(st.st_mode)) {
+            if (remove_directory(full) != 0) {
+                closedir(dir);
+                return -1;
+            }
+        } else {
+            if (unlink(full) != 0) {
+                closedir(dir);
+                return -1;
+            }
+        }
     }
 
     closedir(dir);

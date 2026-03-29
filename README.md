@@ -31,7 +31,7 @@ onvault uses a **two-layer defense**:
 
 **Layer 1 — Encryption at Rest (macFUSE):** Your sensitive directories are encrypted on disk. Files are only decrypted through a FUSE mount when onvault is running and you've authenticated. Kill the daemon? Files stay encrypted. Attacker reads disk? Ciphertext only.
 
-**Layer 2 — Per-Process Access Control (Endpoint Security Framework):** Even when the FUSE mount is active, only verified processes can read your files. `/usr/bin/ssh` can read `~/.ssh/id_rsa`. `python3` cannot. Process identity is verified by Apple's code signing (cdHash + Team ID), not just the binary path.
+**Layer 2 — Per-Process Access Control (Endpoint Security Framework, when available):** On builds/runtimes with the required ESF entitlement and permissions, only verified processes can read mounted plaintext. `/usr/bin/ssh` can read `~/.ssh/id_rsa`. `python3` cannot. Process identity is verified by Apple's code signing (cdHash + Team ID), not just the binary path.
 
 ```
 Malicious package runs → tries to read ~/.ssh/id_rsa
@@ -63,20 +63,20 @@ git clone https://github.com/onllm-dev/onvault.git
 cd onvault
 make        # Development build
 make test   # Run test suite (25 tests)
-make dist   # Distribution build (static linking, no Homebrew needed by users)
+make dist   # Distribution build (macFUSE still required at runtime)
 ```
 
 ### Usage
 
 ```bash
-# 1. First-time setup — sets passphrase, generates recovery key
+# 1. First-time setup — sets passphrase, generates a recovery key display
 onvault init
 
 # 2. Start the daemon (shows menu bar icon + web UI)
 onvaultd &                  # with menu bar
 onvaultd --no-gui &         # headless (servers, CI)
 
-# 3. Unlock — authenticates and lets daemon load the master key
+# 3. Unlock — authenticates, loads the master key, and mounts configured vaults
 onvault unlock
 
 # 4. Protect directories — encrypts files, creates symlink
@@ -90,9 +90,12 @@ onvault status
 onvault lock
 ```
 
+Recovery keys are displayed during `onvault init` today; restore/import flows are still planned.
+
 ### Menu Bar & Web UI
 
 The daemon shows a menu bar icon and serves an interactive web UI. Click the lock icon or open `http://127.0.0.1:<port>/menubar` in any browser.
+The web UI unlock flow returns a localhost-only bearer token; subsequent API calls use that token rather than unauthenticated localhost access.
 
 Everything can be done from the menu bar — no CLI needed:
 
@@ -133,14 +136,14 @@ Destructive operations require passphrase verification via challenge-response. A
 | Menu bar Lock/Unlock/Add | Passphrase dialog (Argon2id) |
 | `onvault unlock` | Passphrase (Argon2id) |
 | `onvault vault add` | Session (must be unlocked) |
-| `onvault allow/deny` | Session (must be unlocked) |
+| `onvault allow/deny` | Challenge-response passphrase proof |
 | `onvault status/rules/log` | Requires unlocked daemon |
 
-The daemon uses single-use nonces for challenge-response — proofs cannot be replayed.
+The daemon uses short-lived single-use nonces for challenge-response — proofs cannot be replayed.
 
 ### Smart Defaults
 
-Pass `--smart` when adding a vault for a known directory to auto-populate an allowlist of verified binaries:
+Pass `--smart` when adding a vault for a known directory to auto-populate an allowlist of verified binaries. Smart defaults are opt-in; without `--smart`, the vault starts with default-deny rules until you add explicit allow entries.
 
 | Path | Auto-allowed |
 |------|-------------|
@@ -202,6 +205,8 @@ onvault configure                     Interactive configuration (passphrase)
 onvault --version                     Show version
 ```
 
+Planned, not yet implemented: `policy edit`, `rotate-keys`, `export-recovery`.
+
 ---
 
 ## Architecture
@@ -223,7 +228,8 @@ onvault --version                     Show version
 │  Per-file keys via HKDF-SHA512 + nonce in xattr       │
 │  No daemon = no mount = ciphertext only                │
 │                                                        │
-│  Layer 2: Per-Process Access Control (ESF)            │
+│  Layer 2: Per-Process Access Control (ESF, when       │
+│  entitlement + permission are available)              │
 │  AUTH_OPEN + AUTH_RENAME + AUTH_LINK + more            │
 │  cdHash + Team ID + Signing ID verification            │
 │  su/sudo detection via audit_token ruid vs euid        │
@@ -269,7 +275,7 @@ User Passphrase
 | **Binary swapping** | Process identity verified by cdHash (Apple's content directory hash), not just path. |
 | **Config tampering** | All policies and config encrypted with master key derivative. |
 | **Memory snooping** | Keys `mlock()`'d (never swapped to disk), `explicit_bzero()`'d after use. |
-| **IPC replay attacks** | Challenge-response with single-use nonces for destructive commands. |
+| **IPC replay attacks** | Challenge-response with short-lived single-use nonces for lock, vault remove, allow, and deny. |
 | **Policy enumeration** | Read-only IPC commands require unlocked daemon. |
 | **Multiple daemon instances** | PID lock file at `~/.onvault/onvaultd.pid`. |
 
@@ -303,7 +309,8 @@ User Passphrase
 ├── onvaultd.pid            # PID lock (prevents multiple daemons)
 ├── onvault.sock            # IPC socket (CLI ↔ daemon)
 ├── http.port               # HTTP server port for web UI
-├── session                 # Session token (15 min TTL)
+├── session                 # Session token + HMAC (15 min TTL)
+├── policies.enc            # Encrypted persisted policy state
 ├── logs/                   # Encrypted audit logs (daily rotation)
 ├── vaults/
 │   ├── ssh/                # Ciphertext for ~/.ssh
@@ -319,7 +326,7 @@ User Passphrase
 
 - **macOS 15 Sequoia** or later (Apple Silicon)
 - **macFUSE 5.1+** (`brew install --cask macfuse`)
-- No other dependencies (OpenSSL and Argon2 are statically linked)
+- Dist builds still require macFUSE at runtime
 
 ### Build Requirements (developers only)
 
@@ -345,7 +352,7 @@ onvault/
 │   ├── auth/           # Passphrase, sessions, Touch ID, challenge-response
 │   └── watch/          # Learning/discovery mode
 ├── tests/              # Unit + integration tests
-├── defaults/           # Smart default allowlists (ssh, aws, kube)
+├── defaults/           # Smart default allowlists (ssh, aws, kube, gnupg, docker)
 ├── install/            # launchd plist, entitlements
 ├── Makefile
 └── LICENSE             # GPL-3.0

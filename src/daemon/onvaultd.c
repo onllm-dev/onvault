@@ -684,7 +684,9 @@ static void handle_client(int client_fd)
         char ids[32][64];
         int count = onvault_vault_list(ids, 32);
         int off = snprintf(resp_buf, sizeof(resp_buf),
-                           "onvaultd running, %d vault(s)\n", count);
+                           "onvaultd running, state=%s, %d vault(s)\n",
+                           g_master_key_loaded ? "unlocked" : "locked",
+                           count);
         for (int i = 0; i < count; i++) {
             char mount_dir[PATH_MAX], source[PATH_MAX];
             onvault_vault_get_paths(ids[i], NULL, mount_dir, source);
@@ -1377,6 +1379,14 @@ static void http_reset_unlock_failures(void)
     pthread_mutex_unlock(&g_http_auth_lock);
 }
 
+static void http_audit_log(const char *path, const char *detail)
+{
+    if (!g_log_initialized || !path)
+        return;
+    onvault_log_write(LOG_POLICY_CHANGE, "http", "web-ui", 0, path,
+                      detail ? detail : "");
+}
+
 /* Simple localhost-only HTTP server for menubar web UI */
 static int g_http_port = 0;
 static int g_http_sock = -1;
@@ -1639,6 +1649,7 @@ static void handle_http_client(int client_fd)
                              "{\"ok\":false,\"msg\":\"%s: %s\"}", err_msg, escaped_path);
                 }
             }
+            http_audit_log(path, resp_json);
             http_respond(client_fd, 200, "application/json",
                          resp_json, strlen(resp_json));
 
@@ -1676,6 +1687,7 @@ static void handle_http_client(int client_fd)
                 snprintf(resp_json, sizeof(resp_json),
                          "{\"ok\":false,\"msg\":\"Invalid request or locked\"}");
             }
+            http_audit_log(path, resp_json);
             http_respond(client_fd, 200, "application/json",
                          resp_json, strlen(resp_json));
 
@@ -1746,6 +1758,7 @@ static void handle_http_client(int client_fd)
                              "{\"ok\":false,\"msg\":\"Wrong passphrase\"}");
                 }
             }
+            http_audit_log(path, resp_json);
             http_respond(client_fd, 200, "application/json",
                          resp_json, strlen(resp_json));
 
@@ -1769,6 +1782,7 @@ static void handle_http_client(int client_fd)
                 snprintf(resp_json, sizeof(resp_json),
                          "{\"ok\":false,\"msg\":\"Wrong passphrase\"}");
             }
+            http_audit_log(path, resp_json);
             http_respond(client_fd, 200, "application/json",
                          resp_json, strlen(resp_json));
 
