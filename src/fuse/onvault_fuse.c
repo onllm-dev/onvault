@@ -23,6 +23,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/mount.h>
 #include <dirent.h>
@@ -65,6 +66,18 @@ static void real_path(const char *path, char *out)
         snprintf(out, PATH_MAX, "%s", ctx->vault_dir);
     else
         snprintf(out, PATH_MAX, "%s%s", ctx->vault_dir, path);
+}
+
+static size_t ciphertext_len_for_plaintext(uint64_t plain_size)
+{
+    uint64_t full_blocks = plain_size / ONVAULT_BLOCK_SIZE;
+    uint64_t tail = plain_size % ONVAULT_BLOCK_SIZE;
+    size_t cipher_len = (size_t)(full_blocks * ONVAULT_BLOCK_SIZE);
+
+    if (tail > 0)
+        cipher_len += (size_t)(tail < 16 ? 16 : tail);
+
+    return cipher_len;
 }
 
 /* --- FUSE operations --- */
@@ -252,10 +265,15 @@ static int ov_write(const char *path, const char *buf, size_t size, off_t offset
     FILE *f = fopen(rpath, "r+b");
     if (!f)
         return -errno;
+    int fd = fileno(f);
+    if (fd >= 0)
+        flock(fd, LOCK_EX);
 
     /* Read current file size from header */
     uint64_t file_size;
     if (fread(&file_size, sizeof(file_size), 1, f) != 1) {
+        if (fd >= 0)
+            flock(fd, LOCK_UN);
         fclose(f);
         return -EIO;
     }
@@ -317,6 +335,8 @@ static int ov_write(const char *path, const char *buf, size_t size, off_t offset
         onvault_memzero(plainbuf, sizeof(plainbuf));
 
         if (rc != ONVAULT_OK) {
+            if (fd >= 0)
+                flock(fd, LOCK_UN);
             fclose(f);
             onvault_memzero(&nonce, sizeof(nonce));
             return -EIO;
@@ -324,11 +344,15 @@ static int ov_write(const char *path, const char *buf, size_t size, off_t offset
 
         /* Write encrypted block to ciphertext file */
         if (fseeko(f, (off_t)cipher_pos, SEEK_SET) != 0) {
+            if (fd >= 0)
+                flock(fd, LOCK_UN);
             fclose(f);
             onvault_memzero(&nonce, sizeof(nonce));
             return -EIO;
         }
         if (fwrite(cipherout, 1, encrypt_len, f) != encrypt_len) {
+            if (fd >= 0)
+                flock(fd, LOCK_UN);
             fclose(f);
             onvault_memzero(&nonce, sizeof(nonce));
             return -EIO;
@@ -345,6 +369,8 @@ static int ov_write(const char *path, const char *buf, size_t size, off_t offset
     }
 
     fflush(f);
+    if (fd >= 0)
+        flock(fd, LOCK_UN);
     fclose(f);
     onvault_memzero(&nonce, sizeof(nonce));
     return (int)total_written;
@@ -355,14 +381,136 @@ static int ov_truncate(const char *path, off_t newsize)
     char rpath[PATH_MAX];
     real_path(path, rpath);
 
-    /* Update the plaintext size in the ciphertext header */
+    if (newsize < 0)
+        return -EINVAL;
+
+    onvault_fuse_ctx_t *ctx = get_ctx();
+    onvault_nonce_t nonce;
+    if (onvault_file_nonce_load(rpath, &nonce) != ONVAULT_OK)
+        return -EIO;
+
     FILE *f = fopen(rpath, "r+b");
     if (!f)
         return -errno;
+    int fd = fileno(f);
+    if (fd >= 0)
+        flock(fd, LOCK_EX);
 
-    uint64_t new_file_size = (uint64_t)newsize;
-    fwrite(&new_file_size, sizeof(new_file_size), 1, f);
+    uint64_t old_size = 0;
+    if (fread(&old_size, sizeof(old_size), 1, f) != 1) {
+        if (fd >= 0)
+            flock(fd, LOCK_UN);
+        fclose(f);
+        onvault_memzero(&nonce, sizeof(nonce));
+        return -EIO;
+    }
+
+    if ((uint64_t)newsize > old_size) {
+        uint8_t zeros[ONVAULT_BLOCK_SIZE];
+        off_t offset = (off_t)old_size;
+
+        memset(zeros, 0, sizeof(zeros));
+        while (offset < newsize) {
+            size_t chunk = (size_t)(newsize - offset);
+            if (chunk > sizeof(zeros))
+                chunk = sizeof(zeros);
+            if (fd >= 0)
+                flock(fd, LOCK_UN);
+            fclose(f);
+            if (ov_write(path, (const char *)zeros, chunk, offset, NULL) < 0) {
+                onvault_memzero(&nonce, sizeof(nonce));
+                return -EIO;
+            }
+            offset += (off_t)chunk;
+            f = fopen(rpath, "r+b");
+            if (!f) {
+                onvault_memzero(&nonce, sizeof(nonce));
+                return -errno;
+            }
+            fd = fileno(f);
+            if (fd >= 0)
+                flock(fd, LOCK_EX);
+        }
+    } else {
+        uint64_t new_file_size = (uint64_t)newsize;
+        size_t tail = (size_t)(new_file_size % ONVAULT_BLOCK_SIZE);
+
+        if (tail > 0) {
+            uint64_t block_index = new_file_size / ONVAULT_BLOCK_SIZE;
+            uint64_t old_block_plain = old_size - (block_index * ONVAULT_BLOCK_SIZE);
+            size_t old_block_len = old_block_plain > ONVAULT_BLOCK_SIZE
+                ? ONVAULT_BLOCK_SIZE
+                : (size_t)old_block_plain;
+            size_t old_cipher_len = old_block_len == 0
+                ? 0
+                : (old_block_len < 16 ? 16 : old_block_len);
+            size_t new_cipher_len = tail < 16 ? 16 : tail;
+            uint8_t cipherbuf[ONVAULT_BLOCK_SIZE];
+            uint8_t plainbuf[ONVAULT_BLOCK_SIZE];
+
+            memset(cipherbuf, 0, sizeof(cipherbuf));
+            memset(plainbuf, 0, sizeof(plainbuf));
+
+            if (old_cipher_len > 0) {
+                off_t block_pos = (off_t)(sizeof(uint64_t) + block_index * ONVAULT_BLOCK_SIZE);
+                if (fseeko(f, block_pos, SEEK_SET) != 0 ||
+                    fread(cipherbuf, 1, old_cipher_len, f) != old_cipher_len ||
+                    onvault_file_decrypt_block(&ctx->vault_key, &nonce,
+                                               cipherbuf, old_cipher_len,
+                                               plainbuf, block_index) != ONVAULT_OK) {
+                    if (fd >= 0)
+                        flock(fd, LOCK_UN);
+                    fclose(f);
+                    onvault_memzero(cipherbuf, sizeof(cipherbuf));
+                    onvault_memzero(plainbuf, sizeof(plainbuf));
+                    onvault_memzero(&nonce, sizeof(nonce));
+                    return -EIO;
+                }
+            }
+
+            memset(plainbuf + tail, 0, sizeof(plainbuf) - tail);
+            if (onvault_file_encrypt_block(&ctx->vault_key, &nonce,
+                                           plainbuf, new_cipher_len,
+                                           cipherbuf, block_index) != ONVAULT_OK) {
+                if (fd >= 0)
+                    flock(fd, LOCK_UN);
+                fclose(f);
+                onvault_memzero(cipherbuf, sizeof(cipherbuf));
+                onvault_memzero(plainbuf, sizeof(plainbuf));
+                onvault_memzero(&nonce, sizeof(nonce));
+                return -EIO;
+            }
+            if (fseeko(f, (off_t)(sizeof(uint64_t) + block_index * ONVAULT_BLOCK_SIZE), SEEK_SET) != 0 ||
+                fwrite(cipherbuf, 1, new_cipher_len, f) != new_cipher_len) {
+                if (fd >= 0)
+                    flock(fd, LOCK_UN);
+                fclose(f);
+                onvault_memzero(cipherbuf, sizeof(cipherbuf));
+                onvault_memzero(plainbuf, sizeof(plainbuf));
+                onvault_memzero(&nonce, sizeof(nonce));
+                return -EIO;
+            }
+
+            onvault_memzero(cipherbuf, sizeof(cipherbuf));
+            onvault_memzero(plainbuf, sizeof(plainbuf));
+        }
+
+        if (fseeko(f, 0, SEEK_SET) != 0 ||
+            fwrite(&new_file_size, sizeof(new_file_size), 1, f) != 1 ||
+            fflush(f) != 0 ||
+            ftruncate(fd, (off_t)(sizeof(uint64_t) + ciphertext_len_for_plaintext(new_file_size))) != 0) {
+            if (fd >= 0)
+                flock(fd, LOCK_UN);
+            fclose(f);
+            onvault_memzero(&nonce, sizeof(nonce));
+            return -EIO;
+        }
+    }
+
+    if (fd >= 0)
+        flock(fd, LOCK_UN);
     fclose(f);
+    onvault_memzero(&nonce, sizeof(nonce));
     return 0;
 }
 

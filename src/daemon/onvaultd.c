@@ -31,6 +31,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #include <signal.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -510,6 +511,28 @@ static ssize_t read_all(int fd, void *buf, size_t n)
     return (ssize_t)total;
 }
 
+static void append_text(char *buf, size_t buf_len, int *off, const char *fmt, ...)
+{
+    va_list ap;
+    int written;
+
+    if (!buf || !off || !fmt || buf_len == 0)
+        return;
+    if (*off < 0 || (size_t)*off >= buf_len - 1)
+        return;
+
+    va_start(ap, fmt);
+    written = vsnprintf(buf + *off, buf_len - (size_t)*off, fmt, ap);
+    va_end(ap);
+
+    if (written < 0)
+        return;
+    if ((size_t)written >= buf_len - (size_t)*off)
+        *off = (int)buf_len - 1;
+    else
+        *off += written;
+}
+
 /* Handle IPC commands from CLI */
 static void handle_client(int client_fd)
 {
@@ -545,9 +568,9 @@ static void handle_client(int client_fd)
             char mount_dir[PATH_MAX], source[PATH_MAX];
             onvault_vault_get_paths(ids[i], NULL, mount_dir, source);
             int mounted = onvault_fuse_is_mounted(mount_dir);
-            off += snprintf(resp_buf + off, sizeof(resp_buf) - (size_t)off,
-                            "  %s (%s) [%s]\n", ids[i], source,
-                            mounted ? "mounted" : "locked");
+            append_text(resp_buf, sizeof(resp_buf), &off,
+                        "  %s (%s) [%s]\n", ids[i], source,
+                        mounted ? "mounted" : "locked");
         }
         resp.payload_len = (uint32_t)strlen(resp_buf);
         break;
@@ -586,19 +609,19 @@ static void handle_client(int client_fd)
                 char rules_buf[2048];
                 int nrules = onvault_policy_get_rules(vid, rules_buf, sizeof(rules_buf));
                 if (nrules > 0) {
-                    off += snprintf(resp_buf + off, sizeof(resp_buf) - (size_t)off,
-                                    "\nSmart defaults applied (%d rules):\n%s", nrules, rules_buf);
+                    append_text(resp_buf, sizeof(resp_buf), &off,
+                                "\nSmart defaults applied (%d rules):\n%s", nrules, rules_buf);
                 }
             } else {
-                off += snprintf(resp_buf + off, sizeof(resp_buf) - (size_t)off,
-                                "No smart defaults applied. Use --smart to auto-populate allowlist.\n");
+                append_text(resp_buf, sizeof(resp_buf), &off,
+                            "No smart defaults applied. Use --smart to auto-populate allowlist.\n");
             }
 
             rc = mount_vault_async(vid, vault_dir, mount_dir);
             if (rc != ONVAULT_OK) {
                 resp.status = IPC_RESP_ERROR;
-                snprintf(resp_buf + off, sizeof(resp_buf) - (size_t)off,
-                         "Vault added but mount failed (err=%d)\n", rc);
+                append_text(resp_buf, sizeof(resp_buf), &off,
+                            "Vault added but mount failed (err=%d)\n", rc);
             }
         }
         resp.payload_len = (uint32_t)strlen(resp_buf);
@@ -669,8 +692,8 @@ static void handle_client(int client_fd)
         for (int i = 0; i < count; i++) {
             char source[PATH_MAX];
             onvault_vault_get_paths(ids[i], NULL, NULL, source);
-            off += snprintf(resp_buf + off, sizeof(resp_buf) - (size_t)off,
-                            "%s → %s\n", ids[i], source);
+            append_text(resp_buf, sizeof(resp_buf), &off,
+                        "%s → %s\n", ids[i], source);
         }
         resp.payload_len = (uint32_t)strlen(resp_buf);
         break;
@@ -879,17 +902,17 @@ static void handle_client(int client_fd)
                                "Discovered processes (%d):\n", count);
             for (int i = 0; i < count && (size_t)off < sizeof(resp_buf) - 128; i++) {
                 const char *signed_str = entries[i].is_signed ? "signed" : "unsigned";
-                off += snprintf(resp_buf + off, sizeof(resp_buf) - (size_t)off,
-                                "  [%d] %s (%s, %d accesses)",
-                                i + 1, entries[i].path, signed_str,
-                                entries[i].access_count);
+                append_text(resp_buf, sizeof(resp_buf), &off,
+                            "  [%d] %s (%s, %d accesses)",
+                            i + 1, entries[i].path, signed_str,
+                            entries[i].access_count);
                 if (entries[i].team_id[0])
-                    off += snprintf(resp_buf + off, sizeof(resp_buf) - (size_t)off,
-                                    " team=%s", entries[i].team_id);
-                off += snprintf(resp_buf + off, sizeof(resp_buf) - (size_t)off, "\n");
+                    append_text(resp_buf, sizeof(resp_buf), &off,
+                                " team=%s", entries[i].team_id);
+                append_text(resp_buf, sizeof(resp_buf), &off, "\n");
             }
-            off += snprintf(resp_buf + off, sizeof(resp_buf) - (size_t)off,
-                            "\nTo allow a process: onvault allow <path> %s\n", payload);
+            append_text(resp_buf, sizeof(resp_buf), &off,
+                        "\nTo allow a process: onvault allow <path> %s\n", payload);
         }
         resp.payload_len = (uint32_t)strlen(resp_buf);
         break;

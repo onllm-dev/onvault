@@ -82,6 +82,10 @@ int onvault_log_write(onvault_log_event_t event,
         file_path ? file_path : "",
         detail ? detail : ""
     );
+    if (len < 0)
+        return ONVAULT_ERR_IO;
+    if (len >= (int)sizeof(entry))
+        len = (int)sizeof(entry) - 1;
 
     /* Encrypt and append to daily log file */
     char date_str[16];
@@ -114,10 +118,15 @@ int onvault_log_write(onvault_log_event_t event,
     }
 
     uint32_t entry_len = (uint32_t)len;
-    fwrite(&entry_len, sizeof(entry_len), 1, f);
-    fwrite(iv, 1, ONVAULT_GCM_IV_SIZE, f);
-    fwrite(tag, 1, ONVAULT_GCM_TAG_SIZE, f);
-    fwrite(ciphertext, 1, (size_t)len, f);
+    if (fwrite(&entry_len, sizeof(entry_len), 1, f) != 1 ||
+        fwrite(iv, 1, ONVAULT_GCM_IV_SIZE, f) != ONVAULT_GCM_IV_SIZE ||
+        fwrite(tag, 1, ONVAULT_GCM_TAG_SIZE, f) != ONVAULT_GCM_TAG_SIZE ||
+        fwrite(ciphertext, 1, (size_t)len, f) != (size_t)len) {
+        fclose(f);
+        onvault_memzero(ciphertext, (size_t)len);
+        free(ciphertext);
+        return ONVAULT_ERR_IO;
+    }
     fclose(f);
     chmod(log_path, 0600);
 

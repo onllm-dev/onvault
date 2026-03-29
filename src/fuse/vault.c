@@ -327,18 +327,55 @@ int onvault_vault_remove(const onvault_key_t *master_key,
         return rc;
     }
 
-    /* Remove symlink first */
     struct stat lst;
-    if (lstat(source_path, &lst) == 0 && S_ISLNK(lst.st_mode)) {
-        unlink(source_path);
+    if (lstat(source_path, &lst) != 0 || !S_ISLNK(lst.st_mode)) {
+        onvault_key_wipe(&vault_key, sizeof(vault_key));
+        return ONVAULT_ERR_INVALID;
     }
 
-    /* Decrypt vault back to original location */
-    rc = decrypt_directory(&vault_key, vault_dir, source_path);
+    {
+        char link_target[PATH_MAX];
+        char expected_mount[PATH_MAX];
+        ssize_t llen = readlink(source_path, link_target, PATH_MAX - 1);
+        if (llen <= 0) {
+            onvault_key_wipe(&vault_key, sizeof(vault_key));
+            return ONVAULT_ERR_INVALID;
+        }
+        link_target[llen] = '\0';
+        onvault_vault_get_paths(vault_id, NULL, expected_mount, NULL);
+        if (strcmp(link_target, expected_mount) != 0) {
+            onvault_key_wipe(&vault_key, sizeof(vault_key));
+            return ONVAULT_ERR_INVALID;
+        }
+    }
+
+    /* Decrypt to a temporary restore directory first. */
+    char restore_path[PATH_MAX];
+    snprintf(restore_path, PATH_MAX, "%s.onvault-restore", source_path);
+
+    if (lstat(restore_path, &lst) == 0) {
+        if (S_ISDIR(lst.st_mode))
+            remove_directory(restore_path);
+        else
+            unlink(restore_path);
+    }
+
+    rc = decrypt_directory(&vault_key, vault_dir, restore_path);
     onvault_key_wipe(&vault_key, sizeof(vault_key));
 
-    if (rc != ONVAULT_OK)
+    if (rc != ONVAULT_OK) {
+        remove_directory(restore_path);
         return rc;
+    }
+
+    if (unlink(source_path) != 0) {
+        remove_directory(restore_path);
+        return ONVAULT_ERR_IO;
+    }
+    if (rename(restore_path, source_path) != 0) {
+        symlink(mount_dir, source_path);
+        return ONVAULT_ERR_IO;
+    }
 
     /* Clean up vault and mount directories */
     remove_directory(vault_dir);

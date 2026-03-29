@@ -748,6 +748,14 @@ static int g_menu_vault_count = 0;
     size_t plen = strlen(proc);
     size_t vlen = strlen(vid);
     char payload[PATH_MAX + 64];
+    if (plen + 1 + vlen + 1 > sizeof(payload)) {
+        NSAlert *err = [[NSAlert alloc] init];
+        err.messageText = @"Path too long";
+        err.alertStyle = NSAlertStyleWarning;
+        [err addButtonWithTitle:@"OK"];
+        [err runModal];
+        return;
+    }
     memcpy(payload, proc, plen + 1);
     memcpy(payload + plen + 1, vid, vlen + 1);
 
@@ -790,6 +798,14 @@ static int g_menu_vault_count = 0;
     size_t plen = strlen(proc);
     size_t vlen = strlen(vid);
     char payload[PATH_MAX + 64];
+    if (plen + 1 + vlen + 1 > sizeof(payload)) {
+        NSAlert *err = [[NSAlert alloc] init];
+        err.messageText = @"Path too long";
+        err.alertStyle = NSAlertStyleWarning;
+        [err addButtonWithTitle:@"OK"];
+        [err runModal];
+        return;
+    }
     memcpy(payload, proc, plen + 1);
     memcpy(payload + plen + 1, vid, vlen + 1);
 
@@ -896,6 +912,8 @@ static int g_menu_vault_count = 0;
     size_t plen = strlen(proc);
     size_t vlen = strlen(vid);
     char payload[PATH_MAX + 64];
+    if (plen + 1 + vlen + 1 > sizeof(payload))
+        return;
     memcpy(payload, proc, plen + 1);
     memcpy(payload + plen + 1, vid, vlen + 1);
     onvault_ipc_send(IPC_CMD_ALLOW,
@@ -939,6 +957,10 @@ didReceiveNotificationResponse:(UNNotificationResponse *)response
         size_t plen = strlen(proc);
         size_t vlen = strlen(vid);
         char payload[PATH_MAX + 64];
+        if (plen + 1 + vlen + 1 > sizeof(payload)) {
+            completionHandler();
+            return;
+        }
         memcpy(payload, proc, plen + 1);
         memcpy(payload + plen + 1, vid, vlen + 1);
         onvault_ipc_send(IPC_CMD_ALLOW,

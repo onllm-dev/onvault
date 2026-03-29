@@ -355,6 +355,10 @@ static int cmd_allow(const char *process, const char *vault_id)
     size_t plen = strlen(process);
     size_t vlen = strlen(vault_id);
     char payload[PATH_MAX + 64];
+    if (plen + 1 + vlen + 1 > sizeof(payload)) {
+        fprintf(stderr, "Path too long.\n");
+        return 1;
+    }
     memcpy(payload, process, plen + 1); /* includes \0 */
     memcpy(payload + plen + 1, vault_id, vlen + 1);
 
@@ -384,6 +388,10 @@ static int cmd_deny(const char *process, const char *vault_id)
     size_t plen = strlen(process);
     size_t vlen = strlen(vault_id);
     char payload[PATH_MAX + 64];
+    if (plen + 1 + vlen + 1 > sizeof(payload)) {
+        fprintf(stderr, "Path too long.\n");
+        return 1;
+    }
     memcpy(payload, process, plen + 1);
     memcpy(payload + plen + 1, vault_id, vlen + 1);
 

@@ -166,10 +166,12 @@ static void esf_handler(es_client_t *client, const es_message_t *msg)
         es_respond_auth_result(client, msg, ES_AUTH_RESULT_ALLOW, false);
     } else {
         es_respond_auth_result(client, msg, ES_AUTH_RESULT_DENY, false);
-        if (g_deny_callback) {
+        onvault_deny_callback_fn cb = g_deny_callback;
+        __sync_synchronize();
+        if (cb) {
             const char *id = strrchr(vault_path, '/');
             id = id ? id + 1 : vault_path;
-            g_deny_callback(&proc, file_path, id);
+            cb(&proc, file_path, id);
         }
     }
 }

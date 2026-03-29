@@ -69,12 +69,12 @@ int onvault_config_read(const char *path,
     long file_size = ftell(f);
     fseek(f, 0, SEEK_SET);
 
-    if (file_size < (long)(ONVAULT_GCM_IV_SIZE + ONVAULT_GCM_TAG_SIZE)) {
+    if (file_size < (long)(ONVAULT_GCM_IV_SIZE + ONVAULT_GCM_TAG_SIZE + 1)) {
         fclose(f);
         return ONVAULT_ERR_INVALID;
     }
 
-    size_t cipher_len = (size_t)file_size - ONVAULT_GCM_IV_SIZE - ONVAULT_GCM_TAG_SIZE;
+    size_t cipher_len = (size_t)(file_size - ONVAULT_GCM_IV_SIZE - ONVAULT_GCM_TAG_SIZE);
     if (cipher_len > *data_len) {
         fclose(f);
         return ONVAULT_ERR_MEMORY;
