@@ -31,28 +31,33 @@ ${CYAN}FLAGS:${NC}
     --build,   -b       Build development binaries
     --dist              Build distribution binaries (static linking)
     --test,    -t       Run full test suite (25 tests)
-    --run,     -r       Build and run daemon in foreground
+    --run,     -r       Build and run daemon in foreground (with menu bar)
+    --start             Build and start daemon in background
     --clean,   -c       Remove binaries, object files, test artifacts
     --deps,    -d       Install all build dependencies
     --check             Check system readiness (deps, macFUSE, ESF)
     --install           Install binaries to /usr/local/bin
     --uninstall         Remove binaries from /usr/local/bin
     --stop              Stop running daemon
+    --status            Show daemon status and web UI URL
     --help,    -h       Show this help message
 
 ${CYAN}EXAMPLES:${NC}
     ./app.sh --deps --build --test   # Install deps, build, test
-    ./app.sh --build --run           # Build and run daemon
+    ./app.sh --build --start         # Build and start daemon (background)
+    ./app.sh --build --run           # Build and run daemon (foreground)
     ./app.sh --dist                  # Build for distribution
     ./app.sh --clean --build --test  # Clean rebuild + test
     ./app.sh --check                 # Verify system readiness
+    ./app.sh --status                # Show daemon status + web UI URL
+    ./app.sh --stop                  # Stop running daemon
 
 ${CYAN}END USER SETUP:${NC}
     1. brew install --cask macfuse   # One-time, requires reboot
     2. ./app.sh --deps --build       # Build onvault
     3. ./onvault init                # Set passphrase
-    4. ./onvault vault add ~/.ssh    # Protect SSH keys
-    5. ./onvault unlock              # Mount vaults
+    4. ./app.sh --start              # Start daemon
+    5. Open menu bar → Unlock → Add Vault
 
 ${CYAN}NOTES:${NC}
     Flags can be combined. Execution order is always:
@@ -70,7 +75,9 @@ DO_DIST=false
 DO_INSTALL=false
 DO_UNINSTALL=false
 DO_RUN=false
+DO_START=false
 DO_STOP=false
+DO_STATUS=false
 
 if [[ $# -eq 0 ]]; then
     usage
@@ -97,8 +104,12 @@ while [[ $# -gt 0 ]]; do
             DO_UNINSTALL=true ;;
         --run|-r)
             DO_RUN=true ;;
+        --start)
+            DO_START=true ;;
         --stop)
             DO_STOP=true ;;
+        --status)
+            DO_STATUS=true ;;
         --help|-h)
             usage; exit 0 ;;
         *)
@@ -307,10 +318,75 @@ run_daemon() {
     "$SCRIPT_DIR/$DAEMON_BIN"
 }
 
+# --- Start (background) ---
+start_daemon() {
+    if ! [[ -f "$SCRIPT_DIR/$DAEMON_BIN" ]]; then
+        info "Binary not found, building first..."
+        build
+    fi
+
+    # Check if already running
+    local pid_file="$HOME/.onvault/onvaultd.pid"
+    if [[ -f "$pid_file" ]]; then
+        local existing_pid
+        existing_pid=$(cat "$pid_file" 2>/dev/null)
+        if kill -0 "$existing_pid" 2>/dev/null; then
+            warn "Daemon already running (pid $existing_pid)"
+            show_status
+            return
+        fi
+    fi
+
+    info "Starting onvaultd in background..."
+    "$SCRIPT_DIR/$DAEMON_BIN" &
+    sleep 3
+
+    if [[ -f "$HOME/.onvault/http.port" ]]; then
+        local port
+        port=$(cat "$HOME/.onvault/http.port")
+        echo ""
+        success "Daemon started."
+        echo -e "  ${BOLD}PID:${NC}      $(cat "$HOME/.onvault/onvaultd.pid" 2>/dev/null)"
+        echo -e "  ${BOLD}Web UI:${NC}   ${CYAN}http://127.0.0.1:${port}/menubar${NC}"
+        echo -e "  ${BOLD}Menu bar:${NC} Look for the lock icon"
+        echo ""
+        echo -e "  To unlock: ${BOLD}./onvault unlock${NC}"
+    else
+        error "Daemon may have failed to start. Check stderr output."
+    fi
+}
+
+# --- Status ---
+show_status() {
+    local pid_file="$HOME/.onvault/onvaultd.pid"
+    local port_file="$HOME/.onvault/http.port"
+
+    if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null; then
+        local pid port
+        pid=$(cat "$pid_file")
+        port=$(cat "$port_file" 2>/dev/null || echo "?")
+        echo ""
+        success "Daemon is running."
+        echo -e "  ${BOLD}PID:${NC}      $pid"
+        echo -e "  ${BOLD}Web UI:${NC}   ${CYAN}http://127.0.0.1:${port}/menubar${NC}"
+        echo -e "  ${BOLD}Socket:${NC}   ~/.onvault/onvault.sock"
+        echo ""
+
+        # Query status via CLI if unlocked
+        if [[ -f "$SCRIPT_DIR/$CLI_BIN" ]]; then
+            "$SCRIPT_DIR/$CLI_BIN" status 2>/dev/null || true
+        fi
+    else
+        warn "Daemon is not running."
+        echo "  Start with: ./app.sh --start"
+    fi
+}
+
 # --- Stop ---
 stop_daemon() {
     info "Stopping onvaultd..."
     if pkill -f onvaultd 2>/dev/null; then
+        sleep 1
         success "Daemon stopped."
     else
         warn "No running daemon found."
@@ -327,6 +403,8 @@ $DO_TEST      && run_tests
 $DO_DIST      && dist
 $DO_INSTALL   && install_bins
 $DO_STOP      && stop_daemon
+$DO_STATUS    && show_status
+$DO_START     && start_daemon
 $DO_RUN       && run_daemon
 
 exit 0

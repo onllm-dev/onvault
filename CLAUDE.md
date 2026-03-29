@@ -18,21 +18,30 @@ Two-layer defense:
 
 Key hierarchy: Passphrase → Argon2id → Master Key (Secure Enclave wrapped) → Per-Vault Key (HKDF) → Per-File Key (HKDF + nonce xattr).
 
+### Daemon Architecture
+
+`onvaultd` runs three concurrent subsystems:
+- **IPC server** — Unix domain socket at `~/.onvault/onvault.sock` for CLI commands
+- **HTTP server** — localhost-only server for the web-based menu bar UI (port in `~/.onvault/http.port`)
+- **Menu bar** — WKWebView popover loading from the HTTP server (or NSApp event loop on main thread)
+
+PID lock at `~/.onvault/onvaultd.pid` prevents multiple daemon instances.
+
+### Auth-Gated IPC
+
+Destructive commands (lock, vault remove) use challenge-response auth:
+1. CLI requests nonce via `IPC_CMD_AUTH_CHALLENGE`
+2. CLI computes `SHA-256(Argon2id(passphrase, salt) || nonce)`
+3. Daemon verifies proof, nonce is single-use (invalidated after verification)
+
+Read-only IPC commands (rules, policy show, vault list) require `g_master_key_loaded` — must be unlocked.
+
 ## Build & Test
 
 ```bash
-./app.sh --deps          # Install dependencies
-./app.sh --build         # Development build
-./app.sh --test          # Run all 25 tests
-./app.sh --dist          # Static-linked distribution build
-./app.sh --check         # Verify system readiness
-```
-
-Or directly with Make:
-```bash
-make clean && make       # Build
-make test                # Run tests
-make dist                # Distribution build
+make clean && make       # Build (CLI + daemon + tests)
+make test                # Run all 25 tests (14 crypto + 11 vault)
+make dist                # Static-linked distribution build
 ```
 
 ## Dependencies
@@ -43,18 +52,18 @@ make dist                # Distribution build
 ## Code Structure
 
 ```
-src/common/     — Shared: crypto, hash, memwipe, argon2, config, ipc, log, types
-src/fuse/       — Layer 1: macFUSE encrypted filesystem (encrypt, vault, onvault_fuse)
-src/esf/        — Layer 2: ESF per-process control (agent, policy)
-src/keystore/   — Secure Enclave + Keychain (ECDH key wrapping)
-src/daemon/     — onvaultd main daemon
-src/cli/        — onvault CLI
-src/menubar/    — macOS menu bar (NSStatusItem via Obj-C runtime)
-src/auth/       — Passphrase, session tokens, Touch ID, recovery key
-src/watch/      — Learning/discovery mode (ESF NOTIFY observer)
-tests/          — Unit + integration tests
-defaults/       — Smart default allowlists (ssh.yaml, aws.yaml, kube.yaml)
-install/        — launchd plist, entitlements
+src/common/       — Shared: crypto, hash, memwipe, argon2, config, ipc, log, types
+src/fuse/         — Layer 1: macFUSE encrypted filesystem (encrypt, vault, onvault_fuse)
+src/esf/          — Layer 2: ESF per-process control (agent, policy)
+src/keystore/     — Secure Enclave + Keychain (ECDH key wrapping, software fallback)
+src/daemon/       — onvaultd: IPC server, HTTP server, embedded web UI (menubar.html)
+src/cli/          — onvault CLI: all commands + interactive configure TUI
+src/menubar/      — macOS menu bar: WKWebView popover + NSStatusItem + notifications
+src/auth/         — Passphrase, session tokens, Touch ID, recovery key, challenge-response
+src/watch/        — Learning/discovery mode (ESF NOTIFY observer)
+tests/            — Unit + integration tests (keystore_stub.c for pop-up-free testing)
+defaults/         — Smart default allowlists (ssh.yaml, aws.yaml, kube.yaml)
+install/          — launchd plist, entitlements
 ```
 
 ## Key Conventions
@@ -68,10 +77,30 @@ install/        — launchd plist, entitlements
 - **FUSE conditional:** FUSE code is behind `#ifdef HAVE_MACFUSE`. Builds with stub if macFUSE not installed.
 - **Config encryption:** All onvault config/policies are AES-256-GCM encrypted with a config key derived from the master key.
 - **Process verification:** Three modes — `codesign_preferred` (default), `hash_only`, `codesign_required`.
+- **Smart defaults:** Opt-in via `--smart` flag. Auto-populates allowlists for known vault types (ssh, aws, kube, gnupg, docker).
+- **Web UI JS:** Must use ES5 syntax (no async/await, use `.then()` chains). WKWebView on older macOS doesn't support top-level await.
+- **HTML embedding:** `src/daemon/menubar.html` is the source; it's embedded as a C string in `onvaultd.c` via a Python script during build.
+- **Test isolation:** Tests use `tests/keystore_stub.c` (in-memory keystore) to avoid Keychain/iCloud popups.
+
+## IPC Protocol
+
+Socket: `~/.onvault/onvault.sock` (umask 0177, owner-only)
+
+Commands: STATUS, UNLOCK, LOCK, VAULT_ADD, VAULT_REMOVE, VAULT_LIST, ALLOW, DENY, POLICY_SHOW, RULES, WATCH_START, WATCH_SUGGEST, ROTATE_KEYS, LOG, AUTH_CHALLENGE
+
+Auth-gated (need proof): LOCK, VAULT_REMOVE
+Session-gated (need unlock): VAULT_ADD, ALLOW, DENY, VAULT_LIST, RULES, POLICY_SHOW, LOG
+
+## HTTP API (localhost only)
+
+GET endpoints: `/menubar`, `/api/status`, `/api/denials`, `/api/policies`, `/api/rules?vault=<id>`
+POST endpoints: `/api/unlock`, `/api/lock`, `/api/vault/add`, `/api/allow`, `/api/deny`
+
+All POST bodies are plain text. Thread-per-request to avoid blocking on Argon2id (~2-3s).
 
 ## Git Rules
 
-- **NEVER commit temporary files, build artifacts, or plan files.** The `.gitignore` covers: `*.o`, binaries (`onvault`, `onvaultd`), test binaries, `.DS_Store`, `.claude/`, `plan.md`, `.onvault/`.
+- **NEVER commit temporary files, build artifacts, or plan files.** The `.gitignore` covers: `*.o`, binaries (`onvault`, `onvaultd`), test binaries, `.DS_Store`, `.claude/`, `plan.md`, `.onvault/`, `*.png`, `.playwright-mcp/`.
 - **NEVER push directly to main without user approval.** Every commit must be reviewed and explicitly approved by the user before pushing.
 - **NEVER force push.** Always create new commits.
 - **Commit messages:** Use conventional commits. Lead with what changed, not how. Example: `feat: add vault watch learning mode` or `fix: handle empty nonce xattr gracefully`.
@@ -85,3 +114,9 @@ install/        — launchd plist, entitlements
 - Always wipe key material from memory after use.
 - Default deny policy — if no rule matches, access is denied.
 - Root is not trusted by default. su/sudo detected via audit_token ruid vs euid.
+- Destructive IPC commands require challenge-response passphrase proof (single-use nonce).
+- Read-only IPC commands require daemon to be unlocked (prevents policy enumeration by attackers).
+- IPC payloads validated with `read_all()` — partial reads rejected.
+- HTTP server is localhost-only (127.0.0.1), thread-per-request.
+- PID lock prevents multiple daemon instances.
+- Auto-create policy on first allow/deny rule for a vault.

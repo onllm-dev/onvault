@@ -72,7 +72,7 @@ make dist   # Distribution build (static linking, no Homebrew needed by users)
 # 1. First-time setup — sets passphrase, generates recovery key
 onvault init
 
-# 2. Start the daemon (shows menu bar icon, or --no-gui for headless)
+# 2. Start the daemon (shows menu bar icon + web UI)
 onvaultd &                  # with menu bar
 onvaultd --no-gui &         # headless (servers, CI)
 
@@ -83,15 +83,28 @@ onvault unlock
 onvault vault add ~/.ssh --smart  # encrypt + auto-populate allowlist
 onvault vault add ~/.aws --smart  # encrypt AWS credentials
 
-# 5. Interactive configuration
-onvault configure             # manage vaults, rules, logs (passphrase required)
-
-# 6. Status — see what's protected
+# 5. Status — see what's protected
 onvault status
 
-# 7. Lock — unmount vaults, wipe keys from memory (passphrase required)
+# 6. Lock — unmount vaults, wipe keys from memory (passphrase required)
 onvault lock
 ```
+
+### Menu Bar & Web UI
+
+The daemon shows a menu bar icon and serves an interactive web UI. Click the lock icon or open `http://127.0.0.1:<port>/menubar` in any browser.
+
+Everything can be done from the menu bar — no CLI needed:
+
+- **Unlock/Lock** — passphrase dialog, Argon2id verification
+- **Add Vault** — type a path, click Protect (auto-creates directory if needed)
+- **Allow/Deny Process** — inline input per vault
+- **View Rules** — overlay panel showing all rules for a vault
+- **View All Policies** — overlay panel with full policy summary
+- **Recent Denials** — denied access attempts with quick-allow button
+- **Auto-refresh** — vault status updates every 5 seconds
+
+The web UI port is written to `~/.onvault/http.port` for scripting and testing.
 
 ### What Happens When You Add a Vault
 
@@ -102,27 +115,28 @@ onvault vault add ~/.ssh --smart
 1. Files in `~/.ssh/` are encrypted (AES-256-XTS) and moved to `~/.onvault/vaults/ssh/`
 2. A nonce is stored in each file's xattr for key derivation
 3. `~/.ssh` is replaced with a symlink → `~/.onvault/mnt/ssh/`
-4. When unlocked: FUSE mount decrypts on-the-fly. `ssh`, `git`, etc. work normally.
-5. When locked or daemon stops: FUSE unmounts. `~/.ssh` symlink points to nothing. Files are ciphertext.
+4. Smart defaults auto-populate 7 allow rules (ssh, scp, sftp, ssh-add, ssh-agent, ssh-keygen, git)
+5. When unlocked: FUSE mount decrypts on-the-fly. `ssh`, `git`, etc. work normally.
+6. When locked or daemon stops: FUSE unmounts. `~/.ssh` symlink points to nothing. Files are ciphertext.
 
 To undo: `onvault vault remove ssh` decrypts everything back to the original location (passphrase required).
 
 ### Auth-Gated Operations
 
-Destructive operations require passphrase verification to prevent unauthorized disabling of protection. A malicious script running as your user **cannot** disable onvault without knowing your passphrase:
+Destructive operations require passphrase verification via challenge-response. A malicious script running as your user **cannot** disable onvault without knowing your passphrase:
 
 | Operation | Auth Required |
 |-----------|--------------|
-| `onvault lock` | Passphrase |
-| `onvault vault remove` | Passphrase |
-| `onvault configure` | Passphrase |
-| Menu bar Lock/Remove | Passphrase (secure dialog) |
-| `onvault unlock` | Passphrase |
+| `onvault lock` | Challenge-response passphrase proof |
+| `onvault vault remove` | Challenge-response passphrase proof |
+| `onvault configure` | Local passphrase verification |
+| Menu bar Lock/Unlock/Add | Passphrase dialog (Argon2id) |
+| `onvault unlock` | Passphrase (Argon2id) |
 | `onvault vault add` | Session (must be unlocked) |
 | `onvault allow/deny` | Session (must be unlocked) |
-| `onvault status/rules/log` | No auth (read-only) |
+| `onvault status/rules/log` | Requires unlocked daemon |
 
-The passphrase proof is verified by the daemon via SHA-256(Argon2id(passphrase, salt)) — the passphrase itself never travels over the IPC socket.
+The daemon uses single-use nonces for challenge-response — proofs cannot be replayed.
 
 ### Smart Defaults
 
@@ -145,7 +159,6 @@ Only processes in the allowlist can read your encrypted files. Everything else i
 ```bash
 # Allow a specific binary to access a vault
 onvault allow /usr/bin/vim ssh
-onvault allow /opt/homebrew/bin/gh ssh
 
 # Deny a specific binary
 onvault deny /usr/bin/python3 ssh
@@ -163,24 +176,30 @@ onvault vault suggest ssh
 # View audit log (all events or denied only)
 onvault log
 onvault log --denied
+
+# Interactive configuration (passphrase required)
+onvault configure
 ```
 
-### Menu Bar
+### CLI Reference
 
-The daemon shows a menu bar icon with full vault management:
-
-- **Vault list** — see all vaults with status (locked/unlocked)
-- **Add Vault** — folder picker to protect a new directory
-- **Remove Vault** — decrypt and unprotect (per-vault submenu)
-- **View Rules** — see which processes are allowed per vault
-- **Recent Denials** — last 5 denied access attempts with process details
-- **Quick Allow** — grant access to a denied process directly from the menu
-- **Lock/Unlock All** — toggle vault access
-
-### Version
-
-```bash
-onvault --version    # onvault 0.1.0
+```
+onvault init                          First-time setup
+onvault unlock                        Authenticate and mount vaults
+onvault lock                          Unmount vaults, wipe keys (passphrase)
+onvault status                        Show daemon and vault status
+onvault vault add <path> [--smart]    Encrypt and protect a directory
+onvault vault remove <vault_id>       Decrypt and unprotect (passphrase)
+onvault vault list                    List all vaults
+onvault vault watch <path>            Learning mode (24h observation)
+onvault vault suggest <vault_id>      Show watch suggestions
+onvault allow <process> <vault_id>    Allow a process
+onvault deny <process> <vault_id>     Deny a process
+onvault rules <vault_id>              Show rules for a vault
+onvault policy show                   Show all policies
+onvault log [--denied]                View audit log
+onvault configure                     Interactive configuration (passphrase)
+onvault --version                     Show version
 ```
 
 ---
@@ -188,31 +207,32 @@ onvault --version    # onvault 0.1.0
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────┐
-│                  onvault CLI (C)                   │
-│        onvault vault, onvault policy, onvault status│
-├──────────────────────────────────────────────────┤
-│            Menu Bar App (C + Obj-C)               │
-│    Status indicator, lock/unlock, notifications    │
-├──────────────────────────────────────────────────┤
-│             Daemon — onvaultd (C)                  │
-│  Policy Engine │ Auth │ Key Mgmt │ Audit Logger   │
-├──────────────────────────────────────────────────┤
-│                                                    │
-│  Layer 1: Encryption at Rest (macFUSE)            │
-│  AES-256-XTS (data) + AES-256-GCM (filenames)    │
-│  Per-file keys via HKDF-SHA512 + nonce in xattr   │
-│  No daemon = no mount = ciphertext only            │
-│                                                    │
-│  Layer 2: Per-Process Access Control (ESF)        │
-│  AUTH_OPEN + AUTH_RENAME + AUTH_LINK + more        │
-│  cdHash + Team ID + Signing ID verification        │
-│  su/sudo detection via audit_token ruid vs euid    │
-│                                                    │
-├──────────────────────────────────────────────────┤
-│  Secure Enclave + Keychain                        │
-│  Master key wrapped via ECDH, non-exportable       │
-└──────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│                    onvault CLI (C)                     │
+│  init, unlock, lock, vault, allow, deny, configure    │
+├──────────────────────────────────────────────────────┤
+│      Menu Bar (WKWebView + HTML/CSS/JS popover)       │
+│  Vault mgmt, allow/deny, rules, denials, lock/unlock  │
+├──────────────────────────────────────────────────────┤
+│               Daemon — onvaultd (C)                    │
+│  IPC Server │ HTTP Server │ Policy │ Auth │ Audit Log  │
+├──────────────────────────────────────────────────────┤
+│                                                        │
+│  Layer 1: Encryption at Rest (macFUSE)                │
+│  AES-256-XTS (data) + AES-256-GCM (filenames)        │
+│  Per-file keys via HKDF-SHA512 + nonce in xattr       │
+│  No daemon = no mount = ciphertext only                │
+│                                                        │
+│  Layer 2: Per-Process Access Control (ESF)            │
+│  AUTH_OPEN + AUTH_RENAME + AUTH_LINK + more            │
+│  cdHash + Team ID + Signing ID verification            │
+│  su/sudo detection via audit_token ruid vs euid        │
+│                                                        │
+├──────────────────────────────────────────────────────┤
+│  Secure Enclave + Keychain                            │
+│  Master key wrapped via ECDH, non-exportable           │
+│  Software EC key fallback for unsigned binaries        │
+└──────────────────────────────────────────────────────┘
 ```
 
 ### Key Hierarchy
@@ -224,18 +244,6 @@ User Passphrase
     → [HKDF-SHA512] → Per-Vault Key (one per protected directory)
       → [HKDF-SHA512 + nonce] → Per-File Key (unique per file)
 ```
-
-### Smart Defaults
-
-When you add a vault, onvault suggests an allowlist of known-good binaries:
-
-| Vault | Default Allowed Processes |
-|-------|-------------------------|
-| `~/.ssh` | ssh, scp, sftp, ssh-add, ssh-agent, ssh-keygen, git |
-| `~/.aws` | aws, terraform, pulumi |
-| `~/.kube` | kubectl, helm, k9s |
-| `~/.gnupg` | gpg, gpg2, gpg-agent, git |
-| `~/.docker` | docker, Docker.app |
 
 ### Process Verification Modes
 
@@ -254,12 +262,16 @@ When you add a vault, onvault suggests an allowlist of known-good binaries:
 | Threat | How |
 |--------|-----|
 | **Supply chain attacks** (litellm, malicious npm/pip packages) | Malicious code reads only ciphertext. Not in allowlist → DENIED. |
+| **Unauthorized daemon shutdown** | `onvault lock` requires passphrase via challenge-response. IPC socket is owner-only. |
 | **Daemon killed / not running** | FUSE auto-unmounts. Files remain AES-256 encrypted on disk. |
 | **Physical disk theft** | Encrypted at rest. Master key in Secure Enclave (hardware-bound). |
 | **Root / su impersonation** | Detected via `audit_token` — real UID vs effective UID comparison. |
 | **Binary swapping** | Process identity verified by cdHash (Apple's content directory hash), not just path. |
 | **Config tampering** | All policies and config encrypted with master key derivative. |
 | **Memory snooping** | Keys `mlock()`'d (never swapped to disk), `explicit_bzero()`'d after use. |
+| **IPC replay attacks** | Challenge-response with single-use nonces for destructive commands. |
+| **Policy enumeration** | Read-only IPC commands require unlocked daemon. |
+| **Multiple daemon instances** | PID lock file at `~/.onvault/onvaultd.pid`. |
 
 ### Not Protected Against
 
@@ -278,6 +290,7 @@ When you add a vault, onvault suggests an allowlist of known-good binaries:
 | Key derivation | HKDF-SHA512 | RFC 5869 |
 | Process hashing | SHA-256 | FIPS 180-4 |
 | Master key storage | Secure Enclave (ECDH P-256) | Apple CryptoKit |
+| Auth proof | SHA-256(key \|\| nonce) | Challenge-response |
 
 ---
 
@@ -287,7 +300,11 @@ When you add a vault, onvault suggests an allowlist of known-good binaries:
 ~/.onvault/
 ├── salt                    # Argon2id salt (16 bytes)
 ├── auth.enc                # Passphrase hash (encrypted)
-├── config.enc              # Policies + allowlists (AES-256-GCM)
+├── onvaultd.pid            # PID lock (prevents multiple daemons)
+├── onvault.sock            # IPC socket (CLI ↔ daemon)
+├── http.port               # HTTP server port for web UI
+├── session                 # Session token (15 min TTL)
+├── logs/                   # Encrypted audit logs (daily rotation)
 ├── vaults/
 │   ├── ssh/                # Ciphertext for ~/.ssh
 │   └── aws/                # Ciphertext for ~/.aws
@@ -295,10 +312,6 @@ When you add a vault, onvault suggests an allowlist of known-good binaries:
     ├── ssh/                # FUSE mount → symlinked from ~/.ssh
     └── aws/                # FUSE mount → symlinked from ~/.aws
 ```
-
-When locked: `~/.ssh` is a symlink to an empty mount point. The actual files are ciphertext in `~/.onvault/vaults/ssh/`.
-
-When unlocked: FUSE mounts decrypt on-the-fly. `~/.ssh/id_rsa` is readable — but only by processes in the allowlist.
 
 ---
 
@@ -325,11 +338,11 @@ onvault/
 │   ├── common/         # Crypto, hashing, IPC, config, logging, types
 │   ├── fuse/           # Layer 1: macFUSE encrypted filesystem
 │   ├── esf/            # Layer 2: Endpoint Security per-process control
-│   ├── keystore/       # Secure Enclave + Keychain integration
-│   ├── daemon/         # onvaultd main entry
-│   ├── cli/            # onvault CLI
-│   ├── menubar/        # macOS menu bar status item
-│   ├── auth/           # Passphrase, session tokens, Touch ID, recovery
+│   ├── keystore/       # Secure Enclave + Keychain (software fallback)
+│   ├── daemon/         # onvaultd: IPC server, HTTP server, web UI
+│   ├── cli/            # onvault CLI + interactive configure
+│   ├── menubar/        # macOS menu bar: WKWebView popover
+│   ├── auth/           # Passphrase, sessions, Touch ID, challenge-response
 │   └── watch/          # Learning/discovery mode
 ├── tests/              # Unit + integration tests
 ├── defaults/           # Smart default allowlists (ssh, aws, kube)
