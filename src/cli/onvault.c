@@ -346,27 +346,40 @@ static int cmd_vault_list(void)
 
 static int cmd_allow(const char *process, const char *vault_id)
 {
+    uint8_t proof[ONVAULT_HASH_SIZE];
+    size_t plen;
+    size_t vlen;
+    char payload[ONVAULT_HASH_SIZE + PATH_MAX + 64];
+    size_t payload_len;
+    char response[ONVAULT_IPC_MAX_MSG];
+    uint32_t resp_len;
+    int rc;
+
     if (!process || !vault_id) {
         fprintf(stderr, "Usage: onvault allow <process_path> <vault_id>\n");
         return 1;
     }
 
-    /* Pack: "process_path\0vault_id" */
-    size_t plen = strlen(process);
-    size_t vlen = strlen(vault_id);
-    char payload[PATH_MAX + 64];
-    if (plen + 1 + vlen + 1 > sizeof(payload)) {
+    if (auth_challenge_response("Passphrase (required to allow): ", proof) != 0)
+        return 1;
+
+    /* Pack: proof(32) + process_path\0vault_id */
+    plen = strlen(process);
+    vlen = strlen(vault_id);
+    payload_len = ONVAULT_HASH_SIZE + plen + 1 + vlen + 1;
+    if (payload_len > sizeof(payload)) {
+        onvault_memzero(proof, sizeof(proof));
         fprintf(stderr, "Path too long.\n");
         return 1;
     }
-    memcpy(payload, process, plen + 1); /* includes \0 */
-    memcpy(payload + plen + 1, vault_id, vlen + 1);
+    memcpy(payload, proof, ONVAULT_HASH_SIZE);
+    memcpy(payload + ONVAULT_HASH_SIZE, process, plen + 1); /* includes \0 */
+    memcpy(payload + ONVAULT_HASH_SIZE + plen + 1, vault_id, vlen + 1);
+    onvault_memzero(proof, sizeof(proof));
 
-    char response[ONVAULT_IPC_MAX_MSG];
-    uint32_t resp_len = sizeof(response) - 1;
-    int rc = onvault_ipc_send(IPC_CMD_ALLOW,
-                               payload, (uint32_t)(plen + 1 + vlen + 1),
-                               response, &resp_len);
+    resp_len = sizeof(response) - 1;
+    rc = onvault_ipc_send(IPC_CMD_ALLOW, payload, (uint32_t)payload_len,
+                          response, &resp_len);
 
     response[resp_len] = '\0';
     if (rc != ONVAULT_OK)
@@ -379,27 +392,40 @@ static int cmd_allow(const char *process, const char *vault_id)
 
 static int cmd_deny(const char *process, const char *vault_id)
 {
+    uint8_t proof[ONVAULT_HASH_SIZE];
+    size_t plen;
+    size_t vlen;
+    char payload[ONVAULT_HASH_SIZE + PATH_MAX + 64];
+    size_t payload_len;
+    char response[ONVAULT_IPC_MAX_MSG];
+    uint32_t resp_len;
+    int rc;
+
     if (!process || !vault_id) {
         fprintf(stderr, "Usage: onvault deny <process_path> <vault_id>\n");
         return 1;
     }
 
-    /* Pack: "process_path\0vault_id" */
-    size_t plen = strlen(process);
-    size_t vlen = strlen(vault_id);
-    char payload[PATH_MAX + 64];
-    if (plen + 1 + vlen + 1 > sizeof(payload)) {
+    if (auth_challenge_response("Passphrase (required to deny): ", proof) != 0)
+        return 1;
+
+    /* Pack: proof(32) + process_path\0vault_id */
+    plen = strlen(process);
+    vlen = strlen(vault_id);
+    payload_len = ONVAULT_HASH_SIZE + plen + 1 + vlen + 1;
+    if (payload_len > sizeof(payload)) {
+        onvault_memzero(proof, sizeof(proof));
         fprintf(stderr, "Path too long.\n");
         return 1;
     }
-    memcpy(payload, process, plen + 1);
-    memcpy(payload + plen + 1, vault_id, vlen + 1);
+    memcpy(payload, proof, ONVAULT_HASH_SIZE);
+    memcpy(payload + ONVAULT_HASH_SIZE, process, plen + 1);
+    memcpy(payload + ONVAULT_HASH_SIZE + plen + 1, vault_id, vlen + 1);
+    onvault_memzero(proof, sizeof(proof));
 
-    char response[ONVAULT_IPC_MAX_MSG];
-    uint32_t resp_len = sizeof(response) - 1;
-    int rc = onvault_ipc_send(IPC_CMD_DENY,
-                               payload, (uint32_t)(plen + 1 + vlen + 1),
-                               response, &resp_len);
+    resp_len = sizeof(response) - 1;
+    rc = onvault_ipc_send(IPC_CMD_DENY, payload, (uint32_t)payload_len,
+                          response, &resp_len);
 
     response[resp_len] = '\0';
     if (rc != ONVAULT_OK)

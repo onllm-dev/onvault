@@ -69,10 +69,18 @@ static onvault_key_t g_config_key;
 static int g_config_key_loaded = 0;
 static int g_log_initialized = 0;
 
-/* Challenge-response nonce for auth-gated commands.
- * Single-use: invalidated after one verification attempt. */
-static uint8_t g_auth_nonce[ONVAULT_HASH_SIZE];
-static int g_nonce_valid = 0;
+#define MAX_NONCES 16
+#define NONCE_TTL_SECONDS 60
+
+/* Challenge-response nonces for auth-gated commands.
+ * Each nonce is single-use and expires after a short TTL. */
+typedef struct {
+    uint8_t nonce[ONVAULT_HASH_SIZE];
+    time_t created;
+    int valid;
+} auth_nonce_slot_t;
+
+static auth_nonce_slot_t g_nonce_bucket[MAX_NONCES];
 static pthread_mutex_t g_nonce_lock = PTHREAD_MUTEX_INITIALIZER;
 
 #define MAX_MOUNTED_VAULTS 32
@@ -452,6 +460,122 @@ static int finish_unlock(const onvault_key_t *master_key)
     return ONVAULT_OK;
 }
 
+static void clear_nonce_slot_locked(int slot)
+{
+    if (slot < 0 || slot >= MAX_NONCES)
+        return;
+    g_nonce_bucket[slot].valid = 0;
+    g_nonce_bucket[slot].created = 0;
+    onvault_memzero(g_nonce_bucket[slot].nonce, sizeof(g_nonce_bucket[slot].nonce));
+}
+
+static void expire_nonces_locked(time_t now)
+{
+    for (int i = 0; i < MAX_NONCES; i++) {
+        if (!g_nonce_bucket[i].valid)
+            continue;
+        if ((now - g_nonce_bucket[i].created) > NONCE_TTL_SECONDS)
+            clear_nonce_slot_locked(i);
+    }
+}
+
+static void clear_nonce_bucket(void)
+{
+    pthread_mutex_lock(&g_nonce_lock);
+    for (int i = 0; i < MAX_NONCES; i++)
+        clear_nonce_slot_locked(i);
+    pthread_mutex_unlock(&g_nonce_lock);
+}
+
+static int issue_auth_nonce(uint8_t *nonce_out)
+{
+    int slot = -1;
+    time_t now;
+
+    if (!nonce_out)
+        return ONVAULT_ERR_INVALID;
+
+    now = time(NULL);
+    pthread_mutex_lock(&g_nonce_lock);
+    expire_nonces_locked(now);
+
+    for (int i = 0; i < MAX_NONCES; i++) {
+        if (!g_nonce_bucket[i].valid) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        time_t oldest = now;
+
+        slot = 0;
+        for (int i = 0; i < MAX_NONCES; i++) {
+            if (g_nonce_bucket[i].created <= oldest) {
+                oldest = g_nonce_bucket[i].created;
+                slot = i;
+            }
+        }
+    }
+
+    clear_nonce_slot_locked(slot);
+    if (onvault_random_bytes(g_nonce_bucket[slot].nonce, ONVAULT_HASH_SIZE) != ONVAULT_OK) {
+        pthread_mutex_unlock(&g_nonce_lock);
+        return ONVAULT_ERR_CRYPTO;
+    }
+    g_nonce_bucket[slot].created = now;
+    g_nonce_bucket[slot].valid = 1;
+    memcpy(nonce_out, g_nonce_bucket[slot].nonce, ONVAULT_HASH_SIZE);
+    pthread_mutex_unlock(&g_nonce_lock);
+    return ONVAULT_OK;
+}
+
+static int consume_nonce_for_proof(const uint8_t *proof, const onvault_key_t *verify_key)
+{
+    onvault_key_t loaded_key;
+    const onvault_key_t *key = verify_key;
+    time_t now;
+    int have_valid = 0;
+    int rc = ONVAULT_ERR_AUTH;
+
+    if (!proof)
+        return ONVAULT_ERR_INVALID;
+
+    if (!key) {
+        onvault_mlock(&loaded_key, sizeof(loaded_key));
+        rc = onvault_keystore_load_master_key(&loaded_key);
+        if (rc != ONVAULT_OK) {
+            onvault_key_wipe(&loaded_key, sizeof(loaded_key));
+            return rc;
+        }
+        key = &loaded_key;
+    }
+
+    now = time(NULL);
+    pthread_mutex_lock(&g_nonce_lock);
+    expire_nonces_locked(now);
+    for (int i = 0; i < MAX_NONCES; i++) {
+        if (!g_nonce_bucket[i].valid)
+            continue;
+        have_valid = 1;
+        rc = onvault_auth_verify_proof_with_key(proof,
+                                                g_nonce_bucket[i].nonce,
+                                                ONVAULT_HASH_SIZE,
+                                                key);
+        if (rc == ONVAULT_OK) {
+            clear_nonce_slot_locked(i);
+            pthread_mutex_unlock(&g_nonce_lock);
+            if (!verify_key)
+                onvault_key_wipe(&loaded_key, sizeof(loaded_key));
+            return ONVAULT_OK;
+        }
+    }
+    pthread_mutex_unlock(&g_nonce_lock);
+
+    if (!verify_key)
+        onvault_key_wipe(&loaded_key, sizeof(loaded_key));
+    return have_valid ? ONVAULT_ERR_AUTH : ONVAULT_ERR_NOT_FOUND;
+}
+
 static void signal_handler(int sig)
 {
     (void)sig;
@@ -486,10 +610,7 @@ static void cleanup(void)
     clear_loaded_keys();
     http_clear_token();
     http_reset_unlock_failures();
-    pthread_mutex_lock(&g_nonce_lock);
-    g_nonce_valid = 0;
-    onvault_memzero(g_auth_nonce, sizeof(g_auth_nonce));
-    pthread_mutex_unlock(&g_nonce_lock);
+    clear_nonce_bucket();
 
     /* Stop IPC */
     onvault_ipc_server_stop();
@@ -641,24 +762,13 @@ static void handle_client(int client_fd)
             resp.payload_len = (uint32_t)strlen(resp_buf);
             break;
         }
-        /* Consume the nonce (single-use) */
-        pthread_mutex_lock(&g_nonce_lock);
-        if (!g_nonce_valid) {
-            pthread_mutex_unlock(&g_nonce_lock);
+        int rm_auth = consume_nonce_for_proof((const uint8_t *)payload, &g_master_key);
+        if (rm_auth == ONVAULT_ERR_NOT_FOUND) {
             resp.status = IPC_RESP_AUTH_REQUIRED;
             snprintf(resp_buf, sizeof(resp_buf), "No challenge issued\n");
             resp.payload_len = (uint32_t)strlen(resp_buf);
             break;
         }
-        uint8_t rm_nonce[ONVAULT_HASH_SIZE];
-        memcpy(rm_nonce, g_auth_nonce, ONVAULT_HASH_SIZE);
-        g_nonce_valid = 0;
-        onvault_memzero(g_auth_nonce, ONVAULT_HASH_SIZE);
-        pthread_mutex_unlock(&g_nonce_lock);
-
-        int rm_auth = onvault_auth_verify_proof_with_key(
-            (const uint8_t *)payload, rm_nonce, ONVAULT_HASH_SIZE, &g_master_key);
-        onvault_memzero(rm_nonce, sizeof(rm_nonce));
         if (rm_auth != ONVAULT_OK) {
             resp.status = IPC_RESP_AUTH_REQUIRED;
             snprintf(resp_buf, sizeof(resp_buf), "Wrong passphrase\n");
@@ -724,13 +834,14 @@ static void handle_client(int client_fd)
     }
 
     case IPC_CMD_AUTH_CHALLENGE: {
-        /* Issue a fresh random nonce for challenge-response */
-        pthread_mutex_lock(&g_nonce_lock);
-        onvault_random_bytes(g_auth_nonce, ONVAULT_HASH_SIZE);
-        g_nonce_valid = 1;
-        memcpy(resp_buf, g_auth_nonce, ONVAULT_HASH_SIZE);
+        int nonce_rc = issue_auth_nonce((uint8_t *)resp_buf);
+        if (nonce_rc != ONVAULT_OK) {
+            resp.status = IPC_RESP_ERROR;
+            snprintf(resp_buf, sizeof(resp_buf), "Failed to generate challenge\n");
+            resp.payload_len = (uint32_t)strlen(resp_buf);
+            break;
+        }
         resp.payload_len = ONVAULT_HASH_SIZE;
-        pthread_mutex_unlock(&g_nonce_lock);
         break;
     }
 
@@ -743,29 +854,15 @@ static void handle_client(int client_fd)
             resp.payload_len = (uint32_t)strlen(resp_buf);
             break;
         }
-        /* Consume the nonce (single-use) */
-        pthread_mutex_lock(&g_nonce_lock);
-        if (!g_nonce_valid) {
-            pthread_mutex_unlock(&g_nonce_lock);
+        int lock_auth = consume_nonce_for_proof((const uint8_t *)payload,
+                                                g_master_key_loaded ? &g_master_key : NULL);
+        if (lock_auth == ONVAULT_ERR_NOT_FOUND) {
             resp.status = IPC_RESP_AUTH_REQUIRED;
             snprintf(resp_buf, sizeof(resp_buf),
                      "No challenge issued. Request IPC_CMD_AUTH_CHALLENGE first.\n");
             resp.payload_len = (uint32_t)strlen(resp_buf);
             break;
         }
-        uint8_t nonce_copy[ONVAULT_HASH_SIZE];
-        memcpy(nonce_copy, g_auth_nonce, ONVAULT_HASH_SIZE);
-        g_nonce_valid = 0; /* Invalidate — single use */
-        onvault_memzero(g_auth_nonce, ONVAULT_HASH_SIZE);
-        pthread_mutex_unlock(&g_nonce_lock);
-
-        int lock_auth = g_master_key_loaded
-            ? onvault_auth_verify_proof_with_key(
-                (const uint8_t *)payload, nonce_copy, ONVAULT_HASH_SIZE, &g_master_key)
-            : onvault_auth_verify_proof(
-                (const uint8_t *)payload, nonce_copy, ONVAULT_HASH_SIZE);
-        onvault_memzero(nonce_copy, sizeof(nonce_copy));
-
         if (lock_auth != ONVAULT_OK) {
             resp.status = IPC_RESP_AUTH_REQUIRED;
             snprintf(resp_buf, sizeof(resp_buf), "Wrong passphrase\n");
@@ -784,10 +881,31 @@ static void handle_client(int client_fd)
             resp.status = IPC_RESP_AUTH_REQUIRED;
             break;
         }
-        /* payload: "process_path\0vault_id" */
-        char *sep = memchr(payload, '\0', header.payload_len);
-        if (sep && sep < payload + header.payload_len - 1) {
-            char *process_path = payload;
+        if (header.payload_len <= ONVAULT_HASH_SIZE + 1) {
+            resp.status = IPC_RESP_AUTH_REQUIRED;
+            snprintf(resp_buf, sizeof(resp_buf), "Passphrase required\n");
+            resp.payload_len = (uint32_t)strlen(resp_buf);
+            break;
+        }
+        int allow_auth = consume_nonce_for_proof((const uint8_t *)payload, &g_master_key);
+        if (allow_auth == ONVAULT_ERR_NOT_FOUND) {
+            resp.status = IPC_RESP_AUTH_REQUIRED;
+            snprintf(resp_buf, sizeof(resp_buf), "No challenge issued\n");
+            resp.payload_len = (uint32_t)strlen(resp_buf);
+            break;
+        }
+        if (allow_auth != ONVAULT_OK) {
+            resp.status = IPC_RESP_AUTH_REQUIRED;
+            snprintf(resp_buf, sizeof(resp_buf), "Wrong passphrase\n");
+            resp.payload_len = (uint32_t)strlen(resp_buf);
+            break;
+        }
+        /* payload: proof(32) + process_path\0vault_id */
+        char *rule_payload = payload + ONVAULT_HASH_SIZE;
+        size_t rule_len = header.payload_len - ONVAULT_HASH_SIZE;
+        char *sep = memchr(rule_payload, '\0', rule_len);
+        if (sep && sep < rule_payload + rule_len - 1) {
+            char *process_path = rule_payload;
             char *vault_id = sep + 1;
             int rc = onvault_policy_add_rule(vault_id, process_path, RULE_ALLOW);
             if (rc == ONVAULT_OK)
@@ -808,10 +926,31 @@ static void handle_client(int client_fd)
             resp.status = IPC_RESP_AUTH_REQUIRED;
             break;
         }
-        /* payload: "process_path\0vault_id" */
-        char *sep = memchr(payload, '\0', header.payload_len);
-        if (sep && sep < payload + header.payload_len - 1) {
-            char *process_path = payload;
+        if (header.payload_len <= ONVAULT_HASH_SIZE + 1) {
+            resp.status = IPC_RESP_AUTH_REQUIRED;
+            snprintf(resp_buf, sizeof(resp_buf), "Passphrase required\n");
+            resp.payload_len = (uint32_t)strlen(resp_buf);
+            break;
+        }
+        int deny_auth = consume_nonce_for_proof((const uint8_t *)payload, &g_master_key);
+        if (deny_auth == ONVAULT_ERR_NOT_FOUND) {
+            resp.status = IPC_RESP_AUTH_REQUIRED;
+            snprintf(resp_buf, sizeof(resp_buf), "No challenge issued\n");
+            resp.payload_len = (uint32_t)strlen(resp_buf);
+            break;
+        }
+        if (deny_auth != ONVAULT_OK) {
+            resp.status = IPC_RESP_AUTH_REQUIRED;
+            snprintf(resp_buf, sizeof(resp_buf), "Wrong passphrase\n");
+            resp.payload_len = (uint32_t)strlen(resp_buf);
+            break;
+        }
+        /* payload: proof(32) + process_path\0vault_id */
+        char *rule_payload = payload + ONVAULT_HASH_SIZE;
+        size_t rule_len = header.payload_len - ONVAULT_HASH_SIZE;
+        char *sep = memchr(rule_payload, '\0', rule_len);
+        if (sep && sep < rule_payload + rule_len - 1) {
+            char *process_path = rule_payload;
             char *vault_id = sep + 1;
             int rc = onvault_policy_add_rule(vault_id, process_path, RULE_DENY);
             if (rc == ONVAULT_OK)

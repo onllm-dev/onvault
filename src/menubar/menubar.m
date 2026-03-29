@@ -725,13 +725,12 @@ static int g_menu_vault_count = 0;
 - (void)allowProcessForVault:(NSMenuItem *)sender {
     NSString *vaultId = sender.representedObject;
 
-    /* Auth required */
     NSString *passphrase = [self promptForPassphrase:@"Allow Process"];
     if (!passphrase) return;
-    int verify_rc = onvault_auth_verify_passphrase([passphrase UTF8String]);
-    if (verify_rc != ONVAULT_OK) {
+    uint8_t proof[ONVAULT_HASH_SIZE];
+    if (![self computeProofForPassphrase:passphrase proof:proof]) {
         NSAlert *err = [[NSAlert alloc] init];
-        err.messageText = @"Wrong passphrase";
+        err.messageText = @"Authentication Failed";
         err.alertStyle = NSAlertStyleWarning;
         [err addButtonWithTitle:@"OK"];
         [err runModal];
@@ -747,8 +746,10 @@ static int g_menu_vault_count = 0;
     const char *vid = [vaultId UTF8String];
     size_t plen = strlen(proc);
     size_t vlen = strlen(vid);
-    char payload[PATH_MAX + 64];
-    if (plen + 1 + vlen + 1 > sizeof(payload)) {
+    char payload[ONVAULT_HASH_SIZE + PATH_MAX + 64];
+    size_t payload_len = ONVAULT_HASH_SIZE + plen + 1 + vlen + 1;
+    if (payload_len > sizeof(payload)) {
+        onvault_memzero(proof, sizeof(proof));
         NSAlert *err = [[NSAlert alloc] init];
         err.messageText = @"Path too long";
         err.alertStyle = NSAlertStyleWarning;
@@ -756,13 +757,15 @@ static int g_menu_vault_count = 0;
         [err runModal];
         return;
     }
-    memcpy(payload, proc, plen + 1);
-    memcpy(payload + plen + 1, vid, vlen + 1);
+    memcpy(payload, proof, ONVAULT_HASH_SIZE);
+    memcpy(payload + ONVAULT_HASH_SIZE, proc, plen + 1);
+    memcpy(payload + ONVAULT_HASH_SIZE + plen + 1, vid, vlen + 1);
 
     char response[ONVAULT_IPC_MAX_MSG];
     uint32_t resp_len = sizeof(response) - 1;
-    int rc = onvault_ipc_send(IPC_CMD_ALLOW, payload, (uint32_t)(plen + 1 + vlen + 1),
+    int rc = onvault_ipc_send(IPC_CMD_ALLOW, payload, (uint32_t)payload_len,
                                response, &resp_len);
+    onvault_memzero(proof, sizeof(proof));
     response[resp_len] = '\0';
 
     NSAlert *alert = [[NSAlert alloc] init];
@@ -775,13 +778,12 @@ static int g_menu_vault_count = 0;
 - (void)denyProcessForVault:(NSMenuItem *)sender {
     NSString *vaultId = sender.representedObject;
 
-    /* Auth required */
     NSString *passphrase = [self promptForPassphrase:@"Deny Process"];
     if (!passphrase) return;
-    int verify_rc = onvault_auth_verify_passphrase([passphrase UTF8String]);
-    if (verify_rc != ONVAULT_OK) {
+    uint8_t proof[ONVAULT_HASH_SIZE];
+    if (![self computeProofForPassphrase:passphrase proof:proof]) {
         NSAlert *err = [[NSAlert alloc] init];
-        err.messageText = @"Wrong passphrase";
+        err.messageText = @"Authentication Failed";
         err.alertStyle = NSAlertStyleWarning;
         [err addButtonWithTitle:@"OK"];
         [err runModal];
@@ -797,8 +799,10 @@ static int g_menu_vault_count = 0;
     const char *vid = [vaultId UTF8String];
     size_t plen = strlen(proc);
     size_t vlen = strlen(vid);
-    char payload[PATH_MAX + 64];
-    if (plen + 1 + vlen + 1 > sizeof(payload)) {
+    char payload[ONVAULT_HASH_SIZE + PATH_MAX + 64];
+    size_t payload_len = ONVAULT_HASH_SIZE + plen + 1 + vlen + 1;
+    if (payload_len > sizeof(payload)) {
+        onvault_memzero(proof, sizeof(proof));
         NSAlert *err = [[NSAlert alloc] init];
         err.messageText = @"Path too long";
         err.alertStyle = NSAlertStyleWarning;
@@ -806,13 +810,15 @@ static int g_menu_vault_count = 0;
         [err runModal];
         return;
     }
-    memcpy(payload, proc, plen + 1);
-    memcpy(payload + plen + 1, vid, vlen + 1);
+    memcpy(payload, proof, ONVAULT_HASH_SIZE);
+    memcpy(payload + ONVAULT_HASH_SIZE, proc, plen + 1);
+    memcpy(payload + ONVAULT_HASH_SIZE + plen + 1, vid, vlen + 1);
 
     char response[ONVAULT_IPC_MAX_MSG];
     uint32_t resp_len = sizeof(response) - 1;
-    int rc = onvault_ipc_send(IPC_CMD_DENY, payload, (uint32_t)(plen + 1 + vlen + 1),
+    int rc = onvault_ipc_send(IPC_CMD_DENY, payload, (uint32_t)payload_len,
                                response, &resp_len);
+    onvault_memzero(proof, sizeof(proof));
     response[resp_len] = '\0';
 
     NSAlert *alert = [[NSAlert alloc] init];
@@ -906,19 +912,29 @@ static int g_menu_vault_count = 0;
     NSDictionary *info = sender.representedObject;
     NSString *processPath = info[@"process_path"];
     NSString *vaultId = info[@"vault_id"];
+    NSString *passphrase = [self promptForPassphrase:@"Allow Process"];
+    if (!passphrase) return;
+    uint8_t proof[ONVAULT_HASH_SIZE];
+    if (![self computeProofForPassphrase:passphrase proof:proof])
+        return;
 
     const char *proc = [processPath UTF8String];
     const char *vid = [vaultId UTF8String];
     size_t plen = strlen(proc);
     size_t vlen = strlen(vid);
-    char payload[PATH_MAX + 64];
-    if (plen + 1 + vlen + 1 > sizeof(payload))
+    char payload[ONVAULT_HASH_SIZE + PATH_MAX + 64];
+    size_t payload_len = ONVAULT_HASH_SIZE + plen + 1 + vlen + 1;
+    if (payload_len > sizeof(payload)) {
+        onvault_memzero(proof, sizeof(proof));
         return;
-    memcpy(payload, proc, plen + 1);
-    memcpy(payload + plen + 1, vid, vlen + 1);
+    }
+    memcpy(payload, proof, ONVAULT_HASH_SIZE);
+    memcpy(payload + ONVAULT_HASH_SIZE, proc, plen + 1);
+    memcpy(payload + ONVAULT_HASH_SIZE + plen + 1, vid, vlen + 1);
     onvault_ipc_send(IPC_CMD_ALLOW,
-                      payload, (uint32_t)(plen + 1 + vlen + 1),
+                      payload, (uint32_t)payload_len,
                       NULL, NULL);
+    onvault_memzero(proof, sizeof(proof));
 
     /* Remove this denial from the list */
     pthread_mutex_lock(&g_denial_lock);
@@ -952,20 +968,34 @@ didReceiveNotificationResponse:(UNNotificationResponse *)response
     } else if ([response.actionIdentifier isEqualToString:@"ALLOW_ALWAYS"]) {
         NSLog(@"onvault: allow always %@ for %@", processPath, vaultId);
         /* Allow Always: add persistent allow rule via IPC */
+        NSString *passphrase = [self promptForPassphrase:@"Allow Process"];
+        if (!passphrase) {
+            completionHandler();
+            return;
+        }
+        uint8_t proof[ONVAULT_HASH_SIZE];
+        if (![self computeProofForPassphrase:passphrase proof:proof]) {
+            completionHandler();
+            return;
+        }
         const char *proc = [processPath UTF8String];
         const char *vid = [vaultId UTF8String];
         size_t plen = strlen(proc);
         size_t vlen = strlen(vid);
-        char payload[PATH_MAX + 64];
-        if (plen + 1 + vlen + 1 > sizeof(payload)) {
+        char payload[ONVAULT_HASH_SIZE + PATH_MAX + 64];
+        size_t payload_len = ONVAULT_HASH_SIZE + plen + 1 + vlen + 1;
+        if (payload_len > sizeof(payload)) {
+            onvault_memzero(proof, sizeof(proof));
             completionHandler();
             return;
         }
-        memcpy(payload, proc, plen + 1);
-        memcpy(payload + plen + 1, vid, vlen + 1);
+        memcpy(payload, proof, ONVAULT_HASH_SIZE);
+        memcpy(payload + ONVAULT_HASH_SIZE, proc, plen + 1);
+        memcpy(payload + ONVAULT_HASH_SIZE + plen + 1, vid, vlen + 1);
         onvault_ipc_send(IPC_CMD_ALLOW,
-                          payload, (uint32_t)(plen + 1 + vlen + 1),
+                          payload, (uint32_t)payload_len,
                           NULL, NULL);
+        onvault_memzero(proof, sizeof(proof));
     }
 
     completionHandler();
