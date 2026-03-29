@@ -43,6 +43,8 @@
 /* Forward declarations */
 static void release_pid_lock(void);
 static void stop_http_server(void);
+static void http_clear_token(void);
+static void http_reset_unlock_failures(void);
 
 /* Recent denial tracking (shared between menubar, HTTP API, and deny callback) */
 #define MAX_RECENT_DENIALS 10
@@ -91,6 +93,10 @@ typedef struct {
 
 static mounted_vault_t g_mounted_vaults[MAX_MOUNTED_VAULTS];
 static pthread_mutex_t g_mount_lock = PTHREAD_MUTEX_INITIALIZER;
+static char g_http_token[65] = {0};
+static int g_unlock_failures = 0;
+static time_t g_unlock_lockout_until = 0;
+static pthread_mutex_t g_http_auth_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /*
  * Smart defaults: auto-populate allowlist when adding a vault.
@@ -477,6 +483,8 @@ static void cleanup(void)
     onvault_policy_clear();
 
     clear_loaded_keys();
+    http_clear_token();
+    http_reset_unlock_failures();
     pthread_mutex_lock(&g_nonce_lock);
     g_nonce_valid = 0;
     onvault_memzero(g_auth_nonce, sizeof(g_auth_nonce));
@@ -1011,6 +1019,202 @@ static void release_pid_lock(void)
         unlink(g_pid_path);
 }
 
+static const char *http_status_text(int status_code)
+{
+    switch (status_code) {
+    case 200: return "OK";
+    case 401: return "Unauthorized";
+    case 404: return "Not Found";
+    case 429: return "Too Many Requests";
+    default: return "Error";
+    }
+}
+
+static int json_escape(char *out, size_t out_len, const char *in)
+{
+    size_t j = 0;
+
+    if (!out || out_len == 0)
+        return 0;
+    if (!in) {
+        out[0] = '\0';
+        return 0;
+    }
+
+    for (size_t i = 0; in[i] != '\0' && j < out_len - 1; i++) {
+        const unsigned char ch = (unsigned char)in[i];
+
+        if (ch == '"' || ch == '\\') {
+            if (j + 2 >= out_len)
+                break;
+            out[j++] = '\\';
+            out[j++] = (char)ch;
+            continue;
+        }
+        if (ch == '\n' || ch == '\r' || ch == '\t') {
+            if (j + 2 >= out_len)
+                break;
+            out[j++] = '\\';
+            out[j++] = (ch == '\n') ? 'n' : (ch == '\r' ? 'r' : 't');
+            continue;
+        }
+        if (ch < 0x20) {
+            if (j + 6 >= out_len)
+                break;
+            j += (size_t)snprintf(out + j, out_len - j, "\\u%04x", ch);
+            continue;
+        }
+
+        out[j++] = (char)ch;
+    }
+
+    out[j] = '\0';
+    return (int)j;
+}
+
+static void http_copy_token(char out[65])
+{
+    pthread_mutex_lock(&g_http_auth_lock);
+    memcpy(out, g_http_token, 65);
+    pthread_mutex_unlock(&g_http_auth_lock);
+}
+
+static void http_clear_token(void)
+{
+    pthread_mutex_lock(&g_http_auth_lock);
+    onvault_memzero(g_http_token, sizeof(g_http_token));
+    pthread_mutex_unlock(&g_http_auth_lock);
+}
+
+static int http_generate_token(void)
+{
+    uint8_t raw[32];
+    static const char hex[] = "0123456789abcdef";
+
+    if (onvault_random_bytes(raw, sizeof(raw)) != ONVAULT_OK)
+        return ONVAULT_ERR_CRYPTO;
+
+    pthread_mutex_lock(&g_http_auth_lock);
+    for (size_t i = 0; i < sizeof(raw); i++) {
+        g_http_token[i * 2] = hex[(raw[i] >> 4) & 0x0f];
+        g_http_token[i * 2 + 1] = hex[raw[i] & 0x0f];
+    }
+    g_http_token[64] = '\0';
+    pthread_mutex_unlock(&g_http_auth_lock);
+
+    onvault_memzero(raw, sizeof(raw));
+    return ONVAULT_OK;
+}
+
+static int http_parse_query_token(const char *request_path, char *token, size_t token_len)
+{
+    const char *query;
+    const char *start;
+    size_t len = 0;
+
+    if (!request_path || !token || token_len == 0)
+        return 0;
+
+    query = strchr(request_path, '?');
+    if (!query)
+        return 0;
+
+    start = strstr(query + 1, "token=");
+    if (!start)
+        return 0;
+    start += 6;
+
+    while (start[len] != '\0' && start[len] != '&' && start[len] != ' ' &&
+           start[len] != '\r' && start[len] != '\n' && len < token_len - 1) {
+        len++;
+    }
+    if (len == 0)
+        return 0;
+
+    memcpy(token, start, len);
+    token[len] = '\0';
+    return 1;
+}
+
+static int http_parse_bearer_token(const char *request, char *token, size_t token_len)
+{
+    const char *header;
+    size_t len = 0;
+
+    if (!request || !token || token_len == 0)
+        return 0;
+
+    header = strstr(request, "Authorization: Bearer ");
+    if (!header)
+        return 0;
+    header += strlen("Authorization: Bearer ");
+
+    while (header[len] != '\0' && header[len] != '\r' && header[len] != '\n' &&
+           len < token_len - 1) {
+        len++;
+    }
+    if (len == 0)
+        return 0;
+
+    memcpy(token, header, len);
+    token[len] = '\0';
+    return 1;
+}
+
+static int http_check_auth(const char *request, const char *request_path)
+{
+    char presented[65];
+    char expected[65];
+    int ok = 0;
+
+    if (!request || !request_path)
+        return 0;
+    if (!http_parse_bearer_token(request, presented, sizeof(presented)) &&
+        !http_parse_query_token(request_path, presented, sizeof(presented))) {
+        return 0;
+    }
+
+    http_copy_token(expected);
+    if (expected[0] == '\0')
+        return 0;
+    if (strlen(presented) != 64 || strlen(expected) != 64)
+        return 0;
+
+    ok = onvault_constant_time_eq((const uint8_t *)presented,
+                                  (const uint8_t *)expected,
+                                  64);
+    return ok;
+}
+
+static int http_unlock_locked_out(time_t now)
+{
+    int locked = 0;
+
+    pthread_mutex_lock(&g_http_auth_lock);
+    locked = (g_unlock_lockout_until > now) ? 1 : 0;
+    pthread_mutex_unlock(&g_http_auth_lock);
+    return locked;
+}
+
+static void http_record_unlock_failure(time_t now)
+{
+    pthread_mutex_lock(&g_http_auth_lock);
+    g_unlock_failures++;
+    if (g_unlock_failures >= 10)
+        g_unlock_lockout_until = now + 300;
+    else if (g_unlock_failures >= 5)
+        g_unlock_lockout_until = now + 30;
+    pthread_mutex_unlock(&g_http_auth_lock);
+}
+
+static void http_reset_unlock_failures(void)
+{
+    pthread_mutex_lock(&g_http_auth_lock);
+    g_unlock_failures = 0;
+    g_unlock_lockout_until = 0;
+    pthread_mutex_unlock(&g_http_auth_lock);
+}
+
 /* Simple localhost-only HTTP server for menubar web UI */
 static int g_http_port = 0;
 static int g_http_sock = -1;
@@ -1086,10 +1290,12 @@ static void http_respond(int fd, int status_code, const char *content_type,
         "HTTP/1.1 %d %s\r\n"
         "Content-Type: %s\r\n"
         "Content-Length: %zu\r\n"
-        "Access-Control-Allow-Origin: *\r\n"
+        "Access-Control-Allow-Origin: http://127.0.0.1\r\n"
+        "Access-Control-Allow-Headers: Authorization, Content-Type\r\n"
+        "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
         "Connection: close\r\n"
         "\r\n",
-        status_code, status_code == 200 ? "OK" : "Error",
+        status_code, http_status_text(status_code),
         content_type, body_len);
     write(fd, header, (size_t)hlen);
     if (body_len > 0)
@@ -1099,12 +1305,28 @@ static void http_respond(int fd, int status_code, const char *content_type,
 static void handle_http_client(int client_fd)
 {
     char request[4096] = {0};
+    char unauthorized[] = "{\"ok\":false,\"msg\":\"Unauthorized\"}";
     ssize_t n = read(client_fd, request, sizeof(request) - 1);
     if (n <= 0) { close(client_fd); return; }
 
     /* Parse first line: GET /path HTTP/1.1 */
-    char method[16] = {0}, path[256] = {0};
-    sscanf(request, "%15s %255s", method, path);
+    char method[16] = {0}, request_path[256] = {0}, path[256] = {0};
+    sscanf(request, "%15s %255s", method, request_path);
+    strlcpy(path, request_path, sizeof(path));
+    char *query = strchr(path, '?');
+    if (query)
+        *query = '\0';
+
+    if (strcmp(method, "OPTIONS") != 0 &&
+        strcmp(path, "/") != 0 &&
+        strcmp(path, "/menubar") != 0 &&
+        strcmp(path, "/api/unlock") != 0 &&
+        !http_check_auth(request, request_path)) {
+        http_respond(client_fd, 401, "application/json",
+                     unauthorized, strlen(unauthorized));
+        close(client_fd);
+        return;
+    }
 
     if (strcmp(path, "/") == 0 || strcmp(path, "/menubar") == 0) {
         const char *html = get_menubar_html();
@@ -1120,12 +1342,15 @@ static void handle_http_client(int client_fd)
             g_master_key_loaded ? "false" : "true", count);
         for (int i = 0; i < count; i++) {
             char mount_dir[PATH_MAX], source[PATH_MAX];
+            char escaped_id[128], escaped_source[PATH_MAX * 2];
             onvault_vault_get_paths(ids[i], NULL, mount_dir, source);
             int mounted = onvault_fuse_is_mounted(mount_dir);
+            json_escape(escaped_id, sizeof(escaped_id), ids[i]);
+            json_escape(escaped_source, sizeof(escaped_source), source);
             if (i > 0) off += snprintf(json + off, sizeof(json) - (size_t)off, ",");
             off += snprintf(json + off, sizeof(json) - (size_t)off,
                 "{\"id\":\"%s\",\"source\":\"%s\",\"mounted\":%s}",
-                ids[i], source, mounted ? "true" : "false");
+                escaped_id, escaped_source, mounted ? "true" : "false");
         }
         off += snprintf(json + off, sizeof(json) - (size_t)off, "]}");
         http_respond(client_fd, 200, "application/json", json, (size_t)off);
@@ -1144,19 +1369,25 @@ static void handle_http_client(int client_fd)
         pthread_mutex_lock(&g_denial_lock);
         for (int i = 0; i < g_denial_count; i++) {
             recent_denial_t *d = &g_recent_denials[i];
+            char escaped_process[512], escaped_path[PATH_MAX * 2];
+            char escaped_file[PATH_MAX * 2], escaped_vault[128];
             if (i > 0) off += snprintf(json + off, sizeof(json) - (size_t)off, ",");
+            json_escape(escaped_process, sizeof(escaped_process), d->process_name);
+            json_escape(escaped_path, sizeof(escaped_path), d->process_path);
+            json_escape(escaped_file, sizeof(escaped_file), d->file_path);
+            json_escape(escaped_vault, sizeof(escaped_vault), d->vault_id);
             off += snprintf(json + off, sizeof(json) - (size_t)off,
                 "{\"process\":\"%s\",\"path\":\"%s\",\"file\":\"%s\","
                 "\"vault\":\"%s\",\"time\":%ld}",
-                d->process_name, d->process_path, d->file_path,
-                d->vault_id, (long)d->timestamp);
+                escaped_process, escaped_path, escaped_file,
+                escaped_vault, (long)d->timestamp);
         }
         pthread_mutex_unlock(&g_denial_lock);
         off += snprintf(json + off, sizeof(json) - (size_t)off, "]");
         http_respond(client_fd, 200, "application/json", json, (size_t)off);
     } else if (strncmp(path, "/api/rules", 10) == 0 && strcmp(method, "GET") == 0) {
         /* /api/rules?vault=ssh */
-        char *qp = strchr(path, '?');
+        char *qp = strchr(request_path, '?');
         char vid[64] = {0};
         if (qp) {
             char *vp = strstr(qp, "vault=");
@@ -1203,8 +1434,11 @@ static void handle_http_client(int client_fd)
                 struct stat add_st;
                 if (stat(add_path, &add_st) != 0) {
                     if (mkdir(add_path, 0700) != 0) {
+                        char escaped_path[PATH_MAX * 2];
+                        json_escape(escaped_path, sizeof(escaped_path), add_path);
                         snprintf(resp_json, sizeof(resp_json),
-                                 "{\"ok\":false,\"msg\":\"Cannot create directory: %s\"}", add_path);
+                                 "{\"ok\":false,\"msg\":\"Cannot create directory: %s\"}",
+                                 escaped_path);
                         http_respond(client_fd, 200, "application/json",
                                      resp_json, strlen(resp_json));
                         close(client_fd);
@@ -1217,26 +1451,30 @@ static void handle_http_client(int client_fd)
                     char vid[64];
                     char vault_dir[PATH_MAX];
                     char mount_dir[PATH_MAX];
+                    char escaped_path[PATH_MAX * 2];
                     onvault_vault_id_from_path(add_path, vid, sizeof(vid));
                     apply_smart_defaults(vid);
                     onvault_vault_get_paths(vid, vault_dir, mount_dir, NULL);
                     rc = mount_vault_async(vid, vault_dir, mount_dir);
+                    json_escape(escaped_path, sizeof(escaped_path), add_path);
                     if (rc == ONVAULT_OK) {
                         snprintf(resp_json, sizeof(resp_json),
-                                 "{\"ok\":true,\"msg\":\"Vault added: %s\"}", add_path);
+                                 "{\"ok\":true,\"msg\":\"Vault added: %s\"}", escaped_path);
                     } else {
                         snprintf(resp_json, sizeof(resp_json),
                                  "{\"ok\":false,\"msg\":\"Vault added but mount failed: %s\"}",
-                                 add_path);
+                                 escaped_path);
                     }
                 } else {
                     const char *err_msg = "Unknown error";
+                    char escaped_path[PATH_MAX * 2];
                     if (rc == ONVAULT_ERR_NOT_FOUND) err_msg = "Path not found";
                     else if (rc == ONVAULT_ERR_ALREADY_EXISTS) err_msg = "Vault already exists";
                     else if (rc == ONVAULT_ERR_INVALID) err_msg = "Invalid path";
                     else if (rc == ONVAULT_ERR_IO) err_msg = "I/O error";
+                    json_escape(escaped_path, sizeof(escaped_path), add_path);
                     snprintf(resp_json, sizeof(resp_json),
-                             "{\"ok\":false,\"msg\":\"%s: %s\"}", err_msg, add_path);
+                             "{\"ok\":false,\"msg\":\"%s: %s\"}", err_msg, escaped_path);
                 }
             }
             http_respond(client_fd, 200, "application/json",
@@ -1262,9 +1500,12 @@ static void handle_http_client(int client_fd)
                 int rc = onvault_policy_add_rule(vid, proc,
                     is_allow ? RULE_ALLOW : RULE_DENY);
                 if (rc == ONVAULT_OK) {
+                    char escaped_proc[PATH_MAX * 2], escaped_vid[128];
+                    json_escape(escaped_proc, sizeof(escaped_proc), proc);
+                    json_escape(escaped_vid, sizeof(escaped_vid), vid);
                     snprintf(resp_json, sizeof(resp_json),
                              "{\"ok\":true,\"msg\":\"%s %s for %s\"}",
-                             is_allow ? "Allowed" : "Denied", proc, vid);
+                             is_allow ? "Allowed" : "Denied", escaped_proc, escaped_vid);
                 } else {
                     snprintf(resp_json, sizeof(resp_json),
                              "{\"ok\":false,\"msg\":\"Failed (err=%d)\"}", rc);
@@ -1279,14 +1520,37 @@ static void handle_http_client(int client_fd)
         } else if (strcmp(path, "/api/unlock") == 0) {
             /* Body: passphrase */
             if (g_master_key_loaded) {
+                char token[65], escaped_token[128];
+                if (http_generate_token() != ONVAULT_OK) {
+                    snprintf(resp_json, sizeof(resp_json),
+                             "{\"ok\":false,\"msg\":\"Failed to create session token\"}");
+                    http_respond(client_fd, 200, "application/json",
+                                 resp_json, strlen(resp_json));
+                    close(client_fd);
+                    return;
+                }
+                http_copy_token(token);
+                http_reset_unlock_failures();
+                json_escape(escaped_token, sizeof(escaped_token), token);
                 snprintf(resp_json, sizeof(resp_json),
-                         "{\"ok\":true,\"msg\":\"Already unlocked\"}");
+                         "{\"ok\":true,\"msg\":\"Already unlocked\",\"token\":\"%s\"}",
+                         escaped_token);
             } else {
                 char pass[256];
+                time_t now = time(NULL);
                 strlcpy(pass, body, sizeof(pass));
                 size_t pl = strlen(pass);
                 while (pl > 0 && (pass[pl-1] == '\n' || pass[pl-1] == '\r'))
                     pass[--pl] = '\0';
+
+                if (http_unlock_locked_out(now)) {
+                    snprintf(resp_json, sizeof(resp_json),
+                             "{\"ok\":false,\"msg\":\"Too many attempts. Try again later.\"}");
+                    http_respond(client_fd, 429, "application/json",
+                                 resp_json, strlen(resp_json));
+                    close(client_fd);
+                    return;
+                }
 
                 onvault_key_t mk;
                 memset(&mk, 0, sizeof(mk));
@@ -1294,17 +1558,28 @@ static void handle_http_client(int client_fd)
                 onvault_memzero(pass, sizeof(pass));
 
                 if (urc == ONVAULT_OK) {
+                    char token[65], escaped_token[128];
                     int frc = finish_unlock(&mk);
                     onvault_key_wipe(&mk, sizeof(mk));
                     if (frc == ONVAULT_OK) {
-                        snprintf(resp_json, sizeof(resp_json),
-                                 "{\"ok\":true,\"msg\":\"Unlocked\"}");
+                        if (http_generate_token() == ONVAULT_OK) {
+                            http_copy_token(token);
+                            http_reset_unlock_failures();
+                            json_escape(escaped_token, sizeof(escaped_token), token);
+                            snprintf(resp_json, sizeof(resp_json),
+                                     "{\"ok\":true,\"msg\":\"Unlocked\",\"token\":\"%s\"}",
+                                     escaped_token);
+                        } else {
+                            snprintf(resp_json, sizeof(resp_json),
+                                     "{\"ok\":false,\"msg\":\"Failed to create session token\"}");
+                        }
                     } else {
                         snprintf(resp_json, sizeof(resp_json),
                                  "{\"ok\":false,\"msg\":\"Unlock failed (err=%d)\"}", frc);
                     }
                 } else {
                     onvault_key_wipe(&mk, sizeof(mk));
+                    http_record_unlock_failure(now);
                     snprintf(resp_json, sizeof(resp_json),
                              "{\"ok\":false,\"msg\":\"Wrong passphrase\"}");
                 }
@@ -1324,6 +1599,7 @@ static void handle_http_client(int client_fd)
             onvault_memzero(pass, sizeof(pass));
 
             if (vrc == ONVAULT_OK) {
+                http_clear_token();
                 g_running = 0;
                 snprintf(resp_json, sizeof(resp_json),
                          "{\"ok\":true,\"msg\":\"Locked. Daemon stopping.\"}");
@@ -1514,58 +1790,443 @@ int main(int argc, char *argv[])
 static const char *get_menubar_html(void)
 {
     return
-    "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"UTF-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n<title>onvault</title>\n<style>\n:root {\n    color-scheme: dark;\n    --bg: #0d0d0d;\n    --card: rgba(26, 26, 26, 0.96);\n    --card-hover: rgba(34, 34, 34, 0.98);\n    --border: rgba(255, 255, 255, 0.08);\n    --text: #ffffff;\n"
-    "    --text-soft: rgba(255, 255, 255, 0.72);\n    --text-muted: rgba(255, 255, 255, 0.42);\n    --green: #22c55e;\n    --green-dim: rgba(34, 197, 94, 0.15);\n    --red: #ef4444;\n    --red-dim: rgba(239, 68, 68, 0.15);\n    --orange: #f59e0b;\n    --orange-dim: rgba(245, 158, 11, 0.15);\n    --blue: #3b82f6;\n    --blue-dim: rgba(59, 130, 246, 0.12);\n    --radius: 10px;\n    --radius-sm: 6px;\n}\n"
-    "* { margin: 0; padding: 0; box-sizing: border-box; }\nbody {\n    font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui, sans-serif;\n    background: var(--bg); color: var(--text);\n    width: 300px; font-size: 12px;\n    -webkit-font-smoothing: antialiased;\n    overflow: hidden;\n}\n.header {\n    display: flex; align-items: center; justify-content: space-between;\n"
-    "    padding: 14px 16px 10px; border-bottom: 1px solid var(--border);\n}\n.header .logo { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 13px; }\n.header .logo svg { width: 18px; height: 18px; }\n.badge { font-size: 10px; padding: 3px 8px; border-radius: 20px; font-weight: 500; }\n.badge.locked { background: var(--red-dim); color: var(--red); }\n"
-    ".badge.unlocked { background: var(--green-dim); color: var(--green); }\n.section { padding: 8px 12px 4px; }\n.section-title { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); padding: 4px 4px 6px; }\n"
-    ".vault-card { background: var(--card); border-radius: var(--radius); padding: 10px 12px; margin-bottom: 6px; border: 1px solid var(--border); cursor: pointer; transition: background 0.15s; }\n.vault-card:hover { background: var(--card-hover); }\n.vault-row { display: flex; align-items: center; justify-content: space-between; }\n"
-    ".vault-name { font-weight: 600; font-size: 12px; display: flex; align-items: center; gap: 6px; }\n.vault-name .icon { font-size: 14px; }\n.vault-source { font-size: 10px; color: var(--text-muted); margin-top: 2px; font-family: 'SF Mono', Menlo, monospace; }\n.vault-status { font-size: 10px; padding: 2px 6px; border-radius: 4px; font-weight: 500; }\n"
-    ".vault-status.mounted { background: var(--green-dim); color: var(--green); }\n.vault-status.locked { background: var(--red-dim); color: var(--red); }\n.vault-detail { display: none; }\n.vault-card.expanded .vault-detail { display: block; padding-top: 8px; margin-top: 8px; border-top: 1px solid var(--border); }\n.vault-actions { display: flex; gap: 4px; flex-wrap: wrap; }\n"
-    ".vault-actions button { font-size: 10px; padding: 4px 10px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: transparent; color: var(--text-soft); cursor: pointer; transition: all 0.15s; font-family: inherit; }\n.vault-actions button:hover { background: var(--blue-dim); color: var(--blue); border-color: rgba(59, 130, 246, 0.3); }\n"
-    ".vault-actions button.danger:hover { background: var(--red-dim); color: var(--red); border-color: rgba(239, 68, 68, 0.3); }\n.denial-card { background: var(--card); border-radius: var(--radius-sm); padding: 8px 10px; margin-bottom: 4px; border: 1px solid var(--border); font-size: 11px; display: flex; align-items: center; justify-content: space-between; }\n.denial-info { flex: 1; }\n"
-    ".denial-proc { font-weight: 600; color: var(--orange); }\n.denial-file { font-size: 10px; color: var(--text-muted); font-family: 'SF Mono', Menlo, monospace; }\n.denial-time { font-size: 9px; color: var(--text-muted); white-space: nowrap; margin-left: 8px; }\n"
-    ".denial-allow { font-size: 9px; padding: 2px 6px; border-radius: 4px; border: 1px solid rgba(34, 197, 94, 0.3); background: var(--green-dim); color: var(--green); cursor: pointer; margin-left: 6px; font-family: inherit; }\n.action-bar { display: flex; gap: 6px; padding: 8px 12px; border-top: 1px solid var(--border); }\n"
-    ".action-bar button { flex: 1; padding: 8px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: var(--card); color: var(--text-soft); cursor: pointer; font-size: 11px; font-weight: 500; transition: all 0.15s; font-family: inherit; }\n.action-bar button:hover { background: var(--card-hover); color: var(--text); }\n"
-    ".action-bar button.primary { background: var(--blue-dim); color: var(--blue); border-color: rgba(59, 130, 246, 0.25); }\n.action-bar button.primary:hover { background: rgba(59, 130, 246, 0.2); border-color: rgba(59, 130, 246, 0.4); }\n"
-    ".footer { display: flex; align-items: center; justify-content: space-between; padding: 8px 16px; border-top: 1px solid var(--border); font-size: 10px; color: var(--text-muted); }\n@keyframes spin { to { transform: rotate(360deg); } }\n.spinning { animation: spin 1s linear infinite; display: inline-block; }\n.empty-state { text-align: center; padding: 20px 16px; }\n"
-    ".empty-state .icon { font-size: 28px; margin-bottom: 8px; }\n.empty-state p { color: var(--text-muted); margin-bottom: 4px; font-size: 11px; }\n/* Toast notification (replaces browser alerts) */\n"
-    ".toast { position: fixed; bottom: 40px; left: 50%; transform: translateX(-50%); background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px 16px; font-size: 11px; color: var(--green); opacity: 0; transition: opacity 0.3s; pointer-events: none; z-index: 100; white-space: nowrap; }\n.toast.show { opacity: 1; }\n.toast.error { color: var(--red); }\n"
-    "/* Input row for inline allow/deny */\n.input-row { display: flex; gap: 4px; margin-top: 6px; }\n.input-row input { flex: 1; padding: 4px 8px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: rgba(0,0,0,0.3); color: var(--text); font-size: 10px; font-family: 'SF Mono', Menlo, monospace; outline: none; }\n"
-    ".input-row input:focus { border-color: rgba(59, 130, 246, 0.5); }\n.input-row button { padding: 4px 8px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: var(--green-dim); color: var(--green); font-size: 10px; cursor: pointer; font-family: inherit; }\n/* Overlay panel */\n"
-    ".panel-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.6); z-index: 200; }\n.panel-overlay.show { display: flex; align-items: center; justify-content: center; }\n.panel { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); width: 280px; max-height: 350px; overflow: hidden; }\n"
-    ".panel-header { display: flex; justify-content: space-between; align-items: center; padding: 10px 12px; border-bottom: 1px solid var(--border); font-weight: 600; font-size: 12px; }\n.panel-body { padding: 10px 12px; font-size: 10px; color: var(--text-soft); white-space: pre-wrap; font-family: 'SF Mono', Menlo, monospace; overflow-y: auto; max-height: 280px; margin: 0; }\n</style>\n</head>\n"
-    "<body>\n\n<div class=\"header\">\n    <div class=\"logo\">\n        <svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\">\n            <rect x=\"3\" y=\"11\" width=\"18\" height=\"11\" rx=\"2\" ry=\"2\"/>\n            <path d=\"M7 11V7a5 5 0 0 1 10 0v4\"/>\n        </svg>\n        onvault\n    </div>\n"
-    "    <span class=\"badge locked\" id=\"statusBadge\">Locked</span>\n</div>\n\n<div id=\"vaultSection\" class=\"section\">\n    <div class=\"section-title\">Vaults</div>\n    <div id=\"vaultList\"></div>\n</div>\n\n<div id=\"denialSection\" class=\"section\" style=\"display:none\">\n    <div class=\"section-title\">Recent Denials</div>\n    <div id=\"denialList\"></div>\n</div>\n\n"
-    "<div id=\"addVaultPanel\" style=\"display:none; padding: 8px 12px;\">\n    <div class=\"section-title\">Add Vault</div>\n    <div class=\"input-row\">\n        <input placeholder=\"~/.ssh or /path/to/dir\" id=\"addVaultInput\">\n        <button onclick=\"doAddVault()\">Protect</button>\n    </div>\n</div>\n\n<div class=\"action-bar\">\n"
-    "    <button class=\"primary\" onclick=\"promptAddVault()\">+ Add Vault</button>\n    <button onclick=\"viewPolicies()\">Policies</button>\n    <button id=\"lockBtn\" onclick=\"doLockUnlock()\">Lock</button>\n    <button onclick=\"refresh()\" id=\"refreshBtn\">Refresh</button>\n</div>\n\n<div class=\"footer\">\n    <span>onvault 0.1.0</span>\n    <span id=\"lastUpdate\"></span>\n</div>\n\n"
-    "<div class=\"toast\" id=\"toast\"></div>\n\n<div class=\"panel-overlay\" id=\"panelOverlay\" onclick=\"hidePanel()\">\n    <div class=\"panel\" onclick=\"event.stopPropagation()\">\n        <div class=\"panel-header\">\n            <span id=\"panelTitle\"></span>\n"
-    "            <button onclick=\"hidePanel()\" style=\"background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:14px\">✕</button>\n        </div>\n        <pre class=\"panel-body\" id=\"panelBody\"></pre>\n        <div id=\"panelAuth\" style=\"display:none;padding:10px 12px;border-top:1px solid var(--border)\">\n            <div class=\"input-row\">\n"
-    "                <input type=\"password\" placeholder=\"Passphrase\" id=\"panelPassInput\">\n                <button id=\"panelAuthBtn\" onclick=\"panelAuthSubmit()\">Confirm</button>\n            </div>\n        </div>\n    </div>\n</div>\n\n<script>\nvar API = window.location.origin;\nvar data = { locked: true, vault_count: 0, vaults: [] };\nvar denials = [];\nvar expandedVaults = {};\n"
-    "var pendingAuthAction = null;\n\nfunction toast(msg, isError) {\n    var t = document.getElementById('toast');\n    t.textContent = msg;\n    t.className = 'toast show' + (isError ? ' error' : '');\n    setTimeout(function() { t.className = 'toast'; }, 2500);\n}\n\nfunction postAPI(path, body) {\n    return fetch(API + path, { method: 'POST', body: body }).then(function(r) { return r.json(); });\n"
-    "}\n\nfunction fetchData() {\n    return Promise.all([\n        fetch(API + '/api/status').then(function(r) { return r.json(); }),\n        fetch(API + '/api/denials').then(function(r) { return r.json(); })\n    ]).then(function(results) {\n        data = results[0];\n        denials = results[1];\n        render();\n    }).catch(function() {\n"
-    "        data = { locked: true, vault_count: 0, vaults: [] };\n        denials = [];\n        render();\n    });\n}\n\nfunction timeAgo(ts) {\n    var s = Math.floor(Date.now() / 1000) - ts;\n    if (s < 60) return s + 's';\n    if (s < 3600) return Math.floor(s / 60) + 'm';\n    return Math.floor(s / 3600) + 'h';\n}\n\nfunction render() {\n    var badge = document.getElementById('statusBadge');\n"
-    "    badge.className = 'badge ' + (data.locked ? 'locked' : 'unlocked');\n    badge.textContent = data.locked ? 'Locked' : data.vault_count + ' vault(s)';\n\n    var vl = document.getElementById('vaultList');\n    if (data.vaults.length === 0) {\n        vl.innerHTML = '<div class=\"empty-state\"><div class=\"icon\">' + (data.locked ? '🔒' : '🛡️') + '</div>' +\n"
-    "            '<p>' + (data.locked ? 'Locked — click Unlock below.' : 'No vaults yet. Click + Add Vault.') + '</p></div>';\n    } else {\n        vl.innerHTML = data.vaults.map(function(v) {\n            var exp = expandedVaults[v.id] ? ' expanded' : '';\n            return '<div class=\"vault-card' + exp + '\" onclick=\"toggle(\\'' + v.id + '\\')\">' +\n"
-    "                '<div class=\"vault-row\"><div class=\"vault-name\"><span class=\"icon\">' +\n                (v.mounted ? '🔓' : '🔒') + '</span>' + v.id + '</div>' +\n                '<span class=\"vault-status ' + (v.mounted ? 'mounted' : 'locked') + '\">' +\n                (v.mounted ? 'Active' : 'Locked') + '</span></div>' +\n"
-    "                '<div class=\"vault-source\">' + v.source + '</div>' +\n                '<div class=\"vault-detail\">' +\n                '<div class=\"vault-actions\">' +\n                '<button onclick=\"event.stopPropagation();viewRules(\\'' + v.id + '\\')\">Rules</button>' +\n"
-    "                '<button onclick=\"event.stopPropagation();showInput(\\'allow\\',\\'' + v.id + '\\')\">Allow</button>' +\n                '<button onclick=\"event.stopPropagation();showInput(\\'deny\\',\\'' + v.id + '\\')\">Deny</button>' +\n                '<button class=\"danger\" onclick=\"event.stopPropagation();toast(\\'Use CLI: onvault vault remove ' + v.id + '\\')\">Remove</button>' +\n"
-    "                '</div>' +\n                '<div class=\"input-row\" id=\"allow-' + v.id + '\" style=\"display:none\">' +\n                '<input placeholder=\"/usr/bin/process\" id=\"allow-input-' + v.id + '\">' +\n                '<button onclick=\"event.stopPropagation();doRule(\\'allow\\',\\'' + v.id + '\\')\">Allow</button>' +\n                '</div>' +\n"
-    "                '<div class=\"input-row\" id=\"deny-' + v.id + '\" style=\"display:none\">' +\n                '<input placeholder=\"/usr/bin/process\" id=\"deny-input-' + v.id + '\">' +\n                '<button onclick=\"event.stopPropagation();doRule(\\'deny\\',\\'' + v.id + '\\')\">Deny</button>' +\n                '</div></div>';\n        }).join('');\n    }\n\n"
-    "    var ds = document.getElementById('denialSection');\n    var dl = document.getElementById('denialList');\n    if (denials.length > 0) {\n        ds.style.display = 'block';\n        dl.innerHTML = denials.slice(-5).reverse().map(function(d) {\n            return '<div class=\"denial-card\"><div class=\"denial-info\">' +\n"
-    "                '<span class=\"denial-proc\">' + d.process + '</span> \\u2192 ' + d.vault +\n                '<div class=\"denial-file\">' + d.file + '</div></div>' +\n                '<span class=\"denial-time\">' + timeAgo(d.time) + '</span>' +\n                '<button class=\"denial-allow\" onclick=\"quickAllow(\\'' + d.path + '\\',\\'' + d.vault + '\\')\">Allow</button></div>';\n"
-    "        }).join('');\n    } else { ds.style.display = 'none'; }\n\n    var lockBtn = document.getElementById('lockBtn');\n    if (lockBtn) lockBtn.textContent = data.locked ? 'Unlock' : 'Lock';\n\n    document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});\n    notifyResize();\n}\n\nfunction toggle(id) {\n"
-    "    expandedVaults[id] = !expandedVaults[id];\n    render();\n}\n\nfunction showInput(type, id) {\n    var el = document.getElementById(type + '-' + id);\n    var other = type === 'allow' ? 'deny' : 'allow';\n    el.style.display = el.style.display === 'none' ? 'flex' : 'none';\n    document.getElementById(other + '-' + id).style.display = 'none';\n}\n\nfunction doRule(type, id) {\n"
-    "    var input = document.getElementById(type + '-input-' + id);\n    var proc = input.value.trim();\n    if (!proc) return;\n    input.value = '';\n    document.getElementById(type + '-' + id).style.display = 'none';\n    postAPI('/api/' + type, proc + '\\n' + id).then(function(j) {\n        toast(j.msg, !j.ok);\n        fetchData();\n    }).catch(function() { toast('Failed', true); });\n}\n\n"
-    "function promptAddVault() {\n    var panel = document.getElementById('addVaultPanel');\n    panel.style.display = panel.style.display === 'none' ? 'block' : 'none';\n    if (panel.style.display === 'block') document.getElementById('addVaultInput').focus();\n    notifyResize();\n}\n\nfunction doAddVault() {\n    var input = document.getElementById('addVaultInput');\n"
-    "    var path = input.value.trim();\n    if (!path) return;\n    input.value = '';\n    document.getElementById('addVaultPanel').style.display = 'none';\n    postAPI('/api/vault/add', path).then(function(j) {\n        toast(j.msg, !j.ok);\n        fetchData();\n    }).catch(function() { toast('Failed to add vault', true); });\n}\n\nfunction viewRules(id) {\n"
-    "    fetch(API + '/api/rules?vault=' + id).then(function(r) { return r.text(); }).then(function(text) {\n        showPanel('Rules: ' + id, text);\n    }).catch(function() { toast('Failed to load rules', true); });\n}\n\nfunction quickAllow(proc, vault) {\n    postAPI('/api/allow', proc + '\\n' + vault).then(function(j) {\n        toast(j.msg, !j.ok);\n        fetchData();\n"
-    "    }).catch(function() { toast('Failed', true); });\n}\n\nfunction refresh() {\n    var btn = document.getElementById('refreshBtn');\n    btn.innerHTML = '<span class=\"spinning\">\\u21bb</span>';\n    fetchData().then(function() { btn.textContent = 'Refresh'; });\n}\n\nfunction doLockUnlock() {\n    if (data.locked) {\n        showPanel('Unlock', 'Enter your passphrase to unlock all vaults.');\n"
-    "        pendingAuthAction = 'unlock';\n    } else {\n        showPanel('Lock All Vaults', 'Enter your passphrase to lock and unmount all vaults.');\n        pendingAuthAction = 'lock';\n    }\n    document.getElementById('panelAuth').style.display = 'block';\n    document.getElementById('panelPassInput').value = '';\n"
-    "    setTimeout(function() { document.getElementById('panelPassInput').focus(); }, 100);\n}\n\nfunction panelAuthSubmit() {\n    var pass = document.getElementById('panelPassInput').value;\n    if (!pass) return;\n    document.getElementById('panelPassInput').value = '';\n    var action = pendingAuthAction;\n    pendingAuthAction = null;\n\n    /* Show loading state */\n"
-    "    document.getElementById('panelBody').textContent = 'Authenticating...';\n    document.getElementById('panelAuth').style.display = 'none';\n\n    postAPI('/api/' + action, pass).then(function(j) {\n        toast(j.msg, !j.ok);\n        hidePanel();\n        fetchData();\n    }).catch(function() {\n        toast('Failed — try again', true);\n        hidePanel();\n    });\n}\n\n"
-    "function viewPolicies() {\n    fetch(API + '/api/policies').then(function(r) { return r.text(); }).then(function(text) {\n        showPanel('All Policies', text);\n    }).catch(function() { toast('Failed to load policies', true); });\n}\n\nfunction showPanel(title, body) {\n    document.getElementById('panelTitle').textContent = title;\n"
-    "    document.getElementById('panelBody').textContent = body || '';\n    document.getElementById('panelAuth').style.display = 'none';\n    document.getElementById('panelOverlay').className = 'panel-overlay show';\n}\n\nfunction hidePanel() {\n    document.getElementById('panelOverlay').className = 'panel-overlay';\n}\n\nfunction notifyResize() {\n"
-    "    try { window.webkit.messageHandlers.resize.postMessage(document.body.scrollHeight); } catch(e) {}\n}\n\nfetchData();\nwindow._refreshInterval = setInterval(fetchData, 5000);\n</script>\n</body>\n</html>\n"
+    "<!DOCTYPE html>\n"
+    "<html lang=\"en\">\n"
+    "<head>\n"
+    "<meta charset=\"UTF-8\">\n"
+    "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n"
+    "<title>onvault</title>\n"
+    "<style>\n"
+    ":root {\n"
+    "    color-scheme: dark;\n"
+    "    --bg: #0d0d0d;\n"
+    "    --card: rgba(26, 26, 26, 0.96);\n"
+    "    --card-hover: rgba(34, 34, 34, 0.98);\n"
+    "    --border: rgba(255, 255, 255, 0.08);\n"
+    "    --text: #ffffff;\n"
+    "    --text-soft: rgba(255, 255, 255, 0.72);\n"
+    "    --text-muted: rgba(255, 255, 255, 0.42);\n"
+    "    --green: #22c55e;\n"
+    "    --green-dim: rgba(34, 197, 94, 0.15);\n"
+    "    --red: #ef4444;\n"
+    "    --red-dim: rgba(239, 68, 68, 0.15);\n"
+    "    --orange: #f59e0b;\n"
+    "    --orange-dim: rgba(245, 158, 11, 0.15);\n"
+    "    --blue: #3b82f6;\n"
+    "    --blue-dim: rgba(59, 130, 246, 0.12);\n"
+    "    --radius: 10px;\n"
+    "    --radius-sm: 6px;\n"
+    "}\n"
+    "* { margin: 0; padding: 0; box-sizing: border-box; }\n"
+    "body {\n"
+    "    font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui, sans-serif;\n"
+    "    background: var(--bg); color: var(--text);\n"
+    "    width: 300px; font-size: 12px;\n"
+    "    -webkit-font-smoothing: antialiased;\n"
+    "    overflow: hidden;\n"
+    "}\n"
+    ".header {\n"
+    "    display: flex; align-items: center; justify-content: space-between;\n"
+    "    padding: 14px 16px 10px; border-bottom: 1px solid var(--border);\n"
+    "}\n"
+    ".header .logo { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 13px; }\n"
+    ".header .logo svg { width: 18px; height: 18px; }\n"
+    ".badge { font-size: 10px; padding: 3px 8px; border-radius: 20px; font-weight: 500; }\n"
+    ".badge.locked { background: var(--red-dim); color: var(--red); }\n"
+    ".badge.unlocked { background: var(--green-dim); color: var(--green); }\n"
+    ".section { padding: 8px 12px 4px; }\n"
+    ".section-title { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); padding: 4px 4px 6px; }\n"
+    ".vault-card { background: var(--card); border-radius: var(--radius); padding: 10px 12px; margin-bottom: 6px; border: 1px solid var(--border); cursor: pointer; transition: background 0.15s; }\n"
+    ".vault-card:hover { background: var(--card-hover); }\n"
+    ".vault-row { display: flex; align-items: center; justify-content: space-between; }\n"
+    ".vault-name { font-weight: 600; font-size: 12px; display: flex; align-items: center; gap: 6px; }\n"
+    ".vault-name .icon { font-size: 14px; }\n"
+    ".vault-source { font-size: 10px; color: var(--text-muted); margin-top: 2px; font-family: 'SF Mono', Menlo, monospace; }\n"
+    ".vault-status { font-size: 10px; padding: 2px 6px; border-radius: 4px; font-weight: 500; }\n"
+    ".vault-status.mounted { background: var(--green-dim); color: var(--green); }\n"
+    ".vault-status.locked { background: var(--red-dim); color: var(--red); }\n"
+    ".vault-detail { display: none; }\n"
+    ".vault-card.expanded .vault-detail { display: block; padding-top: 8px; margin-top: 8px; border-top: 1px solid var(--border); }\n"
+    ".vault-actions { display: flex; gap: 4px; flex-wrap: wrap; }\n"
+    ".vault-actions button { font-size: 10px; padding: 4px 10px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: transparent; color: var(--text-soft); cursor: pointer; transition: all 0.15s; font-family: inherit; }\n"
+    ".vault-actions button:hover { background: var(--blue-dim); color: var(--blue); border-color: rgba(59, 130, 246, 0.3); }\n"
+    ".vault-actions button.danger:hover { background: var(--red-dim); color: var(--red); border-color: rgba(239, 68, 68, 0.3); }\n"
+    ".denial-card { background: var(--card); border-radius: var(--radius-sm); padding: 8px 10px; margin-bottom: 4px; border: 1px solid var(--border); font-size: 11px; display: flex; align-items: center; justify-content: space-between; }\n"
+    ".denial-info { flex: 1; }\n"
+    ".denial-proc { font-weight: 600; color: var(--orange); }\n"
+    ".denial-file { font-size: 10px; color: var(--text-muted); font-family: 'SF Mono', Menlo, monospace; }\n"
+    ".denial-time { font-size: 9px; color: var(--text-muted); white-space: nowrap; margin-left: 8px; }\n"
+    ".denial-allow { font-size: 9px; padding: 2px 6px; border-radius: 4px; border: 1px solid rgba(34, 197, 94, 0.3); background: var(--green-dim); color: var(--green); cursor: pointer; margin-left: 6px; font-family: inherit; }\n"
+    ".action-bar { display: flex; gap: 6px; padding: 8px 12px; border-top: 1px solid var(--border); }\n"
+    ".action-bar button { flex: 1; padding: 8px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: var(--card); color: var(--text-soft); cursor: pointer; font-size: 11px; font-weight: 500; transition: all 0.15s; font-family: inherit; }\n"
+    ".action-bar button:hover { background: var(--card-hover); color: var(--text); }\n"
+    ".action-bar button.primary { background: var(--blue-dim); color: var(--blue); border-color: rgba(59, 130, 246, 0.25); }\n"
+    ".action-bar button.primary:hover { background: rgba(59, 130, 246, 0.2); border-color: rgba(59, 130, 246, 0.4); }\n"
+    ".footer { display: flex; align-items: center; justify-content: space-between; padding: 8px 16px; border-top: 1px solid var(--border); font-size: 10px; color: var(--text-muted); }\n"
+    "@keyframes spin { to { transform: rotate(360deg); } }\n"
+    ".spinning { animation: spin 1s linear infinite; display: inline-block; }\n"
+    ".empty-state { text-align: center; padding: 20px 16px; }\n"
+    ".empty-state .icon { font-size: 28px; margin-bottom: 8px; }\n"
+    ".empty-state p { color: var(--text-muted); margin-bottom: 4px; font-size: 11px; }\n"
+    "/* Toast notification (replaces browser alerts) */\n"
+    ".toast { position: fixed; bottom: 40px; left: 50%; transform: translateX(-50%); background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px 16px; font-size: 11px; color: var(--green); opacity: 0; transition: opacity 0.3s; pointer-events: none; z-index: 100; white-space: nowrap; }\n"
+    ".toast.show { opacity: 1; }\n"
+    ".toast.error { color: var(--red); }\n"
+    "/* Input row for inline allow/deny */\n"
+    ".input-row { display: flex; gap: 4px; margin-top: 6px; }\n"
+    ".input-row input { flex: 1; padding: 4px 8px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: rgba(0,0,0,0.3); color: var(--text); font-size: 10px; font-family: 'SF Mono', Menlo, monospace; outline: none; }\n"
+    ".input-row input:focus { border-color: rgba(59, 130, 246, 0.5); }\n"
+    ".input-row button { padding: 4px 8px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: var(--green-dim); color: var(--green); font-size: 10px; cursor: pointer; font-family: inherit; }\n"
+    "/* Overlay panel */\n"
+    ".panel-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.6); z-index: 200; }\n"
+    ".panel-overlay.show { display: flex; align-items: center; justify-content: center; }\n"
+    ".panel { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); width: 280px; max-height: 350px; overflow: hidden; }\n"
+    ".panel-header { display: flex; justify-content: space-between; align-items: center; padding: 10px 12px; border-bottom: 1px solid var(--border); font-weight: 600; font-size: 12px; }\n"
+    ".panel-body { padding: 10px 12px; font-size: 10px; color: var(--text-soft); white-space: pre-wrap; font-family: 'SF Mono', Menlo, monospace; overflow-y: auto; max-height: 280px; margin: 0; }\n"
+    "</style>\n"
+    "</head>\n"
+    "<body>\n"
+    "\n"
+    "<div class=\"header\">\n"
+    "    <div class=\"logo\">\n"
+    "        <svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\">\n"
+    "            <rect x=\"3\" y=\"11\" width=\"18\" height=\"11\" rx=\"2\" ry=\"2\"/>\n"
+    "            <path d=\"M7 11V7a5 5 0 0 1 10 0v4\"/>\n"
+    "        </svg>\n"
+    "        onvault\n"
+    "    </div>\n"
+    "    <span class=\"badge locked\" id=\"statusBadge\">Locked</span>\n"
+    "</div>\n"
+    "\n"
+    "<div id=\"vaultSection\" class=\"section\">\n"
+    "    <div class=\"section-title\">Vaults</div>\n"
+    "    <div id=\"vaultList\"></div>\n"
+    "</div>\n"
+    "\n"
+    "<div id=\"denialSection\" class=\"section\" style=\"display:none\">\n"
+    "    <div class=\"section-title\">Recent Denials</div>\n"
+    "    <div id=\"denialList\"></div>\n"
+    "</div>\n"
+    "\n"
+    "<div id=\"addVaultPanel\" style=\"display:none; padding: 8px 12px;\">\n"
+    "    <div class=\"section-title\">Add Vault</div>\n"
+    "    <div class=\"input-row\">\n"
+    "        <input placeholder=\"~/.ssh or /path/to/dir\" id=\"addVaultInput\">\n"
+    "        <button onclick=\"doAddVault()\">Protect</button>\n"
+    "    </div>\n"
+    "</div>\n"
+    "\n"
+    "<div class=\"action-bar\">\n"
+    "    <button class=\"primary\" onclick=\"promptAddVault()\">+ Add Vault</button>\n"
+    "    <button onclick=\"viewPolicies()\">Policies</button>\n"
+    "    <button id=\"lockBtn\" onclick=\"doLockUnlock()\">Lock</button>\n"
+    "    <button onclick=\"refresh()\" id=\"refreshBtn\">Refresh</button>\n"
+    "</div>\n"
+    "\n"
+    "<div class=\"footer\">\n"
+    "    <span>onvault 0.1.0</span>\n"
+    "    <span id=\"lastUpdate\"></span>\n"
+    "</div>\n"
+    "\n"
+    "<div class=\"toast\" id=\"toast\"></div>\n"
+    "\n"
+    "<div class=\"panel-overlay\" id=\"panelOverlay\" onclick=\"hidePanel()\">\n"
+    "    <div class=\"panel\" onclick=\"event.stopPropagation()\">\n"
+    "        <div class=\"panel-header\">\n"
+    "            <span id=\"panelTitle\"></span>\n"
+    "            <button onclick=\"hidePanel()\" style=\"background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:14px\">✕</button>\n"
+    "        </div>\n"
+    "        <pre class=\"panel-body\" id=\"panelBody\"></pre>\n"
+    "        <div id=\"panelAuth\" style=\"display:none;padding:10px 12px;border-top:1px solid var(--border)\">\n"
+    "            <div class=\"input-row\">\n"
+    "                <input type=\"password\" placeholder=\"Passphrase\" id=\"panelPassInput\">\n"
+    "                <button id=\"panelAuthBtn\" onclick=\"panelAuthSubmit()\">Confirm</button>\n"
+    "            </div>\n"
+    "        </div>\n"
+    "    </div>\n"
+    "</div>\n"
+    "\n"
+    "<script>\n"
+    "var API = window.location.origin;\n"
+    "var data = { locked: true, vault_count: 0, vaults: [] };\n"
+    "var denials = [];\n"
+    "var expandedVaults = {};\n"
+    "var pendingAuthAction = null;\n"
+    "var authToken = null;\n"
+    "var _refreshInterval = null;\n"
+    "\n"
+    "function esc(s) {\n"
+    "    if (!s) return '';\n"
+    "    return String(s)\n"
+    "        .replace(/&/g, '&amp;')\n"
+    "        .replace(/</g, '&lt;')\n"
+    "        .replace(/>/g, '&gt;')\n"
+    "        .replace(/\"/g, '&quot;')\n"
+    "        .replace(/'/g, '&#39;');\n"
+    "}\n"
+    "\n"
+    "function toast(msg, isError) {\n"
+    "    var t = document.getElementById('toast');\n"
+    "    t.innerHTML = msg;\n"
+    "    t.className = 'toast show' + (isError ? ' error' : '');\n"
+    "    setTimeout(function() { t.className = 'toast'; }, 2500);\n"
+    "}\n"
+    "\n"
+    "function fetchJSON(path) {\n"
+    "    return fetch(API + path).then(function(r) {\n"
+    "        return r.json().then(function(j) {\n"
+    "            if (r.status === 401 || (j && !j.ok && j.msg && j.msg.indexOf('Unauthorized') >= 0)) {\n"
+    "                authToken = null;\n"
+    "            }\n"
+    "            if (r.status === 401) throw j;\n"
+    "            return j;\n"
+    "        });\n"
+    "    });\n"
+    "}\n"
+    "\n"
+    "function fetchText(path) {\n"
+    "    return fetch(API + path).then(function(r) {\n"
+    "        return r.text().then(function(text) {\n"
+    "            if (r.status === 401) {\n"
+    "                authToken = null;\n"
+    "                throw { ok: false, msg: text || 'Unauthorized' };\n"
+    "            }\n"
+    "            return text;\n"
+    "        });\n"
+    "    });\n"
+    "}\n"
+    "\n"
+    "function postAPI(path, body) {\n"
+    "    var headers = {};\n"
+    "    if (authToken) headers['Authorization'] = 'Bearer ' + authToken;\n"
+    "    return fetch(API + path, { method: 'POST', body: body, headers: headers }).then(function(r) {\n"
+    "        return r.json().then(function(j) {\n"
+    "            if (r.status === 401 || (j && !j.ok && j.msg && j.msg.indexOf('Unauthorized') >= 0)) {\n"
+    "                authToken = null;\n"
+    "            }\n"
+    "            j._status = r.status;\n"
+    "            return j;\n"
+    "        });\n"
+    "    });\n"
+    "}\n"
+    "\n"
+    "function fetchData() {\n"
+    "    var tokenParam = authToken ? '?token=' + encodeURIComponent(authToken) : '';\n"
+    "    return Promise.all([\n"
+    "        fetchJSON('/api/status' + tokenParam),\n"
+    "        fetchJSON('/api/denials' + tokenParam)\n"
+    "    ]).then(function(results) {\n"
+    "        data = results[0];\n"
+    "        denials = results[1];\n"
+    "        render();\n"
+    "    }).catch(function(err) {\n"
+    "        if (err && err.msg && err.msg.indexOf('Unauthorized') >= 0) authToken = null;\n"
+    "        data = { locked: true, vault_count: 0, vaults: [] };\n"
+    "        denials = [];\n"
+    "        render();\n"
+    "    });\n"
+    "}\n"
+    "\n"
+    "function timeAgo(ts) {\n"
+    "    var s = Math.floor(Date.now() / 1000) - ts;\n"
+    "    if (s < 60) return s + 's';\n"
+    "    if (s < 3600) return Math.floor(s / 60) + 'm';\n"
+    "    return Math.floor(s / 3600) + 'h';\n"
+    "}\n"
+    "\n"
+    "function render() {\n"
+    "    var badge = document.getElementById('statusBadge');\n"
+    "    badge.className = 'badge ' + (data.locked ? 'locked' : 'unlocked');\n"
+    "    badge.textContent = data.locked ? 'Locked' : data.vault_count + ' vault(s)';\n"
+    "\n"
+    "    var vl = document.getElementById('vaultList');\n"
+    "    if (data.vaults.length === 0) {\n"
+    "        vl.innerHTML = '<div class=\"empty-state\"><div class=\"icon\">' + (data.locked ? '🔒' : '🛡️') + '</div>' +\n"
+    "            '<p>' + (data.locked ? 'Locked — click Unlock below.' : 'No vaults yet. Click + Add Vault.') + '</p></div>';\n"
+    "    } else {\n"
+    "        vl.innerHTML = data.vaults.map(function(v) {\n"
+    "            var exp = expandedVaults[v.id] ? ' expanded' : '';\n"
+    "            var vidArg = encodeURIComponent(v.id);\n"
+    "            return '<div class=\"vault-card' + exp + '\" onclick=\"toggle(decodeURIComponent(\\'' + vidArg + '\\'))\">' +\n"
+    "                '<div class=\"vault-row\"><div class=\"vault-name\"><span class=\"icon\">' +\n"
+    "                (v.mounted ? '🔓' : '🔒') + '</span>' + esc(v.id) + '</div>' +\n"
+    "                '<span class=\"vault-status ' + (v.mounted ? 'mounted' : 'locked') + '\">' +\n"
+    "                (v.mounted ? 'Active' : 'Locked') + '</span></div>' +\n"
+    "                '<div class=\"vault-source\">' + esc(v.source) + '</div>' +\n"
+    "                '<div class=\"vault-detail\">' +\n"
+    "                '<div class=\"vault-actions\">' +\n"
+    "                '<button onclick=\"event.stopPropagation();viewRules(decodeURIComponent(\\'' + vidArg + '\\'))\">Rules</button>' +\n"
+    "                '<button onclick=\"event.stopPropagation();showInput(\\'allow\\',decodeURIComponent(\\'' + vidArg + '\\'))\">Allow</button>' +\n"
+    "                '<button onclick=\"event.stopPropagation();showInput(\\'deny\\',decodeURIComponent(\\'' + vidArg + '\\'))\">Deny</button>' +\n"
+    "                '<button class=\"danger\" onclick=\"event.stopPropagation();toast(\\'Use CLI: onvault vault remove ' + esc(v.id) + '\\')\">Remove</button>' +\n"
+    "                '</div>' +\n"
+    "                '<div class=\"input-row\" id=\"allow-' + v.id + '\" style=\"display:none\">' +\n"
+    "                '<input placeholder=\"/usr/bin/process\" id=\"allow-input-' + v.id + '\">' +\n"
+    "                '<button onclick=\"event.stopPropagation();doRule(\\'allow\\',decodeURIComponent(\\'' + vidArg + '\\'))\">Allow</button>' +\n"
+    "                '</div>' +\n"
+    "                '<div class=\"input-row\" id=\"deny-' + v.id + '\" style=\"display:none\">' +\n"
+    "                '<input placeholder=\"/usr/bin/process\" id=\"deny-input-' + v.id + '\">' +\n"
+    "                '<button onclick=\"event.stopPropagation();doRule(\\'deny\\',decodeURIComponent(\\'' + vidArg + '\\'))\">Deny</button>' +\n"
+    "                '</div></div>';\n"
+    "        }).join('');\n"
+    "    }\n"
+    "\n"
+    "    var ds = document.getElementById('denialSection');\n"
+    "    var dl = document.getElementById('denialList');\n"
+    "    if (denials.length > 0) {\n"
+    "        ds.style.display = 'block';\n"
+    "        dl.innerHTML = denials.slice(-5).reverse().map(function(d) {\n"
+    "            var pathArg = encodeURIComponent(d.path || '');\n"
+    "            var vaultArg = encodeURIComponent(d.vault || '');\n"
+    "            return '<div class=\"denial-card\"><div class=\"denial-info\">' +\n"
+    "                '<span class=\"denial-proc\">' + esc(d.process) + '</span> \\u2192 ' + esc(d.vault) +\n"
+    "                '<div class=\"denial-file\">' + esc(d.file) + '</div></div>' +\n"
+    "                '<span class=\"denial-time\">' + timeAgo(d.time) + '</span>' +\n"
+    "                '<button class=\"denial-allow\" onclick=\"quickAllow(decodeURIComponent(\\'' + pathArg + '\\'),decodeURIComponent(\\'' + vaultArg + '\\'))\">Allow</button></div>';\n"
+    "        }).join('');\n"
+    "    } else { ds.style.display = 'none'; }\n"
+    "\n"
+    "    var lockBtn = document.getElementById('lockBtn');\n"
+    "    if (lockBtn) lockBtn.textContent = data.locked ? 'Unlock' : 'Lock';\n"
+    "\n"
+    "    document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});\n"
+    "    notifyResize();\n"
+    "}\n"
+    "\n"
+    "function toggle(id) {\n"
+    "    expandedVaults[id] = !expandedVaults[id];\n"
+    "    render();\n"
+    "}\n"
+    "\n"
+    "function showInput(type, id) {\n"
+    "    var el = document.getElementById(type + '-' + id);\n"
+    "    var other = type === 'allow' ? 'deny' : 'allow';\n"
+    "    el.style.display = el.style.display === 'none' ? 'flex' : 'none';\n"
+    "    document.getElementById(other + '-' + id).style.display = 'none';\n"
+    "}\n"
+    "\n"
+    "function doRule(type, id) {\n"
+    "    var input = document.getElementById(type + '-input-' + id);\n"
+    "    var proc = input.value.trim();\n"
+    "    if (!proc) return;\n"
+    "    input.value = '';\n"
+    "    document.getElementById(type + '-' + id).style.display = 'none';\n"
+    "    postAPI('/api/' + type, proc + '\\n' + id).then(function(j) {\n"
+    "        toast(esc(j.msg), !j.ok);\n"
+    "        fetchData();\n"
+    "    }).catch(function() { toast('Failed', true); });\n"
+    "}\n"
+    "\n"
+    "function promptAddVault() {\n"
+    "    var panel = document.getElementById('addVaultPanel');\n"
+    "    panel.style.display = panel.style.display === 'none' ? 'block' : 'none';\n"
+    "    if (panel.style.display === 'block') document.getElementById('addVaultInput').focus();\n"
+    "    notifyResize();\n"
+    "}\n"
+    "\n"
+    "function doAddVault() {\n"
+    "    var input = document.getElementById('addVaultInput');\n"
+    "    var path = input.value.trim();\n"
+    "    if (!path) return;\n"
+    "    input.value = '';\n"
+    "    document.getElementById('addVaultPanel').style.display = 'none';\n"
+    "    postAPI('/api/vault/add', path).then(function(j) {\n"
+    "        toast(esc(j.msg), !j.ok);\n"
+    "        fetchData();\n"
+    "    }).catch(function() { toast('Failed to add vault', true); });\n"
+    "}\n"
+    "\n"
+    "function viewRules(id) {\n"
+    "    var tokenParam = authToken ? '&token=' + encodeURIComponent(authToken) : '';\n"
+    "    fetchText('/api/rules?vault=' + encodeURIComponent(id) + tokenParam).then(function(text) {\n"
+    "        showPanel('Rules: ' + id, text);\n"
+    "    }).catch(function(err) {\n"
+    "        toast(esc(err && err.msg ? err.msg : 'Failed to load rules'), true);\n"
+    "    });\n"
+    "}\n"
+    "\n"
+    "function quickAllow(proc, vault) {\n"
+    "    postAPI('/api/allow', proc + '\\n' + vault).then(function(j) {\n"
+    "        toast(esc(j.msg), !j.ok);\n"
+    "        fetchData();\n"
+    "    }).catch(function() { toast('Failed', true); });\n"
+    "}\n"
+    "\n"
+    "function refresh() {\n"
+    "    var btn = document.getElementById('refreshBtn');\n"
+    "    btn.innerHTML = '<span class=\"spinning\">\\u21bb</span>';\n"
+    "    fetchData().then(function() { btn.textContent = 'Refresh'; });\n"
+    "}\n"
+    "\n"
+    "function doLockUnlock() {\n"
+    "    if (data.locked) {\n"
+    "        showPanel('Unlock', 'Enter your passphrase to unlock all vaults.');\n"
+    "        pendingAuthAction = 'unlock';\n"
+    "    } else {\n"
+    "        showPanel('Lock All Vaults', 'Enter your passphrase to lock and unmount all vaults.');\n"
+    "        pendingAuthAction = 'lock';\n"
+    "    }\n"
+    "    document.getElementById('panelAuth').style.display = 'block';\n"
+    "    document.getElementById('panelPassInput').value = '';\n"
+    "    setTimeout(function() { document.getElementById('panelPassInput').focus(); }, 100);\n"
+    "}\n"
+    "\n"
+    "function panelAuthSubmit() {\n"
+    "    var pass = document.getElementById('panelPassInput').value;\n"
+    "    if (!pass) return;\n"
+    "    document.getElementById('panelPassInput').value = '';\n"
+    "    var action = pendingAuthAction;\n"
+    "    pendingAuthAction = null;\n"
+    "\n"
+    "    /* Show loading state */\n"
+    "    document.getElementById('panelBody').textContent = 'Authenticating...';\n"
+    "    document.getElementById('panelAuth').style.display = 'none';\n"
+    "\n"
+    "    postAPI('/api/' + action, pass).then(function(j) {\n"
+    "        if (action === 'unlock' && j.ok && j.token) {\n"
+    "            authToken = j.token;\n"
+    "        }\n"
+    "        if (action === 'lock' && j.ok) {\n"
+    "            authToken = null;\n"
+    "        }\n"
+    "        toast(esc(j.msg), !j.ok);\n"
+    "        hidePanel();\n"
+    "        fetchData();\n"
+    "    }).catch(function() {\n"
+    "        toast('Failed — try again', true);\n"
+    "        hidePanel();\n"
+    "    });\n"
+    "}\n"
+    "\n"
+    "function viewPolicies() {\n"
+    "    var tokenParam = authToken ? '?token=' + encodeURIComponent(authToken) : '';\n"
+    "    fetchText('/api/policies' + tokenParam).then(function(text) {\n"
+    "        showPanel('All Policies', text);\n"
+    "    }).catch(function(err) {\n"
+    "        toast(esc(err && err.msg ? err.msg : 'Failed to load policies'), true);\n"
+    "    });\n"
+    "}\n"
+    "\n"
+    "function showPanel(title, body) {\n"
+    "    document.getElementById('panelTitle').textContent = title;\n"
+    "    document.getElementById('panelBody').textContent = body || '';\n"
+    "    document.getElementById('panelAuth').style.display = 'none';\n"
+    "    document.getElementById('panelOverlay').className = 'panel-overlay show';\n"
+    "}\n"
+    "\n"
+    "function hidePanel() {\n"
+    "    document.getElementById('panelOverlay').className = 'panel-overlay';\n"
+    "}\n"
+    "\n"
+    "function notifyResize() {\n"
+    "    try { window.webkit.messageHandlers.resize.postMessage(document.body.scrollHeight); } catch(e) {}\n"
+    "}\n"
+    "\n"
+    "fetchData();\n"
+    "if (_refreshInterval) clearInterval(_refreshInterval);\n"
+    "_refreshInterval = setInterval(fetchData, 5000);\n"
+    "</script>\n"
+    "</body>\n"
+    "</html>\n"
     ;
 }

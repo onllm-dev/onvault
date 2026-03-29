@@ -160,27 +160,75 @@ var data = { locked: true, vault_count: 0, vaults: [] };
 var denials = [];
 var expandedVaults = {};
 var pendingAuthAction = null;
+var authToken = null;
+var _refreshInterval = null;
+
+function esc(s) {
+    if (!s) return '';
+    return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
 
 function toast(msg, isError) {
     var t = document.getElementById('toast');
-    t.textContent = msg;
+    t.innerHTML = msg;
     t.className = 'toast show' + (isError ? ' error' : '');
     setTimeout(function() { t.className = 'toast'; }, 2500);
 }
 
+function fetchJSON(path) {
+    return fetch(API + path).then(function(r) {
+        return r.json().then(function(j) {
+            if (r.status === 401 || (j && !j.ok && j.msg && j.msg.indexOf('Unauthorized') >= 0)) {
+                authToken = null;
+            }
+            if (r.status === 401) throw j;
+            return j;
+        });
+    });
+}
+
+function fetchText(path) {
+    return fetch(API + path).then(function(r) {
+        return r.text().then(function(text) {
+            if (r.status === 401) {
+                authToken = null;
+                throw { ok: false, msg: text || 'Unauthorized' };
+            }
+            return text;
+        });
+    });
+}
+
 function postAPI(path, body) {
-    return fetch(API + path, { method: 'POST', body: body }).then(function(r) { return r.json(); });
+    var headers = {};
+    if (authToken) headers['Authorization'] = 'Bearer ' + authToken;
+    return fetch(API + path, { method: 'POST', body: body, headers: headers }).then(function(r) {
+        return r.json().then(function(j) {
+            if (r.status === 401 || (j && !j.ok && j.msg && j.msg.indexOf('Unauthorized') >= 0)) {
+                authToken = null;
+            }
+            j._status = r.status;
+            return j;
+        });
+    });
 }
 
 function fetchData() {
+    var tokenParam = authToken ? '?token=' + encodeURIComponent(authToken) : '';
     return Promise.all([
-        fetch(API + '/api/status').then(function(r) { return r.json(); }),
-        fetch(API + '/api/denials').then(function(r) { return r.json(); })
+        fetchJSON('/api/status' + tokenParam),
+        fetchJSON('/api/denials' + tokenParam)
     ]).then(function(results) {
         data = results[0];
         denials = results[1];
         render();
-    }).catch(function() {
+    }).catch(function(err) {
+        if (err && err.msg && err.msg.indexOf('Unauthorized') >= 0) authToken = null;
         data = { locked: true, vault_count: 0, vaults: [] };
         denials = [];
         render();
@@ -206,26 +254,27 @@ function render() {
     } else {
         vl.innerHTML = data.vaults.map(function(v) {
             var exp = expandedVaults[v.id] ? ' expanded' : '';
-            return '<div class="vault-card' + exp + '" onclick="toggle(\'' + v.id + '\')">' +
+            var vidArg = encodeURIComponent(v.id);
+            return '<div class="vault-card' + exp + '" onclick="toggle(decodeURIComponent(\'' + vidArg + '\'))">' +
                 '<div class="vault-row"><div class="vault-name"><span class="icon">' +
-                (v.mounted ? '🔓' : '🔒') + '</span>' + v.id + '</div>' +
+                (v.mounted ? '🔓' : '🔒') + '</span>' + esc(v.id) + '</div>' +
                 '<span class="vault-status ' + (v.mounted ? 'mounted' : 'locked') + '">' +
                 (v.mounted ? 'Active' : 'Locked') + '</span></div>' +
-                '<div class="vault-source">' + v.source + '</div>' +
+                '<div class="vault-source">' + esc(v.source) + '</div>' +
                 '<div class="vault-detail">' +
                 '<div class="vault-actions">' +
-                '<button onclick="event.stopPropagation();viewRules(\'' + v.id + '\')">Rules</button>' +
-                '<button onclick="event.stopPropagation();showInput(\'allow\',\'' + v.id + '\')">Allow</button>' +
-                '<button onclick="event.stopPropagation();showInput(\'deny\',\'' + v.id + '\')">Deny</button>' +
-                '<button class="danger" onclick="event.stopPropagation();toast(\'Use CLI: onvault vault remove ' + v.id + '\')">Remove</button>' +
+                '<button onclick="event.stopPropagation();viewRules(decodeURIComponent(\'' + vidArg + '\'))">Rules</button>' +
+                '<button onclick="event.stopPropagation();showInput(\'allow\',decodeURIComponent(\'' + vidArg + '\'))">Allow</button>' +
+                '<button onclick="event.stopPropagation();showInput(\'deny\',decodeURIComponent(\'' + vidArg + '\'))">Deny</button>' +
+                '<button class="danger" onclick="event.stopPropagation();toast(\'Use CLI: onvault vault remove ' + esc(v.id) + '\')">Remove</button>' +
                 '</div>' +
                 '<div class="input-row" id="allow-' + v.id + '" style="display:none">' +
                 '<input placeholder="/usr/bin/process" id="allow-input-' + v.id + '">' +
-                '<button onclick="event.stopPropagation();doRule(\'allow\',\'' + v.id + '\')">Allow</button>' +
+                '<button onclick="event.stopPropagation();doRule(\'allow\',decodeURIComponent(\'' + vidArg + '\'))">Allow</button>' +
                 '</div>' +
                 '<div class="input-row" id="deny-' + v.id + '" style="display:none">' +
                 '<input placeholder="/usr/bin/process" id="deny-input-' + v.id + '">' +
-                '<button onclick="event.stopPropagation();doRule(\'deny\',\'' + v.id + '\')">Deny</button>' +
+                '<button onclick="event.stopPropagation();doRule(\'deny\',decodeURIComponent(\'' + vidArg + '\'))">Deny</button>' +
                 '</div></div>';
         }).join('');
     }
@@ -235,11 +284,13 @@ function render() {
     if (denials.length > 0) {
         ds.style.display = 'block';
         dl.innerHTML = denials.slice(-5).reverse().map(function(d) {
+            var pathArg = encodeURIComponent(d.path || '');
+            var vaultArg = encodeURIComponent(d.vault || '');
             return '<div class="denial-card"><div class="denial-info">' +
-                '<span class="denial-proc">' + d.process + '</span> \u2192 ' + d.vault +
-                '<div class="denial-file">' + d.file + '</div></div>' +
+                '<span class="denial-proc">' + esc(d.process) + '</span> \u2192 ' + esc(d.vault) +
+                '<div class="denial-file">' + esc(d.file) + '</div></div>' +
                 '<span class="denial-time">' + timeAgo(d.time) + '</span>' +
-                '<button class="denial-allow" onclick="quickAllow(\'' + d.path + '\',\'' + d.vault + '\')">Allow</button></div>';
+                '<button class="denial-allow" onclick="quickAllow(decodeURIComponent(\'' + pathArg + '\'),decodeURIComponent(\'' + vaultArg + '\'))">Allow</button></div>';
         }).join('');
     } else { ds.style.display = 'none'; }
 
@@ -269,7 +320,7 @@ function doRule(type, id) {
     input.value = '';
     document.getElementById(type + '-' + id).style.display = 'none';
     postAPI('/api/' + type, proc + '\n' + id).then(function(j) {
-        toast(j.msg, !j.ok);
+        toast(esc(j.msg), !j.ok);
         fetchData();
     }).catch(function() { toast('Failed', true); });
 }
@@ -288,20 +339,23 @@ function doAddVault() {
     input.value = '';
     document.getElementById('addVaultPanel').style.display = 'none';
     postAPI('/api/vault/add', path).then(function(j) {
-        toast(j.msg, !j.ok);
+        toast(esc(j.msg), !j.ok);
         fetchData();
     }).catch(function() { toast('Failed to add vault', true); });
 }
 
 function viewRules(id) {
-    fetch(API + '/api/rules?vault=' + id).then(function(r) { return r.text(); }).then(function(text) {
+    var tokenParam = authToken ? '&token=' + encodeURIComponent(authToken) : '';
+    fetchText('/api/rules?vault=' + encodeURIComponent(id) + tokenParam).then(function(text) {
         showPanel('Rules: ' + id, text);
-    }).catch(function() { toast('Failed to load rules', true); });
+    }).catch(function(err) {
+        toast(esc(err && err.msg ? err.msg : 'Failed to load rules'), true);
+    });
 }
 
 function quickAllow(proc, vault) {
     postAPI('/api/allow', proc + '\n' + vault).then(function(j) {
-        toast(j.msg, !j.ok);
+        toast(esc(j.msg), !j.ok);
         fetchData();
     }).catch(function() { toast('Failed', true); });
 }
@@ -337,7 +391,13 @@ function panelAuthSubmit() {
     document.getElementById('panelAuth').style.display = 'none';
 
     postAPI('/api/' + action, pass).then(function(j) {
-        toast(j.msg, !j.ok);
+        if (action === 'unlock' && j.ok && j.token) {
+            authToken = j.token;
+        }
+        if (action === 'lock' && j.ok) {
+            authToken = null;
+        }
+        toast(esc(j.msg), !j.ok);
         hidePanel();
         fetchData();
     }).catch(function() {
@@ -347,9 +407,12 @@ function panelAuthSubmit() {
 }
 
 function viewPolicies() {
-    fetch(API + '/api/policies').then(function(r) { return r.text(); }).then(function(text) {
+    var tokenParam = authToken ? '?token=' + encodeURIComponent(authToken) : '';
+    fetchText('/api/policies' + tokenParam).then(function(text) {
         showPanel('All Policies', text);
-    }).catch(function() { toast('Failed to load policies', true); });
+    }).catch(function(err) {
+        toast(esc(err && err.msg ? err.msg : 'Failed to load policies'), true);
+    });
 }
 
 function showPanel(title, body) {
@@ -368,7 +431,8 @@ function notifyResize() {
 }
 
 fetchData();
-window._refreshInterval = setInterval(fetchData, 5000);
+if (_refreshInterval) clearInterval(_refreshInterval);
+_refreshInterval = setInterval(fetchData, 5000);
 </script>
 </body>
 </html>
