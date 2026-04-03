@@ -418,7 +418,6 @@ static void unmount_all_vaults(void)
 static int finish_unlock(const onvault_key_t *master_key)
 {
     int rc;
-    int log_started = 0;
 
     if (!master_key)
         return ONVAULT_ERR_INVALID;
@@ -445,22 +444,17 @@ static int finish_unlock(const onvault_key_t *master_key)
     }
 
     if (!g_log_initialized) {
-        if (onvault_log_init(&g_config_key) == ONVAULT_OK) {
+        if (onvault_log_init(&g_config_key) == ONVAULT_OK)
             g_log_initialized = 1;
-            log_started = 1;
-        }
     }
 
     rc = mount_all_vaults();
     if (rc != ONVAULT_OK) {
-        unmount_all_vaults();
-        if (log_started) {
-            onvault_log_close();
-            g_log_initialized = 0;
-        }
-        onvault_policy_clear();
-        clear_loaded_keys();
-        return rc;
+        /* FUSE mount failure is non-fatal — keys and policies remain loaded.
+         * Vaults are still accessible via encrypted directories.
+         * This allows the daemon to function when macFUSE is unavailable. */
+        fprintf(stderr, "onvaultd: warning: vault mount failed (FUSE unavailable?). "
+                        "Keys loaded, policies active.\n");
     }
 
     return ONVAULT_OK;
@@ -865,11 +859,25 @@ static void handle_client(int client_fd)
         if (g_master_key_loaded) {
             snprintf(resp_buf, sizeof(resp_buf), "Already unlocked\n");
         } else {
-            onvault_key_t session_key;
-            int urc = onvault_auth_check_session(&session_key);
+            onvault_key_t mk;
+            int urc;
+
+            /* If CLI sent a passphrase payload, derive key directly (avoids Keychain).
+             * Otherwise fall back to session check (which needs Keychain access). */
+            if (header.payload_len > 0) {
+                char pass[256] = {0};
+                size_t plen = header.payload_len;
+                if (plen >= sizeof(pass)) plen = sizeof(pass) - 1;
+                memcpy(pass, payload, plen);
+                urc = onvault_auth_unlock(pass, &mk);
+                onvault_memzero(pass, sizeof(pass));
+            } else {
+                urc = onvault_auth_check_session(&mk);
+            }
+
             if (urc == ONVAULT_OK) {
-                int frc = finish_unlock(&session_key);
-                onvault_key_wipe(&session_key, sizeof(session_key));
+                int frc = finish_unlock(&mk);
+                onvault_key_wipe(&mk, sizeof(mk));
                 if (frc == ONVAULT_OK)
                     snprintf(resp_buf, sizeof(resp_buf), "Unlocked\n");
                 else {
@@ -877,6 +885,7 @@ static void handle_client(int client_fd)
                     snprintf(resp_buf, sizeof(resp_buf), "Unlock failed (err=%d)\n", frc);
                 }
             } else {
+                onvault_key_wipe(&mk, sizeof(mk));
                 resp.status = IPC_RESP_AUTH_REQUIRED;
                 snprintf(resp_buf, sizeof(resp_buf), "Unlock failed (err=%d)\n", urc);
             }

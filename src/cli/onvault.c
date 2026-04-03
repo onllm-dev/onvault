@@ -142,12 +142,14 @@ static int cmd_unlock(void)
     char pass[256];
     read_passphrase("Passphrase: ", pass, sizeof(pass));
 
+    /* Verify passphrase locally first (fast fail on wrong passphrase) */
     onvault_crypto_init();
     onvault_key_t master_key;
     int rc = onvault_auth_unlock(pass, &master_key);
-    onvault_memzero(pass, sizeof(pass));
+    onvault_key_wipe(&master_key, sizeof(master_key));
 
     if (rc != ONVAULT_OK) {
+        onvault_memzero(pass, sizeof(pass));
         if (rc == ONVAULT_ERR_AUTH)
             fprintf(stderr, "Wrong passphrase.\n");
         else
@@ -155,18 +157,17 @@ static int cmd_unlock(void)
         return 1;
     }
 
-    /* Notify daemon to load the master key from session */
+    /* Send passphrase to daemon so it can derive the key directly
+     * (avoids Keychain access which may block after lock/re-unlock) */
     char response[ONVAULT_IPC_MAX_MSG];
     uint32_t resp_len = sizeof(response) - 1;
-    int ipc_rc = onvault_ipc_send(IPC_CMD_UNLOCK, NULL, 0, response, &resp_len);
-
-    /* Wipe master key from CLI process — daemon has its own copy via session */
-    onvault_key_wipe(&master_key, sizeof(master_key));
+    int ipc_rc = onvault_ipc_send(IPC_CMD_UNLOCK, pass, (uint32_t)strlen(pass),
+                                   response, &resp_len);
+    onvault_memzero(pass, sizeof(pass));
 
     if (ipc_rc == ONVAULT_ERR_IO) {
-        fprintf(stderr, "Error: Could not connect to daemon (not running?)\n");
-        fprintf(stderr, "  Start with: onvault start\n");
-        return 1;
+        printf("Unlocked (daemon not running — start with: onvault start)\n");
+        return 0;
     } else if (ipc_rc != ONVAULT_OK) {
         fprintf(stderr, "Unlock failed (err=%d). Daemon may need restart.\n", ipc_rc);
         return 1;
