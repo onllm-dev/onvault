@@ -6,187 +6,420 @@
 <title>onvault</title>
 <style>
 :root {
-    color-scheme: dark;
-    --bg: #0d0d0d;
-    --card: rgba(26, 26, 26, 0.96);
-    --card-hover: rgba(34, 34, 34, 0.98);
-    --border: rgba(255, 255, 255, 0.08);
-    --text: #ffffff;
-    --text-soft: rgba(255, 255, 255, 0.72);
-    --text-muted: rgba(255, 255, 255, 0.42);
-    --green: #22c55e;
-    --green-dim: rgba(34, 197, 94, 0.15);
-    --red: #ef4444;
-    --red-dim: rgba(239, 68, 68, 0.15);
-    --orange: #f59e0b;
-    --orange-dim: rgba(245, 158, 11, 0.15);
-    --blue: #3b82f6;
-    --blue-dim: rgba(59, 130, 246, 0.12);
+    color-scheme: light dark;
+    --bg: #f5f5f7;
+    --surface: rgba(255, 255, 255, 0.85);
+    --surface-hover: rgba(255, 255, 255, 0.95);
+    --border: rgba(0, 0, 0, 0.08);
+    --text: #1d1d1f;
+    --text-secondary: #6e6e73;
+    --text-tertiary: #aeaeb2;
+    --accent: #007aff;
+    --accent-bg: rgba(0, 122, 255, 0.08);
+    --green: #34c759;
+    --green-bg: rgba(52, 199, 89, 0.1);
+    --red: #ff3b30;
+    --red-bg: rgba(255, 59, 48, 0.1);
+    --orange: #ff9500;
+    --orange-bg: rgba(255, 149, 0, 0.1);
     --radius: 10px;
-    --radius-sm: 6px;
+    --radius-sm: 8px;
+    --shadow: 0 1px 3px rgba(0,0,0,0.06);
+}
+@media (prefers-color-scheme: dark) {
+    :root {
+        --bg: #1c1c1e;
+        --surface: rgba(44, 44, 46, 0.85);
+        --surface-hover: rgba(58, 58, 60, 0.95);
+        --border: rgba(255, 255, 255, 0.08);
+        --text: #f5f5f7;
+        --text-secondary: #98989d;
+        --text-tertiary: #636366;
+        --accent: #0a84ff;
+        --accent-bg: rgba(10, 132, 255, 0.12);
+        --green: #30d158;
+        --green-bg: rgba(48, 209, 88, 0.12);
+        --red: #ff453a;
+        --red-bg: rgba(255, 69, 58, 0.12);
+        --orange: #ff9f0a;
+        --orange-bg: rgba(255, 159, 10, 0.12);
+        --shadow: 0 1px 3px rgba(0,0,0,0.2);
+    }
 }
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body {
     font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui, sans-serif;
     background: var(--bg); color: var(--text);
-    width: 300px; font-size: 12px;
+    width: 320px; font-size: 13px;
     -webkit-font-smoothing: antialiased;
     overflow: hidden;
 }
+
+/* Header */
 .header {
     display: flex; align-items: center; justify-content: space-between;
-    padding: 14px 16px 10px; border-bottom: 1px solid var(--border);
+    padding: 14px 16px 12px;
+    backdrop-filter: blur(20px) saturate(180%);
+    -webkit-backdrop-filter: blur(20px) saturate(180%);
+    border-bottom: 1px solid var(--border);
 }
-.header .logo { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 13px; }
-.header .logo svg { width: 18px; height: 18px; }
-.badge { font-size: 10px; padding: 3px 8px; border-radius: 20px; font-weight: 500; }
-.badge.locked { background: var(--red-dim); color: var(--red); }
-.badge.unlocked { background: var(--green-dim); color: var(--green); }
-.section { padding: 8px 12px 4px; }
-.section-title { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); padding: 4px 4px 6px; }
-.vault-card { background: var(--card); border-radius: var(--radius); padding: 10px 12px; margin-bottom: 6px; border: 1px solid var(--border); cursor: pointer; transition: background 0.15s; }
-.vault-card:hover { background: var(--card-hover); }
-.vault-row { display: flex; align-items: center; justify-content: space-between; }
-.vault-name { font-weight: 600; font-size: 12px; display: flex; align-items: center; gap: 6px; }
-.vault-name .icon { font-size: 14px; }
-.vault-source { font-size: 10px; color: var(--text-muted); margin-top: 2px; font-family: 'SF Mono', Menlo, monospace; }
-.vault-status { font-size: 10px; padding: 2px 6px; border-radius: 4px; font-weight: 500; }
-.vault-status.mounted { background: var(--green-dim); color: var(--green); }
-.vault-status.locked { background: var(--red-dim); color: var(--red); }
-.vault-detail { display: none; }
-.vault-card.expanded .vault-detail { display: block; padding-top: 8px; margin-top: 8px; border-top: 1px solid var(--border); }
-.vault-actions { display: flex; gap: 4px; flex-wrap: wrap; }
-.vault-actions button { font-size: 10px; padding: 4px 10px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: transparent; color: var(--text-soft); cursor: pointer; transition: all 0.15s; font-family: inherit; }
-.vault-actions button:hover { background: var(--blue-dim); color: var(--blue); border-color: rgba(59, 130, 246, 0.3); }
-.vault-actions button.danger:hover { background: var(--red-dim); color: var(--red); border-color: rgba(239, 68, 68, 0.3); }
-.denial-card { background: var(--card); border-radius: var(--radius-sm); padding: 8px 10px; margin-bottom: 4px; border: 1px solid var(--border); font-size: 11px; display: flex; align-items: center; justify-content: space-between; }
-.denial-info { flex: 1; }
-.denial-proc { font-weight: 600; color: var(--orange); }
-.denial-file { font-size: 10px; color: var(--text-muted); font-family: 'SF Mono', Menlo, monospace; }
-.denial-time { font-size: 9px; color: var(--text-muted); white-space: nowrap; margin-left: 8px; }
-.denial-allow { font-size: 9px; padding: 2px 6px; border-radius: 4px; border: 1px solid rgba(34, 197, 94, 0.3); background: var(--green-dim); color: var(--green); cursor: pointer; margin-left: 6px; font-family: inherit; }
-.action-bar { display: flex; gap: 6px; padding: 8px 12px; border-top: 1px solid var(--border); }
-.action-bar button { flex: 1; padding: 8px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: var(--card); color: var(--text-soft); cursor: pointer; font-size: 11px; font-weight: 500; transition: all 0.15s; font-family: inherit; }
-.action-bar button:hover { background: var(--card-hover); color: var(--text); }
-.action-bar button.primary { background: var(--blue-dim); color: var(--blue); border-color: rgba(59, 130, 246, 0.25); }
-.action-bar button.primary:hover { background: rgba(59, 130, 246, 0.2); border-color: rgba(59, 130, 246, 0.4); }
-.footer { display: flex; align-items: center; justify-content: space-between; padding: 8px 16px; border-top: 1px solid var(--border); font-size: 10px; color: var(--text-muted); }
-@keyframes spin { to { transform: rotate(360deg); } }
-.spinning { animation: spin 1s linear infinite; display: inline-block; }
-.empty-state { text-align: center; padding: 20px 16px; }
-.empty-state .icon { font-size: 28px; margin-bottom: 8px; }
-.empty-state p { color: var(--text-muted); margin-bottom: 4px; font-size: 11px; }
-/* Toast notification (replaces browser alerts) */
-.toast { position: fixed; bottom: 40px; left: 50%; transform: translateX(-50%); background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px 16px; font-size: 11px; color: var(--green); opacity: 0; transition: opacity 0.3s; pointer-events: none; z-index: 100; white-space: nowrap; }
-.toast.show { opacity: 1; }
+.header-left { display: flex; align-items: center; gap: 8px; }
+.header-left svg { width: 20px; height: 20px; color: var(--accent); }
+.header-title { font-weight: 600; font-size: 14px; }
+.status-pill {
+    font-size: 11px; padding: 3px 10px; border-radius: 20px; font-weight: 500;
+    display: flex; align-items: center; gap: 4px;
+}
+.status-pill.locked { background: var(--red-bg); color: var(--red); }
+.status-pill.unlocked { background: var(--green-bg); color: var(--green); }
+.status-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+
+/* Tab bar */
+.tab-bar {
+    display: flex; padding: 0 12px; border-bottom: 1px solid var(--border);
+    background: var(--bg);
+}
+.tab {
+    flex: 1; padding: 10px 0; text-align: center; font-size: 11px; font-weight: 500;
+    color: var(--text-tertiary); cursor: pointer; border-bottom: 2px solid transparent;
+    transition: all 0.2s;
+}
+.tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+.tab:hover:not(.active) { color: var(--text-secondary); }
+
+/* Content area */
+.tab-content { display: none; max-height: 400px; overflow-y: auto; }
+.tab-content.active { display: block; }
+.content-section { padding: 10px 12px; }
+.section-label {
+    font-size: 11px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.5px; color: var(--text-tertiary); padding: 4px 4px 8px;
+}
+
+/* Cards */
+.card {
+    background: var(--surface); border-radius: var(--radius);
+    padding: 12px; margin-bottom: 8px;
+    border: 1px solid var(--border); box-shadow: var(--shadow);
+    cursor: pointer; transition: background 0.15s, transform 0.1s;
+}
+.card:hover { background: var(--surface-hover); }
+.card:active { transform: scale(0.99); }
+.card-row { display: flex; align-items: center; justify-content: space-between; }
+.card-title { font-weight: 600; font-size: 13px; display: flex; align-items: center; gap: 6px; }
+.card-subtitle { font-size: 11px; color: var(--text-secondary); margin-top: 2px; font-family: 'SF Mono', Menlo, monospace; }
+.badge-sm {
+    font-size: 10px; padding: 2px 8px; border-radius: 6px; font-weight: 500;
+}
+.badge-sm.active { background: var(--green-bg); color: var(--green); }
+.badge-sm.locked { background: var(--red-bg); color: var(--red); }
+
+/* Card detail (expandable) */
+.card-detail { display: none; padding-top: 10px; margin-top: 10px; border-top: 1px solid var(--border); }
+.card.expanded .card-detail { display: block; }
+
+/* Buttons */
+.btn-row { display: flex; gap: 6px; flex-wrap: wrap; }
+.btn {
+    font-size: 11px; padding: 6px 12px; border-radius: var(--radius-sm);
+    border: 1px solid var(--border); background: var(--surface);
+    color: var(--text-secondary); cursor: pointer; transition: all 0.15s;
+    font-family: inherit; font-weight: 500;
+}
+.btn:hover { background: var(--accent-bg); color: var(--accent); border-color: rgba(0,122,255,0.2); }
+.btn.danger:hover { background: var(--red-bg); color: var(--red); border-color: rgba(255,59,48,0.2); }
+.btn.primary {
+    background: var(--accent); color: white; border-color: var(--accent);
+}
+.btn.primary:hover { opacity: 0.9; }
+.btn-full { width: 100%; padding: 10px; font-size: 13px; margin-top: 8px; }
+
+/* Input row */
+.input-row { display: flex; gap: 6px; margin-top: 8px; }
+.input-row input, .form-input {
+    flex: 1; padding: 7px 10px; border-radius: var(--radius-sm);
+    border: 1px solid var(--border); background: var(--bg);
+    color: var(--text); font-size: 12px; font-family: 'SF Mono', Menlo, monospace;
+    outline: none; transition: border-color 0.15s;
+}
+.input-row input:focus, .form-input:focus { border-color: var(--accent); }
+
+/* Denial cards */
+.denial-card {
+    background: var(--surface); border-radius: var(--radius-sm);
+    padding: 10px 12px; margin-bottom: 6px;
+    border: 1px solid var(--border); box-shadow: var(--shadow);
+    display: flex; align-items: center; gap: 8px;
+}
+.denial-icon { color: var(--orange); font-size: 16px; flex-shrink: 0; }
+.denial-info { flex: 1; min-width: 0; }
+.denial-proc { font-weight: 600; font-size: 12px; color: var(--orange); }
+.denial-file { font-size: 10px; color: var(--text-tertiary); font-family: 'SF Mono', Menlo, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.denial-meta { text-align: right; flex-shrink: 0; }
+.denial-time { font-size: 10px; color: var(--text-tertiary); display: block; }
+.btn-allow-sm {
+    font-size: 10px; padding: 3px 8px; border-radius: 6px;
+    border: 1px solid rgba(52,199,89,0.3); background: var(--green-bg);
+    color: var(--green); cursor: pointer; font-family: inherit; margin-top: 4px;
+}
+
+/* Log entries */
+.log-entry {
+    padding: 8px 0; border-bottom: 1px solid var(--border);
+    font-size: 11px;
+}
+.log-entry:last-child { border-bottom: none; }
+.log-ts { color: var(--text-tertiary); font-family: 'SF Mono', Menlo, monospace; font-size: 10px; }
+.log-event { font-weight: 600; margin: 0 4px; }
+.log-event.allow { color: var(--green); }
+.log-event.deny { color: var(--red); }
+.log-event.unlock { color: var(--accent); }
+.log-event.lock { color: var(--orange); }
+.log-detail { color: var(--text-secondary); font-size: 10px; display: block; margin-top: 2px; }
+
+/* Settings */
+.setting-row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 12px 0; border-bottom: 1px solid var(--border);
+}
+.setting-row:last-child { border-bottom: none; }
+.setting-label { font-size: 13px; font-weight: 500; }
+.setting-desc { font-size: 11px; color: var(--text-secondary); margin-top: 2px; }
+.setting-value { font-size: 12px; color: var(--accent); font-weight: 500; }
+select.form-select {
+    padding: 5px 8px; border-radius: var(--radius-sm); border: 1px solid var(--border);
+    background: var(--surface); color: var(--text); font-size: 12px;
+    font-family: inherit; outline: none;
+}
+
+/* Empty state */
+.empty-state { text-align: center; padding: 32px 16px; }
+.empty-icon { font-size: 32px; margin-bottom: 8px; }
+.empty-text { color: var(--text-tertiary); font-size: 12px; line-height: 1.5; }
+
+/* Toast */
+.toast {
+    position: fixed; bottom: 12px; left: 50%; transform: translateX(-50%) translateY(20px);
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 8px 16px; font-size: 12px; font-weight: 500; color: var(--green);
+    box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+    opacity: 0; transition: all 0.3s ease; pointer-events: none; z-index: 1000;
+    backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
+}
+.toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
 .toast.error { color: var(--red); }
-/* Input row for inline allow/deny */
-.input-row { display: flex; gap: 4px; margin-top: 6px; }
-.input-row input { flex: 1; padding: 4px 8px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: rgba(0,0,0,0.3); color: var(--text); font-size: 10px; font-family: 'SF Mono', Menlo, monospace; outline: none; }
-.input-row input:focus { border-color: rgba(59, 130, 246, 0.5); }
-.input-row button { padding: 4px 8px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: var(--green-dim); color: var(--green); font-size: 10px; cursor: pointer; font-family: inherit; }
-/* Overlay panel */
-.panel-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.6); z-index: 200; }
-.panel-overlay.show { display: flex; align-items: center; justify-content: center; }
-.panel { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); width: 280px; max-height: 350px; overflow: hidden; }
-.panel-header { display: flex; justify-content: space-between; align-items: center; padding: 10px 12px; border-bottom: 1px solid var(--border); font-weight: 600; font-size: 12px; }
-.panel-body { padding: 10px 12px; font-size: 10px; color: var(--text-soft); white-space: pre-wrap; font-family: 'SF Mono', Menlo, monospace; overflow-y: auto; max-height: 280px; margin: 0; }
+
+/* Modal overlay */
+.modal-overlay {
+    display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(0,0,0,0.4); z-index: 500;
+    backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
+}
+.modal-overlay.show { display: flex; align-items: center; justify-content: center; }
+.modal {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 14px;
+    width: 290px; box-shadow: 0 8px 32px rgba(0,0,0,0.2); overflow: hidden;
+}
+.modal-header {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 14px 16px; border-bottom: 1px solid var(--border);
+}
+.modal-title { font-weight: 600; font-size: 14px; }
+.modal-close {
+    background: none; border: none; color: var(--text-tertiary);
+    cursor: pointer; font-size: 18px; padding: 0; line-height: 1;
+}
+.modal-body { padding: 16px; }
+.modal-body p { font-size: 12px; color: var(--text-secondary); margin-bottom: 12px; line-height: 1.4; }
+.modal-body pre {
+    font-size: 11px; color: var(--text-secondary); white-space: pre-wrap;
+    font-family: 'SF Mono', Menlo, monospace; max-height: 200px; overflow-y: auto;
+    background: var(--surface); padding: 10px; border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+}
+
+/* Footer */
+.footer {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 8px 16px; border-top: 1px solid var(--border);
+    font-size: 10px; color: var(--text-tertiary);
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+.spinning { animation: spin 0.8s linear infinite; display: inline-block; }
 </style>
 </head>
 <body>
 
 <div class="header">
-    <div class="logo">
+    <div class="header-left">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
             <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
         </svg>
-        onvault
+        <span class="header-title">onvault</span>
     </div>
-    <span class="badge locked" id="statusBadge">Locked</span>
-</div>
-
-<div id="vaultSection" class="section">
-    <div class="section-title">Vaults</div>
-    <div id="vaultList"></div>
-</div>
-
-<div id="denialSection" class="section" style="display:none">
-    <div class="section-title">Recent Denials</div>
-    <div id="denialList"></div>
-</div>
-
-<div id="addVaultPanel" style="display:none; padding: 8px 12px;">
-    <div class="section-title">Add Vault</div>
-    <div class="input-row">
-        <input placeholder="~/.ssh or /path/to/dir" id="addVaultInput">
-        <button onclick="doAddVault()">Protect</button>
+    <div class="status-pill locked" id="statusPill">
+        <span class="status-dot"></span>
+        <span id="statusText">Locked</span>
     </div>
 </div>
 
-<div class="action-bar">
-    <button class="primary" onclick="promptAddVault()">+ Add Vault</button>
-    <button onclick="viewPolicies()">Policies</button>
-    <button id="lockBtn" onclick="doLockUnlock()">Lock</button>
-    <button onclick="refresh()" id="refreshBtn">Refresh</button>
+<div class="tab-bar">
+    <div class="tab active" onclick="switchTab('vaults')" id="tab-vaults">Vaults</div>
+    <div class="tab" onclick="switchTab('policies')" id="tab-policies">Policies</div>
+    <div class="tab" onclick="switchTab('log')" id="tab-log">Log</div>
+    <div class="tab" onclick="switchTab('settings')" id="tab-settings">Settings</div>
+</div>
+
+<!-- Vaults Tab -->
+<div class="tab-content active" id="content-vaults">
+    <div class="content-section">
+        <div id="vaultList"></div>
+        <div id="denialSection" style="display:none">
+            <div class="section-label" style="margin-top:8px">Recent Denials</div>
+            <div id="denialList"></div>
+        </div>
+        <button class="btn btn-full primary" onclick="promptAddVault()">Add Vault</button>
+    </div>
+</div>
+
+<!-- Policies Tab -->
+<div class="tab-content" id="content-policies">
+    <div class="content-section">
+        <div id="policyList"></div>
+    </div>
+</div>
+
+<!-- Log Tab -->
+<div class="tab-content" id="content-log">
+    <div class="content-section">
+        <div class="btn-row" style="margin-bottom:10px">
+            <button class="btn" onclick="filterLog('all')" id="log-filter-all" style="background:var(--accent-bg);color:var(--accent)">All</button>
+            <button class="btn" onclick="filterLog('denied')" id="log-filter-denied">Denied</button>
+            <button class="btn" onclick="filterLog('allowed')" id="log-filter-allowed">Allowed</button>
+        </div>
+        <div id="logList"></div>
+    </div>
+</div>
+
+<!-- Settings Tab -->
+<div class="tab-content" id="content-settings">
+    <div class="content-section">
+        <div class="section-label">Security</div>
+        <div class="setting-row">
+            <div>
+                <div class="setting-label">Verification Mode</div>
+                <div class="setting-desc">How processes are verified</div>
+            </div>
+            <select class="form-select" id="verifyMode" onchange="toast('Restart daemon to apply',false)">
+                <option value="codesign_preferred">Codesign (preferred)</option>
+                <option value="hash_only">Hash only</option>
+                <option value="codesign_required">Codesign (required)</option>
+            </select>
+        </div>
+        <div class="setting-row">
+            <div>
+                <div class="setting-label">Touch ID</div>
+                <div class="setting-desc">Unlock with biometrics</div>
+            </div>
+            <button class="btn" id="touchIdBtn" onclick="doTouchIdUnlock()">Unlock</button>
+        </div>
+
+        <div class="section-label" style="margin-top:12px">Recovery</div>
+        <div class="setting-row">
+            <div>
+                <div class="setting-label">Recovery Key</div>
+                <div class="setting-desc">View your emergency recovery key</div>
+            </div>
+            <button class="btn" onclick="showRecoveryPrompt()">View</button>
+        </div>
+        <div class="setting-row">
+            <div>
+                <div class="setting-label">Forgot Passphrase?</div>
+                <div class="setting-desc">Unlock using recovery key</div>
+            </div>
+            <button class="btn" onclick="showRecoverPrompt()">Recover</button>
+        </div>
+
+        <div class="section-label" style="margin-top:12px">Advanced</div>
+        <div class="setting-row">
+            <div>
+                <div class="setting-label">Rotate Keys</div>
+                <div class="setting-desc">Re-encrypt all vaults with new key</div>
+            </div>
+            <button class="btn danger" onclick="showRotatePrompt()">Rotate</button>
+        </div>
+        <div class="setting-row">
+            <div>
+                <div class="setting-label">Watch Mode</div>
+                <div class="setting-desc">Discover process access patterns</div>
+            </div>
+            <button class="btn" onclick="toast('Use CLI: onvault vault watch',false)">Start</button>
+        </div>
+    </div>
 </div>
 
 <div class="footer">
-    <span>onvault 0.1.0</span>
+    <span>onvault v0.1.0</span>
     <span id="lastUpdate"></span>
 </div>
 
 <div class="toast" id="toast"></div>
 
-<div class="panel-overlay" id="panelOverlay" onclick="hidePanel()">
-    <div class="panel" onclick="event.stopPropagation()">
-        <div class="panel-header">
-            <span id="panelTitle"></span>
-            <button onclick="hidePanel()" style="background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:14px">✕</button>
+<!-- Modal -->
+<div class="modal-overlay" id="modalOverlay" onclick="hideModal()">
+    <div class="modal" onclick="event.stopPropagation()">
+        <div class="modal-header">
+            <span class="modal-title" id="modalTitle"></span>
+            <button class="modal-close" onclick="hideModal()">&#10005;</button>
         </div>
-        <pre class="panel-body" id="panelBody"></pre>
-        <div id="panelAuth" style="display:none;padding:10px 12px;border-top:1px solid var(--border)">
-            <div class="input-row">
-                <input type="password" placeholder="Passphrase" id="panelPassInput">
-                <button id="panelAuthBtn" onclick="panelAuthSubmit()">Confirm</button>
-            </div>
-        </div>
+        <div class="modal-body" id="modalBody"></div>
     </div>
 </div>
 
 <script>
+/* ES5 only — no let/const/async/await/arrow functions/template literals */
 var API = window.location.origin;
-var data = { locked: true, vault_count: 0, vaults: [] };
+var state = { locked: true, vault_count: 0, vaults: [] };
 var denials = [];
+var logEntries = [];
+var logFilter = 'all';
 var expandedVaults = {};
-var pendingAuthAction = null;
 var authToken = null;
+var currentTab = 'vaults';
 var _refreshInterval = null;
 
+/* --- Utility --- */
 function esc(s) {
     if (!s) return '';
-    return String(s)
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&#39;');
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+        .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 
 function toast(msg, isError) {
     var t = document.getElementById('toast');
-    t.innerHTML = msg;
+    t.textContent = msg;
     t.className = 'toast show' + (isError ? ' error' : '');
     setTimeout(function() { t.className = 'toast'; }, 2500);
 }
 
+function timeAgo(ts) {
+    var s = Math.floor(Date.now() / 1000) - ts;
+    if (s < 60) return s + 's ago';
+    if (s < 3600) return Math.floor(s / 60) + 'm ago';
+    return Math.floor(s / 3600) + 'h ago';
+}
+
+function notifyResize() {
+    try { window.webkit.messageHandlers.resize.postMessage(document.body.scrollHeight); } catch(e) {}
+}
+
+/* --- API helpers --- */
 function fetchJSON(path) {
     return fetch(API + path).then(function(r) {
         return r.json().then(function(j) {
-            if (r.status === 401 || (j && !j.ok && j.msg && j.msg.indexOf('Unauthorized') >= 0)) {
-                authToken = null;
-            }
-            if (r.status === 401) throw j;
+            if (r.status === 401) { authToken = null; throw j; }
             return j;
         });
     });
@@ -195,10 +428,7 @@ function fetchJSON(path) {
 function fetchText(path) {
     return fetch(API + path).then(function(r) {
         return r.text().then(function(text) {
-            if (r.status === 401) {
-                authToken = null;
-                throw { ok: false, msg: text || 'Unauthorized' };
-            }
+            if (r.status === 401) { authToken = null; throw { ok: false, msg: 'Unauthorized' }; }
             return text;
         });
     });
@@ -209,230 +439,438 @@ function postAPI(path, body) {
     if (authToken) headers['Authorization'] = 'Bearer ' + authToken;
     return fetch(API + path, { method: 'POST', body: body, headers: headers }).then(function(r) {
         return r.json().then(function(j) {
-            if (r.status === 401 || (j && !j.ok && j.msg && j.msg.indexOf('Unauthorized') >= 0)) {
-                authToken = null;
-            }
+            if (r.status === 401) authToken = null;
             j._status = r.status;
             return j;
         });
     });
 }
 
+function tokenParam() {
+    return authToken ? '?token=' + encodeURIComponent(authToken) : '';
+}
+
+/* --- Data fetching --- */
 function fetchData() {
-    var tokenParam = authToken ? '?token=' + encodeURIComponent(authToken) : '';
+    var tp = tokenParam();
     return Promise.all([
-        fetchJSON('/api/status' + tokenParam),
-        fetchJSON('/api/denials' + tokenParam)
+        fetchJSON('/api/status' + tp),
+        fetchJSON('/api/denials' + tp)
     ]).then(function(results) {
-        data = results[0];
+        state = results[0];
         denials = results[1];
         render();
-    }).catch(function(err) {
-        if (err && err.msg && err.msg.indexOf('Unauthorized') >= 0) authToken = null;
-        data = { locked: true, vault_count: 0, vaults: [] };
+    }).catch(function() {
+        state = { locked: true, vault_count: 0, vaults: [] };
         denials = [];
         render();
     });
 }
 
-function timeAgo(ts) {
-    var s = Math.floor(Date.now() / 1000) - ts;
-    if (s < 60) return s + 's';
-    if (s < 3600) return Math.floor(s / 60) + 'm';
-    return Math.floor(s / 3600) + 'h';
+function fetchLog() {
+    fetchText('/api/log' + tokenParam()).then(function(text) {
+        try { logEntries = JSON.parse(text); } catch(e) { logEntries = []; }
+        renderLog();
+    }).catch(function() { logEntries = []; renderLog(); });
 }
 
-function render() {
-    var badge = document.getElementById('statusBadge');
-    badge.className = 'badge ' + (data.locked ? 'locked' : 'unlocked');
-    badge.textContent = data.locked ? 'Locked' : data.vault_count + ' vault(s)';
+function fetchPolicies() {
+    fetchText('/api/policies' + tokenParam()).then(function(text) {
+        renderPolicies(text);
+    }).catch(function() { renderPolicies('Locked or unavailable'); });
+}
 
-    var vl = document.getElementById('vaultList');
-    if (data.vaults.length === 0) {
-        vl.innerHTML = '<div class="empty-state"><div class="icon">' + (data.locked ? '🔒' : '🛡️') + '</div>' +
-            '<p>' + (data.locked ? 'Locked — click Unlock below.' : 'No vaults yet. Click + Add Vault.') + '</p></div>';
-    } else {
-        vl.innerHTML = data.vaults.map(function(v) {
-            var exp = expandedVaults[v.id] ? ' expanded' : '';
-            var vidArg = encodeURIComponent(v.id);
-            return '<div class="vault-card' + exp + '" onclick="toggle(decodeURIComponent(\'' + vidArg + '\'))">' +
-                '<div class="vault-row"><div class="vault-name"><span class="icon">' +
-                (v.mounted ? '🔓' : '🔒') + '</span>' + esc(v.id) + '</div>' +
-                '<span class="vault-status ' + (v.mounted ? 'mounted' : 'locked') + '">' +
-                (v.mounted ? 'Active' : 'Locked') + '</span></div>' +
-                '<div class="vault-source">' + esc(v.source) + '</div>' +
-                '<div class="vault-detail">' +
-                '<div class="vault-actions">' +
-                '<button onclick="event.stopPropagation();viewRules(decodeURIComponent(\'' + vidArg + '\'))">Rules</button>' +
-                '<button onclick="event.stopPropagation();showInput(\'allow\',decodeURIComponent(\'' + vidArg + '\'))">Allow</button>' +
-                '<button onclick="event.stopPropagation();showInput(\'deny\',decodeURIComponent(\'' + vidArg + '\'))">Deny</button>' +
-                '<button class="danger" onclick="event.stopPropagation();toast(\'Use CLI: onvault vault remove ' + esc(v.id) + '\')">Remove</button>' +
-                '</div>' +
-                '<div class="input-row" id="allow-' + v.id + '" style="display:none">' +
-                '<input placeholder="/usr/bin/process" id="allow-input-' + v.id + '">' +
-                '<button onclick="event.stopPropagation();doRule(\'allow\',decodeURIComponent(\'' + vidArg + '\'))">Allow</button>' +
-                '</div>' +
-                '<div class="input-row" id="deny-' + v.id + '" style="display:none">' +
-                '<input placeholder="/usr/bin/process" id="deny-input-' + v.id + '">' +
-                '<button onclick="event.stopPropagation();doRule(\'deny\',decodeURIComponent(\'' + vidArg + '\'))">Deny</button>' +
-                '</div></div>';
-        }).join('');
+/* --- Tab switching --- */
+function switchTab(name) {
+    currentTab = name;
+    var tabs = document.querySelectorAll('.tab');
+    var contents = document.querySelectorAll('.tab-content');
+    for (var i = 0; i < tabs.length; i++) {
+        tabs[i].className = 'tab' + (tabs[i].id === 'tab-' + name ? ' active' : '');
     }
+    for (var j = 0; j < contents.length; j++) {
+        contents[j].className = 'tab-content' + (contents[j].id === 'content-' + name ? ' active' : '');
+    }
+    if (name === 'log') fetchLog();
+    if (name === 'policies') fetchPolicies();
+    notifyResize();
+}
 
-    var ds = document.getElementById('denialSection');
-    var dl = document.getElementById('denialList');
-    if (denials.length > 0) {
-        ds.style.display = 'block';
-        dl.innerHTML = denials.slice(-5).reverse().map(function(d) {
-            var pathArg = encodeURIComponent(d.path || '');
-            var vaultArg = encodeURIComponent(d.vault || '');
-            return '<div class="denial-card"><div class="denial-info">' +
-                '<span class="denial-proc">' + esc(d.process) + '</span> \u2192 ' + esc(d.vault) +
-                '<div class="denial-file">' + esc(d.file) + '</div></div>' +
-                '<span class="denial-time">' + timeAgo(d.time) + '</span>' +
-                '<button class="denial-allow" onclick="quickAllow(decodeURIComponent(\'' + pathArg + '\'),decodeURIComponent(\'' + vaultArg + '\'))">Allow</button></div>';
-        }).join('');
-    } else { ds.style.display = 'none'; }
+/* --- Rendering --- */
+function render() {
+    /* Status pill */
+    var pill = document.getElementById('statusPill');
+    pill.className = 'status-pill ' + (state.locked ? 'locked' : 'unlocked');
+    document.getElementById('statusText').textContent = state.locked ? 'Locked' : state.vault_count + ' vault' + (state.vault_count !== 1 ? 's' : '');
 
-    var lockBtn = document.getElementById('lockBtn');
-    if (lockBtn) lockBtn.textContent = data.locked ? 'Unlock' : 'Lock';
-
+    renderVaults();
+    renderDenials();
     document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
     notifyResize();
 }
 
-function toggle(id) {
-    expandedVaults[id] = !expandedVaults[id];
-    render();
+function renderVaults() {
+    var vl = document.getElementById('vaultList');
+    if (state.locked) {
+        vl.innerHTML = '<div class="empty-state"><div class="empty-icon">&#x1F512;</div>' +
+            '<div class="empty-text">Locked<br>Click the status pill or use Settings to unlock.</div></div>';
+        return;
+    }
+    if (!state.vaults || state.vaults.length === 0) {
+        vl.innerHTML = '<div class="empty-state"><div class="empty-icon">&#x1F6E1;</div>' +
+            '<div class="empty-text">No vaults yet<br>Add a directory to protect it.</div></div>';
+        return;
+    }
+    vl.innerHTML = state.vaults.map(function(v) {
+        var exp = expandedVaults[v.id] ? ' expanded' : '';
+        var vid = encodeURIComponent(v.id);
+        return '<div class="card' + exp + '" onclick="toggleVault(\'' + vid + '\')">' +
+            '<div class="card-row"><div class="card-title">' +
+            (v.mounted ? '&#x1F513;' : '&#x1F512;') + ' ' + esc(v.id) + '</div>' +
+            '<span class="badge-sm ' + (v.mounted ? 'active' : 'locked') + '">' +
+            (v.mounted ? 'Mounted' : 'Locked') + '</span></div>' +
+            '<div class="card-subtitle">' + esc(v.source) + '</div>' +
+            '<div class="card-detail">' +
+            '<div class="btn-row">' +
+            '<button class="btn" onclick="event.stopPropagation();viewRules(\'' + vid + '\')">Rules</button>' +
+            '<button class="btn" onclick="event.stopPropagation();promptRule(\'allow\',\'' + vid + '\')">Allow</button>' +
+            '<button class="btn" onclick="event.stopPropagation();promptRule(\'deny\',\'' + vid + '\')">Deny</button>' +
+            '<button class="btn danger" onclick="event.stopPropagation();promptRemoveVault(\'' + vid + '\')">Remove</button>' +
+            '</div></div></div>';
+    }).join('');
 }
 
-function showInput(type, id) {
-    var el = document.getElementById(type + '-' + id);
-    var other = type === 'allow' ? 'deny' : 'allow';
-    el.style.display = el.style.display === 'none' ? 'flex' : 'none';
-    document.getElementById(other + '-' + id).style.display = 'none';
+function renderDenials() {
+    var ds = document.getElementById('denialSection');
+    var dl = document.getElementById('denialList');
+    if (!denials || denials.length === 0) { ds.style.display = 'none'; return; }
+    ds.style.display = 'block';
+    dl.innerHTML = denials.slice(-5).reverse().map(function(d) {
+        var pa = encodeURIComponent(d.path || '');
+        var va = encodeURIComponent(d.vault || '');
+        return '<div class="denial-card">' +
+            '<div class="denial-icon">&#x26A0;</div>' +
+            '<div class="denial-info"><span class="denial-proc">' + esc(d.process) + '</span>' +
+            '<div class="denial-file">' + esc(d.file) + '</div></div>' +
+            '<div class="denial-meta"><span class="denial-time">' + timeAgo(d.time) + '</span>' +
+            '<button class="btn-allow-sm" onclick="promptQuickAllow(\'' + pa + '\',\'' + va + '\')">Allow</button></div></div>';
+    }).join('');
 }
 
-function doRule(type, id) {
-    var input = document.getElementById(type + '-input-' + id);
-    var proc = input.value.trim();
-    if (!proc) return;
-    input.value = '';
-    document.getElementById(type + '-' + id).style.display = 'none';
-    postAPI('/api/' + type, proc + '\n' + id).then(function(j) {
-        toast(esc(j.msg), !j.ok);
-        fetchData();
-    }).catch(function() { toast('Failed', true); });
-}
-
-function promptAddVault() {
-    var panel = document.getElementById('addVaultPanel');
-    panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
-    if (panel.style.display === 'block') document.getElementById('addVaultInput').focus();
+function renderPolicies(text) {
+    var el = document.getElementById('policyList');
+    if (!text || text.indexOf('Locked') >= 0) {
+        el.innerHTML = '<div class="empty-state"><div class="empty-icon">&#x1F4CB;</div>' +
+            '<div class="empty-text">Unlock to view policies</div></div>';
+    } else {
+        el.innerHTML = '<pre style="font-size:11px;color:var(--text-secondary);white-space:pre-wrap;' +
+            'font-family:SF Mono,Menlo,monospace;background:var(--surface);padding:12px;' +
+            'border-radius:var(--radius);border:1px solid var(--border)">' + esc(text) + '</pre>';
+    }
     notifyResize();
 }
 
+function renderLog() {
+    var el = document.getElementById('logList');
+    if (!logEntries || logEntries.length === 0) {
+        el.innerHTML = '<div class="empty-state"><div class="empty-icon">&#x1F4DD;</div>' +
+            '<div class="empty-text">No log entries</div></div>';
+        notifyResize();
+        return;
+    }
+    var filtered = logEntries;
+    if (logFilter === 'denied') {
+        filtered = logEntries.filter(function(e) { return e.event && e.event.toLowerCase().indexOf('deny') >= 0; });
+    } else if (logFilter === 'allowed') {
+        filtered = logEntries.filter(function(e) { return e.event && e.event.toLowerCase().indexOf('allow') >= 0; });
+    }
+    el.innerHTML = filtered.slice(-30).reverse().map(function(e) {
+        var evClass = '';
+        var ev = (e.event || '').toLowerCase();
+        if (ev.indexOf('allow') >= 0) evClass = ' allow';
+        else if (ev.indexOf('deny') >= 0) evClass = ' deny';
+        else if (ev.indexOf('unlock') >= 0) evClass = ' unlock';
+        else if (ev.indexOf('lock') >= 0) evClass = ' lock';
+        var ts = e.ts ? new Date(e.ts * 1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'}) : '';
+        return '<div class="log-entry"><span class="log-ts">' + ts + '</span>' +
+            '<span class="log-event' + evClass + '">' + esc(e.event) + '</span>' +
+            (e.vault ? ' ' + esc(e.vault) : '') +
+            (e.detail ? '<span class="log-detail">' + esc(e.detail) + '</span>' : '') +
+            '</div>';
+    }).join('');
+    notifyResize();
+}
+
+function filterLog(f) {
+    logFilter = f;
+    var filters = ['all', 'denied', 'allowed'];
+    filters.forEach(function(name) {
+        var btn = document.getElementById('log-filter-' + name);
+        if (btn) {
+            btn.style.background = (name === f) ? 'var(--accent-bg)' : '';
+            btn.style.color = (name === f) ? 'var(--accent)' : '';
+        }
+    });
+    renderLog();
+}
+
+/* --- Interactions --- */
+function toggleVault(vid) {
+    var id = decodeURIComponent(vid);
+    expandedVaults[id] = !expandedVaults[id];
+    renderVaults();
+    notifyResize();
+}
+
+function viewRules(vid) {
+    var id = decodeURIComponent(vid);
+    fetchText('/api/rules?vault=' + encodeURIComponent(id) + (authToken ? '&token=' + encodeURIComponent(authToken) : '')).then(function(text) {
+        showModal('Rules: ' + id, '<pre>' + esc(text) + '</pre>');
+    }).catch(function() { toast('Failed to load rules', true); });
+}
+
+/* --- Auth-gated actions with passphrase modal --- */
+function showPassphraseModal(title, desc, callback) {
+    var tp = tokenParam().replace('?','&');
+    fetchJSON('/api/auth-status' + tokenParam()).then(function(r) {
+        if (r && r.elevated) {
+            callback(null); /* elevated — no passphrase needed */
+        } else {
+            showModal(title, '<p>' + desc + '</p>' +
+                '<input type="password" class="form-input" id="modalPassInput" placeholder="Passphrase" ' +
+                'onkeydown="if(event.keyCode===13)document.getElementById(\'modalPassBtn\').click()">' +
+                '<button class="btn primary btn-full" id="modalPassBtn" onclick="submitModalPass()">Confirm</button>');
+            window._pendingPassCallback = callback;
+            setTimeout(function() {
+                var inp = document.getElementById('modalPassInput');
+                if (inp) inp.focus();
+            }, 100);
+        }
+    }).catch(function() {
+        showModal(title, '<p>' + desc + '</p>' +
+            '<input type="password" class="form-input" id="modalPassInput" placeholder="Passphrase" ' +
+            'onkeydown="if(event.keyCode===13)document.getElementById(\'modalPassBtn\').click()">' +
+            '<button class="btn primary btn-full" id="modalPassBtn" onclick="submitModalPass()">Confirm</button>');
+        window._pendingPassCallback = callback;
+        setTimeout(function() {
+            var inp = document.getElementById('modalPassInput');
+            if (inp) inp.focus();
+        }, 100);
+    });
+}
+
+function submitModalPass() {
+    var inp = document.getElementById('modalPassInput');
+    var pass = inp ? inp.value : '';
+    if (!pass) return;
+    hideModal();
+    if (window._pendingPassCallback) {
+        window._pendingPassCallback(pass);
+        window._pendingPassCallback = null;
+    }
+}
+
+function promptRule(type, vid) {
+    var id = decodeURIComponent(vid);
+    showModal((type === 'allow' ? 'Allow' : 'Deny') + ' Process', '<p>Enter process path for <strong>' + esc(id) + '</strong></p>' +
+        '<input class="form-input" id="modalProcInput" placeholder="/usr/bin/process" ' +
+        'onkeydown="if(event.keyCode===13)document.getElementById(\'modalProcBtn\').click()">' +
+        '<button class="btn primary btn-full" id="modalProcBtn" onclick="doRuleFromModal(\'' +
+        encodeURIComponent(type) + '\',\'' + encodeURIComponent(id) + '\')">Confirm</button>');
+    setTimeout(function() {
+        var inp = document.getElementById('modalProcInput');
+        if (inp) inp.focus();
+    }, 100);
+}
+
+function doRuleFromModal(typeEnc, vidEnc) {
+    var type = decodeURIComponent(typeEnc);
+    var id = decodeURIComponent(vidEnc);
+    var procInput = document.getElementById('modalProcInput');
+    var proc = procInput ? procInput.value.trim() : '';
+    if (!proc) return;
+    hideModal();
+    showPassphraseModal(type === 'allow' ? 'Authorize Allow' : 'Authorize Deny',
+        'Enter passphrase to ' + type + ' <strong>' + esc(proc) + '</strong> for <strong>' + esc(id) + '</strong>.',
+        function(pass) {
+            var body = pass ? (pass + '\n' + proc + '\n' + id) : (proc + '\n' + id);
+            postAPI('/api/' + type, body).then(function(j) {
+                toast(j.msg || (type + ' applied'), !j.ok);
+                fetchData();
+            }).catch(function() { toast('Failed', true); });
+        });
+}
+
+function promptQuickAllow(pathEnc, vaultEnc) {
+    var proc = decodeURIComponent(pathEnc);
+    var vault = decodeURIComponent(vaultEnc);
+    showPassphraseModal('Authorize Allow', 'Allow <strong>' + esc(proc) + '</strong> for <strong>' + esc(vault) + '</strong>?', function(pass) {
+        var body = pass ? (pass + '\n' + proc + '\n' + vault) : (proc + '\n' + vault);
+        postAPI('/api/allow', body).then(function(j) {
+            toast(j.msg || 'Allowed', !j.ok);
+            fetchData();
+        }).catch(function() { toast('Failed', true); });
+    });
+}
+
+function promptRemoveVault(vid) {
+    var id = decodeURIComponent(vid);
+    showPassphraseModal('Remove Vault', 'This will decrypt and unprotect <strong>' + esc(id) + '</strong>. Enter passphrase to confirm.', function(pass) {
+        if (!pass) { toast('Passphrase required', true); return; }
+        postAPI('/api/vault/remove', pass + '\n' + id).then(function(j) {
+            toast(j.msg || 'Removed', !j.ok);
+            fetchData();
+        }).catch(function() { toast('Use CLI: onvault vault remove ' + id, true); });
+    });
+}
+
+function promptAddVault() {
+    showModal('Add Vault', '<p>Enter the path to protect:</p>' +
+        '<input class="form-input" id="modalAddInput" placeholder="~/.ssh or /path/to/dir" ' +
+        'onkeydown="if(event.keyCode===13)document.getElementById(\'modalAddBtn\').click()">' +
+        '<button class="btn primary btn-full" id="modalAddBtn" onclick="doAddVault()">Protect</button>');
+    setTimeout(function() {
+        var inp = document.getElementById('modalAddInput');
+        if (inp) inp.focus();
+    }, 100);
+}
+
 function doAddVault() {
-    var input = document.getElementById('addVaultInput');
-    var path = input.value.trim();
+    var inp = document.getElementById('modalAddInput');
+    var path = inp ? inp.value.trim() : '';
     if (!path) return;
-    input.value = '';
-    document.getElementById('addVaultPanel').style.display = 'none';
+    hideModal();
     postAPI('/api/vault/add', path).then(function(j) {
-        toast(esc(j.msg), !j.ok);
+        toast(j.msg || 'Vault added', !j.ok);
         fetchData();
     }).catch(function() { toast('Failed to add vault', true); });
 }
 
-function viewRules(id) {
-    var tokenParam = authToken ? '&token=' + encodeURIComponent(authToken) : '';
-    fetchText('/api/rules?vault=' + encodeURIComponent(id) + tokenParam).then(function(text) {
-        showPanel('Rules: ' + id, text);
-    }).catch(function(err) {
-        toast(esc(err && err.msg ? err.msg : 'Failed to load rules'), true);
-    });
-}
-
-function quickAllow(proc, vault) {
-    postAPI('/api/allow', proc + '\n' + vault).then(function(j) {
-        toast(esc(j.msg), !j.ok);
-        fetchData();
-    }).catch(function() { toast('Failed', true); });
-}
-
-function refresh() {
-    var btn = document.getElementById('refreshBtn');
-    btn.innerHTML = '<span class="spinning">\u21bb</span>';
-    fetchData().then(function() { btn.textContent = 'Refresh'; });
-}
+/* --- Lock/Unlock --- */
+document.getElementById('statusPill').onclick = function() { doLockUnlock(); };
 
 function doLockUnlock() {
-    if (data.locked) {
-        showPanel('Unlock', 'Enter your passphrase to unlock all vaults.');
-        pendingAuthAction = 'unlock';
+    if (state.locked) {
+        showModal('Unlock', '<p>Enter your passphrase to unlock all vaults.</p>' +
+            '<input type="password" class="form-input" id="modalUnlockInput" placeholder="Passphrase" ' +
+            'onkeydown="if(event.keyCode===13)document.getElementById(\'modalUnlockBtn\').click()">' +
+            '<button class="btn primary btn-full" id="modalUnlockBtn" onclick="doUnlock()">Unlock</button>');
+        setTimeout(function() {
+            var inp = document.getElementById('modalUnlockInput');
+            if (inp) inp.focus();
+        }, 100);
     } else {
-        showPanel('Lock All Vaults', 'Enter your passphrase to lock and unmount all vaults.');
-        pendingAuthAction = 'lock';
+        showPassphraseModal('Lock', 'Enter passphrase to lock and unmount all vaults.', function(pass) {
+            if (!pass) { toast('Passphrase required', true); return; }
+            postAPI('/api/lock', pass).then(function(j) {
+                if (j.ok) authToken = null;
+                toast(j.msg || 'Locked', !j.ok);
+                fetchData();
+            }).catch(function() { toast('Failed to lock', true); });
+        });
     }
-    document.getElementById('panelAuth').style.display = 'block';
-    document.getElementById('panelPassInput').value = '';
-    setTimeout(function() { document.getElementById('panelPassInput').focus(); }, 100);
 }
 
-function panelAuthSubmit() {
-    var pass = document.getElementById('panelPassInput').value;
+function doUnlock() {
+    var inp = document.getElementById('modalUnlockInput');
+    var pass = inp ? inp.value : '';
     if (!pass) return;
-    document.getElementById('panelPassInput').value = '';
-    var action = pendingAuthAction;
-    pendingAuthAction = null;
-
-    /* Show loading state */
-    document.getElementById('panelBody').textContent = 'Authenticating...';
-    document.getElementById('panelAuth').style.display = 'none';
-
-    postAPI('/api/' + action, pass).then(function(j) {
-        if (action === 'unlock' && j.ok && j.token) {
-            authToken = j.token;
-        }
-        if (action === 'lock' && j.ok) {
-            authToken = null;
-        }
-        toast(esc(j.msg), !j.ok);
-        hidePanel();
+    hideModal();
+    postAPI('/api/unlock', pass).then(function(j) {
+        if (j.ok && j.token) authToken = j.token;
+        toast(j.msg || (j.ok ? 'Unlocked' : 'Failed'), !j.ok);
         fetchData();
-    }).catch(function() {
-        toast('Failed — try again', true);
-        hidePanel();
+    }).catch(function() { toast('Failed to unlock', true); });
+}
+
+/* --- Touch ID --- */
+function doTouchIdUnlock() {
+    postAPI('/api/unlock-touchid', '').then(function(j) {
+        if (j.ok && j.token) authToken = j.token;
+        toast(j.msg || (j.ok ? 'Unlocked via Touch ID' : 'Touch ID failed'), !j.ok);
+        fetchData();
+    }).catch(function() { toast('Touch ID not available', true); });
+}
+
+/* --- Recovery --- */
+function showRecoveryPrompt() {
+    showPassphraseModal('View Recovery Key', 'Enter passphrase to view your recovery key.', function(pass) {
+        if (!pass) { toast('Passphrase required', true); return; }
+        postAPI('/api/export-recovery', pass).then(function(j) {
+            if (j.ok) {
+                showModal('Recovery Key', '<p>Store this key securely. You will need it if you forget your passphrase.</p>' +
+                    '<pre style="font-size:16px;text-align:center;letter-spacing:2px;padding:16px">' + esc(j.key) + '</pre>');
+            } else {
+                toast(j.msg || 'Failed', true);
+            }
+        }).catch(function() { toast('Failed', true); });
     });
 }
 
-function viewPolicies() {
-    var tokenParam = authToken ? '?token=' + encodeURIComponent(authToken) : '';
-    fetchText('/api/policies' + tokenParam).then(function(text) {
-        showPanel('All Policies', text);
-    }).catch(function(err) {
-        toast(esc(err && err.msg ? err.msg : 'Failed to load policies'), true);
+function showRecoverPrompt() {
+    showModal('Recovery Unlock', '<p>Enter your 24-character recovery key and a new passphrase.</p>' +
+        '<input class="form-input" id="modalRecKeyInput" placeholder="Recovery key (24 chars)" style="margin-bottom:8px">' +
+        '<input type="password" class="form-input" id="modalRecPassInput" placeholder="New passphrase" style="margin-bottom:8px">' +
+        '<input type="password" class="form-input" id="modalRecPass2Input" placeholder="Confirm new passphrase">' +
+        '<button class="btn primary btn-full" id="modalRecBtn" onclick="doRecover()">Recover</button>');
+    setTimeout(function() {
+        var inp = document.getElementById('modalRecKeyInput');
+        if (inp) inp.focus();
+    }, 100);
+}
+
+function doRecover() {
+    var key = (document.getElementById('modalRecKeyInput').value || '').trim();
+    var pass1 = document.getElementById('modalRecPassInput').value || '';
+    var pass2 = document.getElementById('modalRecPass2Input').value || '';
+    if (!key || !pass1) { toast('All fields required', true); return; }
+    if (pass1 !== pass2) { toast('Passphrases do not match', true); return; }
+    hideModal();
+    postAPI('/api/recover', key + '\n' + pass1).then(function(j) {
+        if (j.ok && j.token) authToken = j.token;
+        toast(j.msg || (j.ok ? 'Recovered successfully' : 'Failed'), !j.ok);
+        fetchData();
+    }).catch(function() { toast('Recovery failed', true); });
+}
+
+/* --- Key Rotation --- */
+function showRotatePrompt() {
+    showPassphraseModal('Rotate Keys', 'This will re-encrypt all vault files with a new master key. This may take a while for large vaults.', function(pass) {
+        if (!pass) { toast('Passphrase required', true); return; }
+        toast('Rotating keys...', false);
+        postAPI('/api/rotate-keys', pass).then(function(j) {
+            toast(j.msg || (j.ok ? 'Keys rotated' : 'Failed'), !j.ok);
+            fetchData();
+        }).catch(function() { toast('Rotation failed', true); });
     });
 }
 
-function showPanel(title, body) {
-    document.getElementById('panelTitle').textContent = title;
-    document.getElementById('panelBody').textContent = body || '';
-    document.getElementById('panelAuth').style.display = 'none';
-    document.getElementById('panelOverlay').className = 'panel-overlay show';
+/* --- Modal --- */
+function showModal(title, bodyHtml) {
+    document.getElementById('modalTitle').textContent = title;
+    document.getElementById('modalBody').innerHTML = bodyHtml;
+    document.getElementById('modalOverlay').className = 'modal-overlay show';
+    notifyResize();
 }
 
-function hidePanel() {
-    document.getElementById('panelOverlay').className = 'panel-overlay';
+function hideModal() {
+    document.getElementById('modalOverlay').className = 'modal-overlay';
+    window._pendingPassCallback = null;
+    notifyResize();
 }
 
-function notifyResize() {
-    try { window.webkit.messageHandlers.resize.postMessage(document.body.scrollHeight); } catch(e) {}
+/* --- Session refresh --- */
+function refreshSession() {
+    if (!authToken) return;
+    var tp = tokenParam();
+    fetch(API + '/api/session-refresh' + tp).catch(function() {});
 }
 
+/* --- Init --- */
 fetchData();
 if (_refreshInterval) clearInterval(_refreshInterval);
 _refreshInterval = setInterval(fetchData, 5000);
+setInterval(refreshSession, 600000); /* every 10 min */
 </script>
 </body>
 </html>

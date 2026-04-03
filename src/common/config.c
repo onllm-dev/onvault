@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <limits.h>
 
 int onvault_config_write(const char *path,
                           const onvault_key_t *config_key,
@@ -113,4 +114,80 @@ int onvault_config_read(const char *path,
         *data_len = cipher_len;
 
     return rc;
+}
+
+int onvault_defaults_parse(const char *filepath, onvault_defaults_t *out)
+{
+    if (!filepath || !out)
+        return ONVAULT_ERR_INVALID;
+
+    out->count = 0;
+
+    FILE *f = fopen(filepath, "r");
+    if (!f)
+        return ONVAULT_ERR_NOT_FOUND;
+
+    char line[ONVAULT_DEFAULTS_LINE_MAX + 2]; /* +2 for \n and \0 */
+    while (fgets(line, (int)sizeof(line), f)) {
+        size_t len = strlen(line);
+
+        /* Detect lines that exceed the maximum */
+        if (len == sizeof(line) - 1 && line[len - 1] != '\n') {
+            fclose(f);
+            return ONVAULT_ERR_INVALID;
+        }
+
+        /* Trim trailing whitespace / newline */
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r' ||
+                            line[len - 1] == ' '  || line[len - 1] == '\t')) {
+            line[--len] = '\0';
+        }
+
+        /* Skip empty lines and comments */
+        if (len == 0 || line[0] == '#')
+            continue;
+
+        /* Only extract list items: lines starting with "- " */
+        if (len >= 2 && line[0] == '-' && line[1] == ' ') {
+            const char *item = line + 2;
+            /* Skip leading whitespace after "- " */
+            while (*item == ' ' || *item == '\t')
+                item++;
+
+            if (*item == '\0')
+                continue; /* empty item */
+
+            if (out->count >= ONVAULT_DEFAULTS_MAX_PATHS) {
+                fclose(f);
+                return ONVAULT_ERR_INVALID;
+            }
+
+            /* Store path — truncate safely */
+            strncpy(out->paths[out->count], item, PATH_MAX - 1);
+            out->paths[out->count][PATH_MAX - 1] = '\0';
+            out->count++;
+        }
+        /* key: value lines are silently skipped */
+    }
+
+    fclose(f);
+    return ONVAULT_OK;
+}
+
+int onvault_defaults_load(const char *vault_type, onvault_defaults_t *out)
+{
+    if (!vault_type || !out)
+        return ONVAULT_ERR_INVALID;
+
+    char filepath[PATH_MAX];
+
+    /* Try relative to current working directory first */
+    snprintf(filepath, sizeof(filepath), "defaults/%s.yaml", vault_type);
+    if (onvault_defaults_parse(filepath, out) == ONVAULT_OK)
+        return ONVAULT_OK;
+
+    /* Fall back to system-wide install path */
+    snprintf(filepath, sizeof(filepath),
+             "/usr/local/share/onvault/defaults/%s.yaml", vault_type);
+    return onvault_defaults_parse(filepath, out);
 }

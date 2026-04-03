@@ -4,6 +4,7 @@
  */
 
 #include "auth.h"
+#include "touchid.h"
 #include "../common/crypto.h"
 #include "../common/argon2_kdf.h"
 #include "../common/memwipe.h"
@@ -257,6 +258,9 @@ int onvault_auth_init(const char *passphrase, char *recovery_key_out)
 
     /* Generate recovery key */
     generate_recovery_key(recovery_key_out);
+
+    /* Store recovery key hash so we can verify it during recovery unlock */
+    onvault_auth_store_recovery_hash(recovery_key_out, &config_key);
 
     /* Clean up sensitive material */
     onvault_key_wipe(&master_key, sizeof(master_key));
@@ -545,4 +549,396 @@ int onvault_auth_is_initialized(void)
         return 0;
 
     return onvault_keystore_has_master_key();
+}
+
+int onvault_auth_refresh_session(const onvault_key_t *master_key)
+{
+    if (!master_key)
+        return ONVAULT_ERR_INVALID;
+
+    char data_dir[PATH_MAX];
+    if (onvault_get_data_dir(data_dir) != ONVAULT_OK)
+        return ONVAULT_ERR_IO;
+
+    /* Verify current session is still valid */
+    char session_path[PATH_MAX];
+    snprintf(session_path, PATH_MAX, "%s/session", data_dir);
+
+    uint8_t old_blob[ONVAULT_SESSION_FILE_SIZE];
+    size_t len = sizeof(old_blob);
+    if (read_file(session_path, old_blob, &len) != ONVAULT_OK || len != sizeof(old_blob))
+        return ONVAULT_ERR_AUTH;
+
+    /* Verify HMAC of old session */
+    uint8_t expected_mac[ONVAULT_HASH_SIZE];
+    int rc = onvault_hmac_sha256(master_key->data, ONVAULT_KEY_SIZE,
+                                  old_blob, ONVAULT_SESSION_DATA_SIZE,
+                                  expected_mac);
+    if (rc != ONVAULT_OK) {
+        onvault_memzero(old_blob, sizeof(old_blob));
+        onvault_memzero(expected_mac, sizeof(expected_mac));
+        return rc;
+    }
+    if (!onvault_constant_time_eq(expected_mac, old_blob + ONVAULT_SESSION_DATA_SIZE,
+                                   ONVAULT_HASH_SIZE)) {
+        onvault_memzero(old_blob, sizeof(old_blob));
+        onvault_memzero(expected_mac, sizeof(expected_mac));
+        return ONVAULT_ERR_AUTH;
+    }
+    onvault_memzero(expected_mac, sizeof(expected_mac));
+
+    /* Check not expired */
+    uint64_t old_expiry;
+    memcpy(&old_expiry, old_blob + ONVAULT_TOKEN_SIZE, sizeof(old_expiry));
+    onvault_memzero(old_blob, sizeof(old_blob));
+    if ((uint64_t)time(NULL) > old_expiry)
+        return ONVAULT_ERR_AUTH;
+
+    /* Generate fresh session token */
+    uint8_t token_data[ONVAULT_SESSION_DATA_SIZE];
+    uint8_t session_blob[ONVAULT_SESSION_FILE_SIZE];
+    uint64_t new_expiry = (uint64_t)time(NULL) + (uint64_t)ONVAULT_TOKEN_TTL;
+
+    rc = onvault_random_bytes(token_data, ONVAULT_TOKEN_SIZE);
+    if (rc != ONVAULT_OK)
+        return rc;
+    memcpy(token_data + ONVAULT_TOKEN_SIZE, &new_expiry, sizeof(new_expiry));
+    memcpy(session_blob, token_data, sizeof(token_data));
+
+    rc = onvault_hmac_sha256(master_key->data, ONVAULT_KEY_SIZE,
+                              token_data, sizeof(token_data),
+                              session_blob + sizeof(token_data));
+    onvault_memzero(token_data, sizeof(token_data));
+    if (rc != ONVAULT_OK) {
+        onvault_memzero(session_blob, sizeof(session_blob));
+        return rc;
+    }
+
+    rc = write_file(session_path, session_blob, sizeof(session_blob));
+    onvault_memzero(session_blob, sizeof(session_blob));
+    return rc;
+}
+
+int onvault_auth_unlock_touchid(onvault_key_t *master_key_out)
+{
+    if (!master_key_out)
+        return ONVAULT_ERR_INVALID;
+
+    if (!onvault_touchid_available())
+        return ONVAULT_ERR_NOT_FOUND;
+
+    if (onvault_touchid_authenticate("Unlock onvault") != 0)
+        return ONVAULT_ERR_AUTH;
+
+    /* Touch ID success grants Keychain access — load master key */
+    onvault_mlock(master_key_out, sizeof(*master_key_out));
+    int rc = onvault_keystore_load_master_key(master_key_out);
+    if (rc != ONVAULT_OK) {
+        onvault_key_wipe(master_key_out, sizeof(*master_key_out));
+        return rc;
+    }
+
+    /* Create session token */
+    char data_dir[PATH_MAX];
+    if (onvault_get_data_dir(data_dir) != ONVAULT_OK) {
+        onvault_key_wipe(master_key_out, sizeof(*master_key_out));
+        return ONVAULT_ERR_IO;
+    }
+
+    uint8_t token_data[ONVAULT_SESSION_DATA_SIZE];
+    uint8_t session_blob[ONVAULT_SESSION_FILE_SIZE];
+    uint64_t expiry = (uint64_t)time(NULL) + (uint64_t)ONVAULT_TOKEN_TTL;
+
+    rc = onvault_random_bytes(token_data, ONVAULT_TOKEN_SIZE);
+    if (rc != ONVAULT_OK) {
+        onvault_key_wipe(master_key_out, sizeof(*master_key_out));
+        return rc;
+    }
+    memcpy(token_data + ONVAULT_TOKEN_SIZE, &expiry, sizeof(expiry));
+    memcpy(session_blob, token_data, sizeof(token_data));
+
+    rc = onvault_hmac_sha256(master_key_out->data, ONVAULT_KEY_SIZE,
+                              token_data, sizeof(token_data),
+                              session_blob + sizeof(token_data));
+    onvault_memzero(token_data, sizeof(token_data));
+    if (rc != ONVAULT_OK) {
+        onvault_memzero(session_blob, sizeof(session_blob));
+        onvault_key_wipe(master_key_out, sizeof(*master_key_out));
+        return rc;
+    }
+
+    char session_path[PATH_MAX];
+    snprintf(session_path, PATH_MAX, "%s/session", data_dir);
+    rc = write_file(session_path, session_blob, sizeof(session_blob));
+    onvault_memzero(session_blob, sizeof(session_blob));
+    if (rc != ONVAULT_OK) {
+        onvault_key_wipe(master_key_out, sizeof(*master_key_out));
+        return rc;
+    }
+
+    return ONVAULT_OK;
+}
+
+int onvault_auth_store_recovery_hash(const char *recovery_key,
+                                      const onvault_key_t *config_key)
+{
+    if (!recovery_key || !config_key)
+        return ONVAULT_ERR_INVALID;
+
+    char data_dir[PATH_MAX];
+    if (onvault_get_data_dir(data_dir) != ONVAULT_OK)
+        return ONVAULT_ERR_IO;
+
+    /* Compute SHA-256 of the recovery key string */
+    onvault_hash_t rec_hash;
+    onvault_sha256((const uint8_t *)recovery_key, strlen(recovery_key), &rec_hash);
+
+    /* Encrypt hash with config key: [iv(12)][tag(16)][ciphertext(32)] */
+    uint8_t encrypted[ONVAULT_KEY_SIZE];
+    uint8_t tag[ONVAULT_GCM_TAG_SIZE];
+    uint8_t iv[ONVAULT_GCM_IV_SIZE];
+
+    int rc = onvault_aes_gcm_encrypt(config_key, NULL, NULL, 0,
+                                      rec_hash.data, ONVAULT_HASH_SIZE,
+                                      encrypted, tag, iv);
+    onvault_memzero(&rec_hash, sizeof(rec_hash));
+    if (rc != ONVAULT_OK) {
+        onvault_memzero(encrypted, sizeof(encrypted));
+        onvault_memzero(tag, sizeof(tag));
+        onvault_memzero(iv, sizeof(iv));
+        return rc;
+    }
+
+    uint8_t blob[ONVAULT_GCM_IV_SIZE + ONVAULT_GCM_TAG_SIZE + ONVAULT_HASH_SIZE];
+    memcpy(blob, iv, ONVAULT_GCM_IV_SIZE);
+    memcpy(blob + ONVAULT_GCM_IV_SIZE, tag, ONVAULT_GCM_TAG_SIZE);
+    memcpy(blob + ONVAULT_GCM_IV_SIZE + ONVAULT_GCM_TAG_SIZE, encrypted, ONVAULT_KEY_SIZE);
+
+    onvault_memzero(encrypted, sizeof(encrypted));
+    onvault_memzero(tag, sizeof(tag));
+    onvault_memzero(iv, sizeof(iv));
+
+    char recovery_path[PATH_MAX];
+    snprintf(recovery_path, PATH_MAX, "%s/recovery.enc", data_dir);
+    rc = write_file(recovery_path, blob, sizeof(blob));
+    onvault_memzero(blob, sizeof(blob));
+    return rc;
+}
+
+int onvault_auth_unlock_recovery(const char *recovery_key,
+                                  const char *new_passphrase,
+                                  onvault_key_t *master_key_out)
+{
+    if (!recovery_key || !new_passphrase || !master_key_out)
+        return ONVAULT_ERR_INVALID;
+
+    char data_dir[PATH_MAX];
+    if (onvault_get_data_dir(data_dir) != ONVAULT_OK)
+        return ONVAULT_ERR_IO;
+
+    /* Load master key from keystore (requires Keychain to be accessible) */
+    onvault_key_t master_key;
+    onvault_mlock(&master_key, sizeof(master_key));
+    int rc = onvault_keystore_load_master_key(&master_key);
+    if (rc != ONVAULT_OK) {
+        onvault_key_wipe(&master_key, sizeof(master_key));
+        return rc;
+    }
+
+    /* Derive config key from master key to decrypt recovery.enc */
+    onvault_key_t config_key;
+    onvault_mlock(&config_key, sizeof(config_key));
+    rc = onvault_derive_config_key(&master_key, &config_key);
+    if (rc != ONVAULT_OK) {
+        onvault_key_wipe(&master_key, sizeof(master_key));
+        onvault_key_wipe(&config_key, sizeof(config_key));
+        return rc;
+    }
+
+    /* Read recovery.enc */
+    char recovery_path[PATH_MAX];
+    snprintf(recovery_path, PATH_MAX, "%s/recovery.enc", data_dir);
+
+    uint8_t blob[ONVAULT_GCM_IV_SIZE + ONVAULT_GCM_TAG_SIZE + ONVAULT_HASH_SIZE];
+    size_t blob_len = sizeof(blob);
+    rc = read_file(recovery_path, blob, &blob_len);
+    if (rc != ONVAULT_OK || blob_len != sizeof(blob)) {
+        onvault_key_wipe(&master_key, sizeof(master_key));
+        onvault_key_wipe(&config_key, sizeof(config_key));
+        onvault_memzero(blob, sizeof(blob));
+        return ONVAULT_ERR_NOT_FOUND;
+    }
+
+    /* Decrypt stored recovery hash */
+    uint8_t stored_hash[ONVAULT_HASH_SIZE];
+    rc = onvault_aes_gcm_decrypt(&config_key, blob,
+                                  NULL, 0,
+                                  blob + ONVAULT_GCM_IV_SIZE + ONVAULT_GCM_TAG_SIZE,
+                                  ONVAULT_HASH_SIZE,
+                                  stored_hash,
+                                  blob + ONVAULT_GCM_IV_SIZE);
+    onvault_key_wipe(&config_key, sizeof(config_key));
+    onvault_memzero(blob, sizeof(blob));
+    if (rc != ONVAULT_OK) {
+        onvault_key_wipe(&master_key, sizeof(master_key));
+        onvault_memzero(stored_hash, sizeof(stored_hash));
+        return ONVAULT_ERR_AUTH;
+    }
+
+    /* Compute SHA-256 of supplied recovery key and compare */
+    onvault_hash_t input_hash;
+    onvault_sha256((const uint8_t *)recovery_key, strlen(recovery_key), &input_hash);
+
+    int match = onvault_constant_time_eq(stored_hash, input_hash.data, ONVAULT_HASH_SIZE);
+    onvault_memzero(stored_hash, sizeof(stored_hash));
+    onvault_memzero(&input_hash, sizeof(input_hash));
+
+    if (!match) {
+        onvault_key_wipe(&master_key, sizeof(master_key));
+        return ONVAULT_ERR_AUTH;
+    }
+
+    /* Recovery key verified — re-initialize auth with new passphrase */
+
+    /* Generate new salt */
+    uint8_t new_salt[ONVAULT_SALT_SIZE];
+    rc = onvault_random_bytes(new_salt, ONVAULT_SALT_SIZE);
+    if (rc != ONVAULT_OK) {
+        onvault_key_wipe(&master_key, sizeof(master_key));
+        return rc;
+    }
+
+    char salt_path[PATH_MAX];
+    snprintf(salt_path, PATH_MAX, "%s/salt", data_dir);
+    rc = write_file(salt_path, new_salt, ONVAULT_SALT_SIZE);
+    if (rc != ONVAULT_OK) {
+        onvault_key_wipe(&master_key, sizeof(master_key));
+        onvault_memzero(new_salt, sizeof(new_salt));
+        return rc;
+    }
+
+    /* Derive new master key from new passphrase (master_key identity stays,
+     * but we re-wrap under the new passphrase-derived key and update auth.enc) */
+    onvault_key_t new_master_key;
+    onvault_mlock(&new_master_key, sizeof(new_master_key));
+    rc = onvault_argon2_derive(new_passphrase, new_salt, &new_master_key);
+    onvault_memzero(new_salt, sizeof(new_salt));
+    if (rc != ONVAULT_OK) {
+        onvault_key_wipe(&master_key, sizeof(master_key));
+        onvault_key_wipe(&new_master_key, sizeof(new_master_key));
+        return ONVAULT_ERR_CRYPTO;
+    }
+
+    /* Store new master key in keystore */
+    rc = onvault_keystore_store_master_key(&new_master_key);
+    if (rc != ONVAULT_OK) {
+        onvault_key_wipe(&master_key, sizeof(master_key));
+        onvault_key_wipe(&new_master_key, sizeof(new_master_key));
+        return rc;
+    }
+
+    /* Derive new config key and write new auth.enc */
+    onvault_key_t new_config_key;
+    onvault_mlock(&new_config_key, sizeof(new_config_key));
+    rc = onvault_derive_config_key(&new_master_key, &new_config_key);
+    if (rc != ONVAULT_OK) {
+        onvault_key_wipe(&master_key, sizeof(master_key));
+        onvault_key_wipe(&new_master_key, sizeof(new_master_key));
+        onvault_key_wipe(&new_config_key, sizeof(new_config_key));
+        return rc;
+    }
+
+    /* Read the new salt back for hash computation */
+    uint8_t salt_verify[ONVAULT_SALT_SIZE];
+    size_t salt_verify_len = ONVAULT_SALT_SIZE;
+    rc = read_file(salt_path, salt_verify, &salt_verify_len);
+    if (rc != ONVAULT_OK) {
+        onvault_key_wipe(&master_key, sizeof(master_key));
+        onvault_key_wipe(&new_master_key, sizeof(new_master_key));
+        onvault_key_wipe(&new_config_key, sizeof(new_config_key));
+        return rc;
+    }
+
+    uint8_t pass_hash[ONVAULT_KEY_SIZE];
+    onvault_argon2_hash(new_passphrase, salt_verify, pass_hash, ONVAULT_KEY_SIZE);
+    onvault_memzero(salt_verify, sizeof(salt_verify));
+
+    uint8_t enc_hash[ONVAULT_KEY_SIZE];
+    uint8_t auth_tag[ONVAULT_GCM_TAG_SIZE];
+    uint8_t auth_iv[ONVAULT_GCM_IV_SIZE];
+
+    rc = onvault_aes_gcm_encrypt(&new_config_key, NULL, NULL, 0,
+                                  pass_hash, ONVAULT_KEY_SIZE,
+                                  enc_hash, auth_tag, auth_iv);
+    onvault_memzero(pass_hash, sizeof(pass_hash));
+    if (rc != ONVAULT_OK) {
+        onvault_key_wipe(&master_key, sizeof(master_key));
+        onvault_key_wipe(&new_master_key, sizeof(new_master_key));
+        onvault_key_wipe(&new_config_key, sizeof(new_config_key));
+        onvault_memzero(enc_hash, sizeof(enc_hash));
+        return rc;
+    }
+
+    uint8_t auth_blob[ONVAULT_GCM_IV_SIZE + ONVAULT_GCM_TAG_SIZE + ONVAULT_KEY_SIZE];
+    memcpy(auth_blob, auth_iv, ONVAULT_GCM_IV_SIZE);
+    memcpy(auth_blob + ONVAULT_GCM_IV_SIZE, auth_tag, ONVAULT_GCM_TAG_SIZE);
+    memcpy(auth_blob + ONVAULT_GCM_IV_SIZE + ONVAULT_GCM_TAG_SIZE, enc_hash, ONVAULT_KEY_SIZE);
+    onvault_memzero(enc_hash, sizeof(enc_hash));
+    onvault_memzero(auth_tag, sizeof(auth_tag));
+    onvault_memzero(auth_iv, sizeof(auth_iv));
+
+    char auth_path[PATH_MAX];
+    snprintf(auth_path, PATH_MAX, "%s/auth.enc", data_dir);
+    rc = write_file(auth_path, auth_blob, sizeof(auth_blob));
+    onvault_memzero(auth_blob, sizeof(auth_blob));
+    if (rc != ONVAULT_OK) {
+        onvault_key_wipe(&master_key, sizeof(master_key));
+        onvault_key_wipe(&new_master_key, sizeof(new_master_key));
+        onvault_key_wipe(&new_config_key, sizeof(new_config_key));
+        return rc;
+    }
+
+    /* Update recovery.enc with the same recovery key under the new config key */
+    onvault_auth_store_recovery_hash(recovery_key, &new_config_key);
+    onvault_key_wipe(&new_config_key, sizeof(new_config_key));
+
+    /* Create session token for the new master key */
+    uint8_t token_data[ONVAULT_SESSION_DATA_SIZE];
+    uint8_t session_blob[ONVAULT_SESSION_FILE_SIZE];
+    uint64_t expiry = (uint64_t)time(NULL) + (uint64_t)ONVAULT_TOKEN_TTL;
+
+    rc = onvault_random_bytes(token_data, ONVAULT_TOKEN_SIZE);
+    if (rc != ONVAULT_OK) {
+        onvault_key_wipe(&master_key, sizeof(master_key));
+        onvault_key_wipe(&new_master_key, sizeof(new_master_key));
+        return rc;
+    }
+    memcpy(token_data + ONVAULT_TOKEN_SIZE, &expiry, sizeof(expiry));
+    memcpy(session_blob, token_data, sizeof(token_data));
+
+    rc = onvault_hmac_sha256(new_master_key.data, ONVAULT_KEY_SIZE,
+                              token_data, sizeof(token_data),
+                              session_blob + sizeof(token_data));
+    onvault_memzero(token_data, sizeof(token_data));
+    if (rc != ONVAULT_OK) {
+        onvault_memzero(session_blob, sizeof(session_blob));
+        onvault_key_wipe(&master_key, sizeof(master_key));
+        onvault_key_wipe(&new_master_key, sizeof(new_master_key));
+        return rc;
+    }
+
+    char session_path[PATH_MAX];
+    snprintf(session_path, PATH_MAX, "%s/session", data_dir);
+    rc = write_file(session_path, session_blob, sizeof(session_blob));
+    onvault_memzero(session_blob, sizeof(session_blob));
+    onvault_key_wipe(&master_key, sizeof(master_key));
+    if (rc != ONVAULT_OK) {
+        onvault_key_wipe(&new_master_key, sizeof(new_master_key));
+        return rc;
+    }
+
+    /* Return new master key to caller */
+    memcpy(master_key_out->data, new_master_key.data, ONVAULT_KEY_SIZE);
+    onvault_key_wipe(&new_master_key, sizeof(new_master_key));
+    return ONVAULT_OK;
 }

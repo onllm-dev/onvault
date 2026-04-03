@@ -90,4 +90,34 @@ int onvault_auth_is_initialized(void);
  */
 int onvault_get_data_dir(char *buf);
 
+/*
+ * Refresh an active session token.
+ * Validates current session, generates new token, extends TTL.
+ * Returns ONVAULT_OK on success, ONVAULT_ERR_AUTH if session expired/invalid.
+ */
+int onvault_auth_refresh_session(const onvault_key_t *master_key);
+
+/*
+ * Unlock using Touch ID biometrics.
+ * Requires prior passphrase unlock to have stored key in Keychain.
+ * Returns ONVAULT_OK + master key on success.
+ */
+int onvault_auth_unlock_touchid(onvault_key_t *master_key_out);
+
+/*
+ * Store a hash of the recovery key, encrypted with the config key.
+ * Called during init to enable later recovery.
+ */
+int onvault_auth_store_recovery_hash(const char *recovery_key,
+                                      const onvault_key_t *config_key);
+
+/*
+ * Unlock using recovery key and set a new passphrase.
+ * Verifies recovery key hash, re-wraps master key with new passphrase.
+ * Returns ONVAULT_OK + master key on success.
+ */
+int onvault_auth_unlock_recovery(const char *recovery_key,
+                                  const char *new_passphrase,
+                                  onvault_key_t *master_key_out);
+
 #endif /* ONVAULT_AUTH_H */

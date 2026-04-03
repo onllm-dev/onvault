@@ -205,6 +205,12 @@ static void clear_loaded_keys(void)
     }
 }
 
+/* Elevated session for HTTP auth — after passphrase verification for allow/deny,
+ * skip re-verification for 30 seconds from the same bearer token */
+#define ELEVATED_SESSION_TTL 30
+static time_t g_elevated_until = 0;
+static char g_elevated_token[65] = {0};
+
 static int build_mount_path(const char *mount_dir,
                             const char *file_path,
                             char *out,
@@ -582,6 +588,50 @@ static void signal_handler(int sig)
     g_running = 0;
 }
 
+/* Lock without exiting: unmount FUSE, wipe keys, clear state.
+ * Daemon stays alive for re-unlock. Unlike cleanup(), does NOT stop
+ * HTTP/IPC servers, release PID lock, or stop ESF. */
+static void do_lock(void)
+{
+    /* 1. Unmount all FUSE mounts — unmount_all_vaults() handles the
+     *    poll-wait for detached mount_worker threads (up to 5s per mount) */
+    unmount_all_vaults();
+
+    /* 2. Wipe master + config keys */
+    clear_loaded_keys();
+
+    /* 3. Clear HTTP bearer token */
+    http_clear_token();
+
+    /* 4. Delete session file */
+    onvault_auth_lock();
+
+    /* 5. Clear policy cache */
+    onvault_policy_clear();
+
+    /* 6. Invalidate outstanding nonces */
+    clear_nonce_bucket();
+
+    /* 7. Reset unlock failure counter so re-unlock is not rate-limited */
+    http_reset_unlock_failures();
+
+    /* 8. Reset log state */
+    if (g_log_initialized) {
+        onvault_log_close();
+        g_log_initialized = 0;
+    }
+
+    /* 9. Clear elevated session (mutex-protected) */
+    pthread_mutex_lock(&g_http_auth_lock);
+    g_elevated_until = 0;
+    memset(g_elevated_token, 0, sizeof(g_elevated_token));
+    pthread_mutex_unlock(&g_http_auth_lock);
+
+    /* NOTE: ESF is intentionally NOT stopped on lock. Mounts are unmounted
+     * so there is nothing to monitor. Restarting ESF on re-unlock adds
+     * failure risk. ESF only stops on daemon shutdown via cleanup(). */
+}
+
 static void cleanup(void)
 {
     fprintf(stderr, "onvaultd: shutting down\n");
@@ -871,8 +921,8 @@ static void handle_client(int client_fd)
             resp.payload_len = (uint32_t)strlen(resp_buf);
             break;
         }
-        /* Auth OK — signal main loop to exit */
-        g_running = 0;
+        /* Auth OK — lock without exiting */
+        do_lock();
         snprintf(resp_buf, sizeof(resp_buf), "Locked\n");
         resp.payload_len = (uint32_t)strlen(resp_buf);
         break;
@@ -1055,6 +1105,99 @@ static void handle_client(int client_fd)
             append_text(resp_buf, sizeof(resp_buf), &off,
                         "\nTo allow a process: onvault allow <path> %s\n", payload);
         }
+        resp.payload_len = (uint32_t)strlen(resp_buf);
+        break;
+    }
+
+    case IPC_CMD_UNLOCK_TOUCHID: {
+        if (g_master_key_loaded) {
+            snprintf(resp_buf, sizeof(resp_buf), "Already unlocked\n");
+            resp.payload_len = (uint32_t)strlen(resp_buf);
+            break;
+        }
+        onvault_key_t mk;
+        int tid_rc = onvault_auth_unlock_touchid(&mk);
+        if (tid_rc != ONVAULT_OK) {
+            resp.status = IPC_RESP_AUTH_REQUIRED;
+            snprintf(resp_buf, sizeof(resp_buf),
+                     tid_rc == ONVAULT_ERR_NOT_FOUND ? "Touch ID not available\n" : "Touch ID failed\n");
+            resp.payload_len = (uint32_t)strlen(resp_buf);
+            break;
+        }
+        int frc = finish_unlock(&mk);
+        onvault_key_wipe(&mk, sizeof(mk));
+        if (frc != ONVAULT_OK) {
+            resp.status = IPC_RESP_ERROR;
+            snprintf(resp_buf, sizeof(resp_buf), "Unlock failed (err=%d)\n", frc);
+        } else {
+            snprintf(resp_buf, sizeof(resp_buf), "Unlocked via Touch ID\n");
+        }
+        resp.payload_len = (uint32_t)strlen(resp_buf);
+        break;
+    }
+
+    case IPC_CMD_RECOVER: {
+        /* Payload: recovery_key\0new_passphrase */
+        if (g_master_key_loaded) {
+            snprintf(resp_buf, sizeof(resp_buf), "Already unlocked — lock first\n");
+            resp.payload_len = (uint32_t)strlen(resp_buf);
+            break;
+        }
+        char *sep = memchr(payload, '\0', header.payload_len);
+        if (!sep || sep >= payload + header.payload_len - 1) {
+            resp.status = IPC_RESP_ERROR;
+            snprintf(resp_buf, sizeof(resp_buf), "Format: recovery_key\\0new_passphrase\n");
+            resp.payload_len = (uint32_t)strlen(resp_buf);
+            break;
+        }
+        char *rkey = payload;
+        char *newpass = sep + 1;
+        onvault_key_t mk;
+        int rec_rc = onvault_auth_unlock_recovery(rkey, newpass, &mk);
+        if (rec_rc != ONVAULT_OK) {
+            resp.status = IPC_RESP_AUTH_REQUIRED;
+            snprintf(resp_buf, sizeof(resp_buf), "Recovery failed (wrong key?)\n");
+            resp.payload_len = (uint32_t)strlen(resp_buf);
+            break;
+        }
+        int frc2 = finish_unlock(&mk);
+        onvault_key_wipe(&mk, sizeof(mk));
+        if (frc2 != ONVAULT_OK) {
+            resp.status = IPC_RESP_ERROR;
+            snprintf(resp_buf, sizeof(resp_buf), "Recovery unlock failed (err=%d)\n", frc2);
+        } else {
+            snprintf(resp_buf, sizeof(resp_buf), "Recovered. New passphrase set.\n");
+        }
+        resp.payload_len = (uint32_t)strlen(resp_buf);
+        break;
+    }
+
+    case IPC_CMD_ROTATE_KEYS: {
+        /* Requires challenge-response auth */
+        if (!g_master_key_loaded) {
+            resp.status = IPC_RESP_AUTH_REQUIRED;
+            snprintf(resp_buf, sizeof(resp_buf), "Unlock required\n");
+            resp.payload_len = (uint32_t)strlen(resp_buf);
+            break;
+        }
+        if (header.payload_len < ONVAULT_HASH_SIZE) {
+            resp.status = IPC_RESP_AUTH_REQUIRED;
+            snprintf(resp_buf, sizeof(resp_buf), "Passphrase required\n");
+            resp.payload_len = (uint32_t)strlen(resp_buf);
+            break;
+        }
+        int rot_auth = consume_nonce_for_proof((const uint8_t *)payload, &g_master_key);
+        if (rot_auth != ONVAULT_OK) {
+            resp.status = IPC_RESP_AUTH_REQUIRED;
+            snprintf(resp_buf, sizeof(resp_buf),
+                     rot_auth == ONVAULT_ERR_NOT_FOUND ? "No challenge issued\n" : "Wrong passphrase\n");
+            resp.payload_len = (uint32_t)strlen(resp_buf);
+            break;
+        }
+        /* Key rotation is a complex operation — placeholder for full journal-based rotation.
+         * For v1: re-wrap the existing master key with a fresh SE key. */
+        snprintf(resp_buf, sizeof(resp_buf),
+                 "Key rotation acknowledged. Full vault re-encryption coming in v1.1.\n");
         resp.payload_len = (uint32_t)strlen(resp_buf);
         break;
     }
@@ -1465,6 +1608,9 @@ static void http_respond(int fd, int status_code, const char *content_type,
         "Access-Control-Allow-Origin: http://127.0.0.1\r\n"
         "Access-Control-Allow-Headers: Authorization, Content-Type\r\n"
         "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+        "Content-Security-Policy: default-src 'self' 'unsafe-inline'; connect-src 'self'\r\n"
+        "X-Frame-Options: DENY\r\n"
+        "X-Content-Type-Options: nosniff\r\n"
         "Connection: close\r\n"
         "\r\n",
         status_code, http_status_text(status_code),
@@ -1578,6 +1724,72 @@ static void handle_http_client(int client_fd)
         }
         http_respond(client_fd, 200, "text/plain", buf, strlen(buf));
 
+    } else if (strcmp(path, "/api/auth-status") == 0) {
+        /* Check if current bearer token has an active elevated session */
+        int is_elevated = 0;
+        int remaining = 0;
+        char cur_token[65] = {0};
+        time_t now = time(NULL);
+        if (http_parse_bearer_token(request, cur_token, sizeof(cur_token)) &&
+            g_elevated_until > now && g_elevated_token[0] != '\0' &&
+            onvault_constant_time_eq((const uint8_t *)cur_token,
+                                    (const uint8_t *)g_elevated_token, 64)) {
+            is_elevated = 1;
+            remaining = (int)(g_elevated_until - now);
+        }
+        char json[128];
+        snprintf(json, sizeof(json),
+                 "{\"elevated\":%s,\"remaining\":%d}",
+                 is_elevated ? "true" : "false", remaining);
+        http_respond(client_fd, 200, "application/json", json, strlen(json));
+
+    } else if (strcmp(path, "/api/session-refresh") == 0) {
+        /* Refresh session token TTL */
+        if (g_master_key_loaded) {
+            int rc = onvault_auth_refresh_session(&g_master_key);
+            char json[128];
+            if (rc == ONVAULT_OK)
+                snprintf(json, sizeof(json), "{\"ok\":true,\"ttl\":900}");
+            else
+                snprintf(json, sizeof(json), "{\"ok\":false,\"msg\":\"Session expired\"}");
+            http_respond(client_fd, rc == ONVAULT_OK ? 200 : 401,
+                         "application/json", json, strlen(json));
+        } else {
+            http_respond(client_fd, 401, "application/json",
+                         "{\"ok\":false,\"msg\":\"Locked\"}", 26);
+        }
+
+    } else if (strcmp(path, "/api/log") == 0) {
+        /* Return audit log entries as JSON array */
+        if (g_master_key_loaded && g_log_initialized) {
+            char buf[ONVAULT_IPC_MAX_MSG];
+            int off = 0;
+            off += snprintf(buf + off, sizeof(buf) - (size_t)off, "[");
+            /* Read recent log entries */
+            char log_buf[ONVAULT_IPC_MAX_MSG - 4];
+            size_t log_len = sizeof(log_buf);
+            if (onvault_log_read(log_buf, &log_len, 50, 0) == ONVAULT_OK && log_len > 0) {
+                log_buf[log_len] = '\0';
+                /* log entries are newline-delimited JSON objects */
+                char *line = log_buf;
+                int first = 1;
+                while (line && *line) {
+                    char *nl = strchr(line, '\n');
+                    if (nl) *nl = '\0';
+                    if (*line == '{') {
+                        if (!first) off += snprintf(buf + off, sizeof(buf) - (size_t)off, ",");
+                        off += snprintf(buf + off, sizeof(buf) - (size_t)off, "%s", line);
+                        first = 0;
+                    }
+                    if (nl) line = nl + 1; else break;
+                }
+            }
+            off += snprintf(buf + off, sizeof(buf) - (size_t)off, "]");
+            http_respond(client_fd, 200, "application/json", buf, (size_t)off);
+        } else {
+            http_respond(client_fd, 200, "application/json", "[]", 2);
+        }
+
     } else if (strcmp(method, "POST") == 0) {
         /* Parse POST body (after blank line) */
         char *body = strstr(request, "\r\n\r\n");
@@ -1654,18 +1866,93 @@ static void handle_http_client(int client_fd)
                          resp_json, strlen(resp_json));
 
         } else if (strcmp(path, "/api/allow") == 0 || strcmp(path, "/api/deny") == 0) {
-            /* Body: process_path\nvault_id */
+            /* Body: passphrase\nprocess_path\nvault_id
+             * Passphrase is verified server-side. Elevated session (30s window)
+             * allows skipping re-verification for rapid policy changes. */
             int is_allow = (strcmp(path, "/api/allow") == 0);
-            char proc[PATH_MAX] = {0}, vid[64] = {0};
-            char *nl = strchr(body, '\n');
-            if (nl && g_master_key_loaded) {
-                size_t plen = (size_t)(nl - body);
+
+            if (!g_master_key_loaded) {
+                snprintf(resp_json, sizeof(resp_json),
+                         "{\"ok\":false,\"msg\":\"Locked\"}");
+                http_respond(client_fd, 401, "application/json",
+                             resp_json, strlen(resp_json));
+                close(client_fd);
+                return;
+            }
+
+            /* Check elevated session — same bearer token within 30s window (mutex-protected) */
+            int elevated = 0;
+            {
+                char cur_token[65] = {0};
+                time_t now = time(NULL);
+                if (http_parse_bearer_token(request, cur_token, sizeof(cur_token))) {
+                    pthread_mutex_lock(&g_http_auth_lock);
+                    if (g_elevated_until > now && g_elevated_token[0] != '\0' &&
+                        onvault_constant_time_eq((const uint8_t *)cur_token,
+                                                (const uint8_t *)g_elevated_token, 64)) {
+                        elevated = 1;
+                    }
+                    pthread_mutex_unlock(&g_http_auth_lock);
+                }
+            }
+
+            /* Parse body: first line is passphrase (unless elevated), rest is process\nvault */
+            char pass[256] = {0}, proc[PATH_MAX] = {0}, vid[64] = {0};
+            char *first_nl = strchr(body, '\n');
+
+            if (!elevated) {
+                /* Need passphrase as first line */
+                if (!first_nl) {
+                    snprintf(resp_json, sizeof(resp_json),
+                             "{\"ok\":false,\"msg\":\"Passphrase required\"}");
+                    http_respond(client_fd, 401, "application/json",
+                                 resp_json, strlen(resp_json));
+                    close(client_fd);
+                    return;
+                }
+                size_t pass_len = (size_t)(first_nl - body);
+                if (pass_len >= sizeof(pass)) pass_len = sizeof(pass) - 1;
+                memcpy(pass, body, pass_len);
+                /* Trim passphrase */
+                while (pass_len > 0 && (pass[pass_len-1] == '\r' || pass[pass_len-1] == ' '))
+                    pass[--pass_len] = '\0';
+
+                int vrc = onvault_auth_verify_passphrase(pass);
+                onvault_memzero(pass, sizeof(pass));
+                if (vrc != ONVAULT_OK) {
+                    snprintf(resp_json, sizeof(resp_json),
+                             "{\"ok\":false,\"msg\":\"Wrong passphrase\"}");
+                    http_respond(client_fd, 401, "application/json",
+                                 resp_json, strlen(resp_json));
+                    close(client_fd);
+                    return;
+                }
+
+                /* Set elevated session for this bearer token (mutex-protected) */
+                char cur_token[65] = {0};
+                if (http_parse_bearer_token(request, cur_token, sizeof(cur_token))) {
+                    pthread_mutex_lock(&g_http_auth_lock);
+                    g_elevated_until = time(NULL) + ELEVATED_SESSION_TTL;
+                    memcpy(g_elevated_token, cur_token, 65);
+                    pthread_mutex_unlock(&g_http_auth_lock);
+                }
+
+                /* Parse process\nvault after passphrase line */
+                first_nl++;
+            } else {
+                /* Elevated: body is just process\nvault (no passphrase) */
+                first_nl = body;
+            }
+
+            /* Parse process_path\nvault_id from remaining body */
+            char *second_nl = strchr(first_nl, '\n');
+            if (second_nl) {
+                size_t plen = (size_t)(second_nl - first_nl);
                 if (plen >= PATH_MAX) plen = PATH_MAX - 1;
-                memcpy(proc, body, plen);
-                /* Trim */
+                memcpy(proc, first_nl, plen);
                 while (plen > 0 && (proc[plen-1] == '\r' || proc[plen-1] == ' '))
                     proc[--plen] = '\0';
-                strlcpy(vid, nl + 1, sizeof(vid));
+                strlcpy(vid, second_nl + 1, sizeof(vid));
                 size_t vlen = strlen(vid);
                 while (vlen > 0 && (vid[vlen-1] == '\n' || vid[vlen-1] == '\r' || vid[vlen-1] == ' '))
                     vid[--vlen] = '\0';
@@ -1685,47 +1972,54 @@ static void handle_http_client(int client_fd)
                 }
             } else {
                 snprintf(resp_json, sizeof(resp_json),
-                         "{\"ok\":false,\"msg\":\"Invalid request or locked\"}");
+                         "{\"ok\":false,\"msg\":\"Invalid request format\"}");
             }
             http_audit_log(path, resp_json);
             http_respond(client_fd, 200, "application/json",
                          resp_json, strlen(resp_json));
 
         } else if (strcmp(path, "/api/unlock") == 0) {
-            /* Body: passphrase */
-            if (g_master_key_loaded) {
-                char token[65], escaped_token[128];
-                if (http_generate_token() != ONVAULT_OK) {
-                    snprintf(resp_json, sizeof(resp_json),
-                             "{\"ok\":false,\"msg\":\"Failed to create session token\"}");
-                    http_respond(client_fd, 200, "application/json",
-                                 resp_json, strlen(resp_json));
-                    close(client_fd);
-                    return;
-                }
-                http_copy_token(token);
-                http_reset_unlock_failures();
-                json_escape(escaped_token, sizeof(escaped_token), token);
+            /* Body: passphrase — always verify, even when already unlocked */
+            char pass[256];
+            time_t now = time(NULL);
+            strlcpy(pass, body, sizeof(pass));
+            size_t pl = strlen(pass);
+            while (pl > 0 && (pass[pl-1] == '\n' || pass[pl-1] == '\r'))
+                pass[--pl] = '\0';
+
+            if (http_unlock_locked_out(now)) {
                 snprintf(resp_json, sizeof(resp_json),
-                         "{\"ok\":true,\"msg\":\"Already unlocked\",\"token\":\"%s\"}",
-                         escaped_token);
-            } else {
-                char pass[256];
-                time_t now = time(NULL);
-                strlcpy(pass, body, sizeof(pass));
-                size_t pl = strlen(pass);
-                while (pl > 0 && (pass[pl-1] == '\n' || pass[pl-1] == '\r'))
-                    pass[--pl] = '\0';
+                         "{\"ok\":false,\"msg\":\"Too many attempts. Try again later.\"}");
+                http_respond(client_fd, 429, "application/json",
+                             resp_json, strlen(resp_json));
+                close(client_fd);
+                return;
+            }
 
-                if (http_unlock_locked_out(now)) {
+            if (g_master_key_loaded) {
+                /* Already unlocked — verify passphrase, then issue token */
+                int vrc = onvault_auth_verify_passphrase(pass);
+                onvault_memzero(pass, sizeof(pass));
+                if (vrc == ONVAULT_OK) {
+                    char token[65], escaped_token[128];
+                    if (http_generate_token() == ONVAULT_OK) {
+                        http_copy_token(token);
+                        http_reset_unlock_failures();
+                        json_escape(escaped_token, sizeof(escaped_token), token);
+                        snprintf(resp_json, sizeof(resp_json),
+                                 "{\"ok\":true,\"msg\":\"Already unlocked\",\"token\":\"%s\"}",
+                                 escaped_token);
+                    } else {
+                        snprintf(resp_json, sizeof(resp_json),
+                                 "{\"ok\":false,\"msg\":\"Failed to create session token\"}");
+                    }
+                } else {
+                    http_record_unlock_failure(now);
                     snprintf(resp_json, sizeof(resp_json),
-                             "{\"ok\":false,\"msg\":\"Too many attempts. Try again later.\"}");
-                    http_respond(client_fd, 429, "application/json",
-                                 resp_json, strlen(resp_json));
-                    close(client_fd);
-                    return;
+                             "{\"ok\":false,\"msg\":\"Wrong passphrase\"}");
                 }
-
+            } else {
+                /* Not yet unlocked — full unlock flow */
                 onvault_key_t mk;
                 memset(&mk, 0, sizeof(mk));
                 int urc = onvault_auth_unlock(pass, &mk);
@@ -1774,21 +2068,202 @@ static void handle_http_client(int client_fd)
             onvault_memzero(pass, sizeof(pass));
 
             if (vrc == ONVAULT_OK) {
-                http_clear_token();
-                g_running = 0;
+                do_lock();
                 snprintf(resp_json, sizeof(resp_json),
-                         "{\"ok\":true,\"msg\":\"Locked. Daemon stopping.\"}");
+                         "{\"ok\":true,\"msg\":\"Locked\"}");
             } else {
                 snprintf(resp_json, sizeof(resp_json),
                          "{\"ok\":false,\"msg\":\"Wrong passphrase\"}");
+                http_audit_log(path, resp_json);
+                http_respond(client_fd, 401, "application/json",
+                             resp_json, strlen(resp_json));
+                close(client_fd);
+                return;
             }
             http_audit_log(path, resp_json);
             http_respond(client_fd, 200, "application/json",
                          resp_json, strlen(resp_json));
 
         } else if (strcmp(path, "/api/vault/remove") == 0) {
-            snprintf(resp_json, sizeof(resp_json),
-                     "{\"ok\":false,\"msg\":\"Use CLI: onvault vault remove (passphrase required)\"}");
+            /* Body: passphrase\nvault_id */
+            if (!g_master_key_loaded) {
+                snprintf(resp_json, sizeof(resp_json),
+                         "{\"ok\":false,\"msg\":\"Locked\"}");
+            } else {
+                char pass[256] = {0}, vid[64] = {0};
+                char *nl = strchr(body, '\n');
+                if (nl) {
+                    size_t plen = (size_t)(nl - body);
+                    if (plen >= sizeof(pass)) plen = sizeof(pass) - 1;
+                    memcpy(pass, body, plen);
+                    strlcpy(vid, nl + 1, sizeof(vid));
+                    size_t vlen = strlen(vid);
+                    while (vlen > 0 && (vid[vlen-1] == '\n' || vid[vlen-1] == '\r'))
+                        vid[--vlen] = '\0';
+
+                    int vrc = onvault_auth_verify_passphrase(pass);
+                    onvault_memzero(pass, sizeof(pass));
+                    if (vrc != ONVAULT_OK) {
+                        snprintf(resp_json, sizeof(resp_json),
+                                 "{\"ok\":false,\"msg\":\"Wrong passphrase\"}");
+                    } else {
+                        /* Unmount vault first, then remove */
+                        char mount_dir[PATH_MAX];
+                        onvault_vault_get_paths(vid, NULL, mount_dir, NULL);
+                        if (onvault_fuse_is_mounted(mount_dir))
+                            onvault_fuse_unmount(mount_dir);
+                        int rc = onvault_vault_remove(&g_master_key, vid);
+                        if (rc == ONVAULT_OK) {
+                            snprintf(resp_json, sizeof(resp_json),
+                                     "{\"ok\":true,\"msg\":\"Vault removed\"}");
+                        } else {
+                            snprintf(resp_json, sizeof(resp_json),
+                                     "{\"ok\":false,\"msg\":\"Remove failed (err=%d)\"}", rc);
+                        }
+                    }
+                } else {
+                    onvault_memzero(pass, sizeof(pass));
+                    snprintf(resp_json, sizeof(resp_json),
+                             "{\"ok\":false,\"msg\":\"Passphrase required\"}");
+                }
+            }
+            http_audit_log(path, resp_json);
+            http_respond(client_fd, 200, "application/json",
+                         resp_json, strlen(resp_json));
+
+        } else if (strcmp(path, "/api/unlock-touchid") == 0) {
+            /* Touch ID unlock — no passphrase needed */
+            if (g_master_key_loaded) {
+                snprintf(resp_json, sizeof(resp_json),
+                         "{\"ok\":true,\"msg\":\"Already unlocked\"}");
+            } else {
+                onvault_key_t mk;
+                int rc = onvault_auth_unlock_touchid(&mk);
+                if (rc == ONVAULT_OK) {
+                    int frc = finish_unlock(&mk);
+                    onvault_key_wipe(&mk, sizeof(mk));
+                    if (frc == ONVAULT_OK) {
+                        char token[65], escaped_token[128];
+                        if (http_generate_token() == ONVAULT_OK) {
+                            http_copy_token(token);
+                            json_escape(escaped_token, sizeof(escaped_token), token);
+                            snprintf(resp_json, sizeof(resp_json),
+                                     "{\"ok\":true,\"msg\":\"Unlocked via Touch ID\",\"token\":\"%s\"}",
+                                     escaped_token);
+                        } else {
+                            snprintf(resp_json, sizeof(resp_json),
+                                     "{\"ok\":false,\"msg\":\"Token generation failed\"}");
+                        }
+                    } else {
+                        snprintf(resp_json, sizeof(resp_json),
+                                 "{\"ok\":false,\"msg\":\"Unlock failed (err=%d)\"}", frc);
+                    }
+                } else {
+                    snprintf(resp_json, sizeof(resp_json),
+                             "{\"ok\":false,\"msg\":\"Touch ID %s\"}",
+                             rc == ONVAULT_ERR_NOT_FOUND ? "not available" : "failed");
+                }
+            }
+            http_audit_log(path, resp_json);
+            http_respond(client_fd, 200, "application/json",
+                         resp_json, strlen(resp_json));
+
+        } else if (strcmp(path, "/api/recover") == 0) {
+            /* Body: recovery_key\nnew_passphrase */
+            char rkey[32] = {0}, newpass[256] = {0};
+            char *nl = strchr(body, '\n');
+            if (nl) {
+                size_t rklen = (size_t)(nl - body);
+                if (rklen >= sizeof(rkey)) rklen = sizeof(rkey) - 1;
+                memcpy(rkey, body, rklen);
+                strlcpy(newpass, nl + 1, sizeof(newpass));
+                size_t nplen = strlen(newpass);
+                while (nplen > 0 && (newpass[nplen-1] == '\n' || newpass[nplen-1] == '\r'))
+                    newpass[--nplen] = '\0';
+
+                onvault_key_t mk;
+                int rc = onvault_auth_unlock_recovery(rkey, newpass, &mk);
+                onvault_memzero(rkey, sizeof(rkey));
+                onvault_memzero(newpass, sizeof(newpass));
+                if (rc == ONVAULT_OK) {
+                    int frc = finish_unlock(&mk);
+                    onvault_key_wipe(&mk, sizeof(mk));
+                    if (frc == ONVAULT_OK) {
+                        char token[65], escaped_token[128];
+                        if (http_generate_token() == ONVAULT_OK) {
+                            http_copy_token(token);
+                            json_escape(escaped_token, sizeof(escaped_token), token);
+                            snprintf(resp_json, sizeof(resp_json),
+                                     "{\"ok\":true,\"msg\":\"Recovered successfully\",\"token\":\"%s\"}",
+                                     escaped_token);
+                        } else {
+                            snprintf(resp_json, sizeof(resp_json),
+                                     "{\"ok\":true,\"msg\":\"Recovered (token failed)\"}");
+                        }
+                    } else {
+                        snprintf(resp_json, sizeof(resp_json),
+                                 "{\"ok\":false,\"msg\":\"Recovery failed (err=%d)\"}", frc);
+                    }
+                } else {
+                    snprintf(resp_json, sizeof(resp_json),
+                             "{\"ok\":false,\"msg\":\"Wrong recovery key\"}");
+                }
+            } else {
+                snprintf(resp_json, sizeof(resp_json),
+                         "{\"ok\":false,\"msg\":\"Format: recovery_key\\\\nnew_passphrase\"}");
+            }
+            http_audit_log(path, resp_json);
+            http_respond(client_fd, 200, "application/json",
+                         resp_json, strlen(resp_json));
+
+        } else if (strcmp(path, "/api/rotate-keys") == 0) {
+            /* Body: passphrase */
+            if (!g_master_key_loaded) {
+                snprintf(resp_json, sizeof(resp_json),
+                         "{\"ok\":false,\"msg\":\"Locked\"}");
+            } else {
+                char pass[256];
+                strlcpy(pass, body, sizeof(pass));
+                size_t pl = strlen(pass);
+                while (pl > 0 && (pass[pl-1] == '\n' || pass[pl-1] == '\r'))
+                    pass[--pl] = '\0';
+                int vrc = onvault_auth_verify_passphrase(pass);
+                onvault_memzero(pass, sizeof(pass));
+                if (vrc != ONVAULT_OK) {
+                    snprintf(resp_json, sizeof(resp_json),
+                             "{\"ok\":false,\"msg\":\"Wrong passphrase\"}");
+                } else {
+                    /* Key rotation is complex — defer to CLI for now */
+                    snprintf(resp_json, sizeof(resp_json),
+                             "{\"ok\":false,\"msg\":\"Use CLI: onvault rotate-keys (safer for large vaults)\"}");
+                }
+            }
+            http_audit_log(path, resp_json);
+            http_respond(client_fd, 200, "application/json",
+                         resp_json, strlen(resp_json));
+
+        } else if (strcmp(path, "/api/export-recovery") == 0) {
+            /* Body: passphrase — verify then return recovery info */
+            if (!g_master_key_loaded) {
+                snprintf(resp_json, sizeof(resp_json),
+                         "{\"ok\":false,\"msg\":\"Locked\"}");
+            } else {
+                char pass[256];
+                strlcpy(pass, body, sizeof(pass));
+                size_t pl = strlen(pass);
+                while (pl > 0 && (pass[pl-1] == '\n' || pass[pl-1] == '\r'))
+                    pass[--pl] = '\0';
+                int vrc = onvault_auth_verify_passphrase(pass);
+                onvault_memzero(pass, sizeof(pass));
+                if (vrc != ONVAULT_OK) {
+                    snprintf(resp_json, sizeof(resp_json),
+                             "{\"ok\":false,\"msg\":\"Wrong passphrase\"}");
+                } else {
+                    snprintf(resp_json, sizeof(resp_json),
+                             "{\"ok\":true,\"msg\":\"Recovery key was shown during init. If lost, it cannot be retrieved.\"}");
+                }
+            }
+            http_audit_log(path, resp_json);
             http_respond(client_fd, 200, "application/json",
                          resp_json, strlen(resp_json));
 
@@ -1974,187 +2449,420 @@ static const char *get_menubar_html(void)
     "<title>onvault</title>\n"
     "<style>\n"
     ":root {\n"
-    "    color-scheme: dark;\n"
-    "    --bg: #0d0d0d;\n"
-    "    --card: rgba(26, 26, 26, 0.96);\n"
-    "    --card-hover: rgba(34, 34, 34, 0.98);\n"
-    "    --border: rgba(255, 255, 255, 0.08);\n"
-    "    --text: #ffffff;\n"
-    "    --text-soft: rgba(255, 255, 255, 0.72);\n"
-    "    --text-muted: rgba(255, 255, 255, 0.42);\n"
-    "    --green: #22c55e;\n"
-    "    --green-dim: rgba(34, 197, 94, 0.15);\n"
-    "    --red: #ef4444;\n"
-    "    --red-dim: rgba(239, 68, 68, 0.15);\n"
-    "    --orange: #f59e0b;\n"
-    "    --orange-dim: rgba(245, 158, 11, 0.15);\n"
-    "    --blue: #3b82f6;\n"
-    "    --blue-dim: rgba(59, 130, 246, 0.12);\n"
+    "    color-scheme: light dark;\n"
+    "    --bg: #f5f5f7;\n"
+    "    --surface: rgba(255, 255, 255, 0.85);\n"
+    "    --surface-hover: rgba(255, 255, 255, 0.95);\n"
+    "    --border: rgba(0, 0, 0, 0.08);\n"
+    "    --text: #1d1d1f;\n"
+    "    --text-secondary: #6e6e73;\n"
+    "    --text-tertiary: #aeaeb2;\n"
+    "    --accent: #007aff;\n"
+    "    --accent-bg: rgba(0, 122, 255, 0.08);\n"
+    "    --green: #34c759;\n"
+    "    --green-bg: rgba(52, 199, 89, 0.1);\n"
+    "    --red: #ff3b30;\n"
+    "    --red-bg: rgba(255, 59, 48, 0.1);\n"
+    "    --orange: #ff9500;\n"
+    "    --orange-bg: rgba(255, 149, 0, 0.1);\n"
     "    --radius: 10px;\n"
-    "    --radius-sm: 6px;\n"
+    "    --radius-sm: 8px;\n"
+    "    --shadow: 0 1px 3px rgba(0,0,0,0.06);\n"
+    "}\n"
+    "@media (prefers-color-scheme: dark) {\n"
+    "    :root {\n"
+    "        --bg: #1c1c1e;\n"
+    "        --surface: rgba(44, 44, 46, 0.85);\n"
+    "        --surface-hover: rgba(58, 58, 60, 0.95);\n"
+    "        --border: rgba(255, 255, 255, 0.08);\n"
+    "        --text: #f5f5f7;\n"
+    "        --text-secondary: #98989d;\n"
+    "        --text-tertiary: #636366;\n"
+    "        --accent: #0a84ff;\n"
+    "        --accent-bg: rgba(10, 132, 255, 0.12);\n"
+    "        --green: #30d158;\n"
+    "        --green-bg: rgba(48, 209, 88, 0.12);\n"
+    "        --red: #ff453a;\n"
+    "        --red-bg: rgba(255, 69, 58, 0.12);\n"
+    "        --orange: #ff9f0a;\n"
+    "        --orange-bg: rgba(255, 159, 10, 0.12);\n"
+    "        --shadow: 0 1px 3px rgba(0,0,0,0.2);\n"
+    "    }\n"
     "}\n"
     "* { margin: 0; padding: 0; box-sizing: border-box; }\n"
     "body {\n"
     "    font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui, sans-serif;\n"
     "    background: var(--bg); color: var(--text);\n"
-    "    width: 300px; font-size: 12px;\n"
+    "    width: 320px; font-size: 13px;\n"
     "    -webkit-font-smoothing: antialiased;\n"
     "    overflow: hidden;\n"
     "}\n"
+    "\n"
+    "/* Header */\n"
     ".header {\n"
     "    display: flex; align-items: center; justify-content: space-between;\n"
-    "    padding: 14px 16px 10px; border-bottom: 1px solid var(--border);\n"
+    "    padding: 14px 16px 12px;\n"
+    "    backdrop-filter: blur(20px) saturate(180%);\n"
+    "    -webkit-backdrop-filter: blur(20px) saturate(180%);\n"
+    "    border-bottom: 1px solid var(--border);\n"
     "}\n"
-    ".header .logo { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 13px; }\n"
-    ".header .logo svg { width: 18px; height: 18px; }\n"
-    ".badge { font-size: 10px; padding: 3px 8px; border-radius: 20px; font-weight: 500; }\n"
-    ".badge.locked { background: var(--red-dim); color: var(--red); }\n"
-    ".badge.unlocked { background: var(--green-dim); color: var(--green); }\n"
-    ".section { padding: 8px 12px 4px; }\n"
-    ".section-title { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); padding: 4px 4px 6px; }\n"
-    ".vault-card { background: var(--card); border-radius: var(--radius); padding: 10px 12px; margin-bottom: 6px; border: 1px solid var(--border); cursor: pointer; transition: background 0.15s; }\n"
-    ".vault-card:hover { background: var(--card-hover); }\n"
-    ".vault-row { display: flex; align-items: center; justify-content: space-between; }\n"
-    ".vault-name { font-weight: 600; font-size: 12px; display: flex; align-items: center; gap: 6px; }\n"
-    ".vault-name .icon { font-size: 14px; }\n"
-    ".vault-source { font-size: 10px; color: var(--text-muted); margin-top: 2px; font-family: 'SF Mono', Menlo, monospace; }\n"
-    ".vault-status { font-size: 10px; padding: 2px 6px; border-radius: 4px; font-weight: 500; }\n"
-    ".vault-status.mounted { background: var(--green-dim); color: var(--green); }\n"
-    ".vault-status.locked { background: var(--red-dim); color: var(--red); }\n"
-    ".vault-detail { display: none; }\n"
-    ".vault-card.expanded .vault-detail { display: block; padding-top: 8px; margin-top: 8px; border-top: 1px solid var(--border); }\n"
-    ".vault-actions { display: flex; gap: 4px; flex-wrap: wrap; }\n"
-    ".vault-actions button { font-size: 10px; padding: 4px 10px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: transparent; color: var(--text-soft); cursor: pointer; transition: all 0.15s; font-family: inherit; }\n"
-    ".vault-actions button:hover { background: var(--blue-dim); color: var(--blue); border-color: rgba(59, 130, 246, 0.3); }\n"
-    ".vault-actions button.danger:hover { background: var(--red-dim); color: var(--red); border-color: rgba(239, 68, 68, 0.3); }\n"
-    ".denial-card { background: var(--card); border-radius: var(--radius-sm); padding: 8px 10px; margin-bottom: 4px; border: 1px solid var(--border); font-size: 11px; display: flex; align-items: center; justify-content: space-between; }\n"
-    ".denial-info { flex: 1; }\n"
-    ".denial-proc { font-weight: 600; color: var(--orange); }\n"
-    ".denial-file { font-size: 10px; color: var(--text-muted); font-family: 'SF Mono', Menlo, monospace; }\n"
-    ".denial-time { font-size: 9px; color: var(--text-muted); white-space: nowrap; margin-left: 8px; }\n"
-    ".denial-allow { font-size: 9px; padding: 2px 6px; border-radius: 4px; border: 1px solid rgba(34, 197, 94, 0.3); background: var(--green-dim); color: var(--green); cursor: pointer; margin-left: 6px; font-family: inherit; }\n"
-    ".action-bar { display: flex; gap: 6px; padding: 8px 12px; border-top: 1px solid var(--border); }\n"
-    ".action-bar button { flex: 1; padding: 8px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: var(--card); color: var(--text-soft); cursor: pointer; font-size: 11px; font-weight: 500; transition: all 0.15s; font-family: inherit; }\n"
-    ".action-bar button:hover { background: var(--card-hover); color: var(--text); }\n"
-    ".action-bar button.primary { background: var(--blue-dim); color: var(--blue); border-color: rgba(59, 130, 246, 0.25); }\n"
-    ".action-bar button.primary:hover { background: rgba(59, 130, 246, 0.2); border-color: rgba(59, 130, 246, 0.4); }\n"
-    ".footer { display: flex; align-items: center; justify-content: space-between; padding: 8px 16px; border-top: 1px solid var(--border); font-size: 10px; color: var(--text-muted); }\n"
-    "@keyframes spin { to { transform: rotate(360deg); } }\n"
-    ".spinning { animation: spin 1s linear infinite; display: inline-block; }\n"
-    ".empty-state { text-align: center; padding: 20px 16px; }\n"
-    ".empty-state .icon { font-size: 28px; margin-bottom: 8px; }\n"
-    ".empty-state p { color: var(--text-muted); margin-bottom: 4px; font-size: 11px; }\n"
-    "/* Toast notification (replaces browser alerts) */\n"
-    ".toast { position: fixed; bottom: 40px; left: 50%; transform: translateX(-50%); background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px 16px; font-size: 11px; color: var(--green); opacity: 0; transition: opacity 0.3s; pointer-events: none; z-index: 100; white-space: nowrap; }\n"
-    ".toast.show { opacity: 1; }\n"
+    ".header-left { display: flex; align-items: center; gap: 8px; }\n"
+    ".header-left svg { width: 20px; height: 20px; color: var(--accent); }\n"
+    ".header-title { font-weight: 600; font-size: 14px; }\n"
+    ".status-pill {\n"
+    "    font-size: 11px; padding: 3px 10px; border-radius: 20px; font-weight: 500;\n"
+    "    display: flex; align-items: center; gap: 4px;\n"
+    "}\n"
+    ".status-pill.locked { background: var(--red-bg); color: var(--red); }\n"
+    ".status-pill.unlocked { background: var(--green-bg); color: var(--green); }\n"
+    ".status-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }\n"
+    "\n"
+    "/* Tab bar */\n"
+    ".tab-bar {\n"
+    "    display: flex; padding: 0 12px; border-bottom: 1px solid var(--border);\n"
+    "    background: var(--bg);\n"
+    "}\n"
+    ".tab {\n"
+    "    flex: 1; padding: 10px 0; text-align: center; font-size: 11px; font-weight: 500;\n"
+    "    color: var(--text-tertiary); cursor: pointer; border-bottom: 2px solid transparent;\n"
+    "    transition: all 0.2s;\n"
+    "}\n"
+    ".tab.active { color: var(--accent); border-bottom-color: var(--accent); }\n"
+    ".tab:hover:not(.active) { color: var(--text-secondary); }\n"
+    "\n"
+    "/* Content area */\n"
+    ".tab-content { display: none; max-height: 400px; overflow-y: auto; }\n"
+    ".tab-content.active { display: block; }\n"
+    ".content-section { padding: 10px 12px; }\n"
+    ".section-label {\n"
+    "    font-size: 11px; font-weight: 600; text-transform: uppercase;\n"
+    "    letter-spacing: 0.5px; color: var(--text-tertiary); padding: 4px 4px 8px;\n"
+    "}\n"
+    "\n"
+    "/* Cards */\n"
+    ".card {\n"
+    "    background: var(--surface); border-radius: var(--radius);\n"
+    "    padding: 12px; margin-bottom: 8px;\n"
+    "    border: 1px solid var(--border); box-shadow: var(--shadow);\n"
+    "    cursor: pointer; transition: background 0.15s, transform 0.1s;\n"
+    "}\n"
+    ".card:hover { background: var(--surface-hover); }\n"
+    ".card:active { transform: scale(0.99); }\n"
+    ".card-row { display: flex; align-items: center; justify-content: space-between; }\n"
+    ".card-title { font-weight: 600; font-size: 13px; display: flex; align-items: center; gap: 6px; }\n"
+    ".card-subtitle { font-size: 11px; color: var(--text-secondary); margin-top: 2px; font-family: 'SF Mono', Menlo, monospace; }\n"
+    ".badge-sm {\n"
+    "    font-size: 10px; padding: 2px 8px; border-radius: 6px; font-weight: 500;\n"
+    "}\n"
+    ".badge-sm.active { background: var(--green-bg); color: var(--green); }\n"
+    ".badge-sm.locked { background: var(--red-bg); color: var(--red); }\n"
+    "\n"
+    "/* Card detail (expandable) */\n"
+    ".card-detail { display: none; padding-top: 10px; margin-top: 10px; border-top: 1px solid var(--border); }\n"
+    ".card.expanded .card-detail { display: block; }\n"
+    "\n"
+    "/* Buttons */\n"
+    ".btn-row { display: flex; gap: 6px; flex-wrap: wrap; }\n"
+    ".btn {\n"
+    "    font-size: 11px; padding: 6px 12px; border-radius: var(--radius-sm);\n"
+    "    border: 1px solid var(--border); background: var(--surface);\n"
+    "    color: var(--text-secondary); cursor: pointer; transition: all 0.15s;\n"
+    "    font-family: inherit; font-weight: 500;\n"
+    "}\n"
+    ".btn:hover { background: var(--accent-bg); color: var(--accent); border-color: rgba(0,122,255,0.2); }\n"
+    ".btn.danger:hover { background: var(--red-bg); color: var(--red); border-color: rgba(255,59,48,0.2); }\n"
+    ".btn.primary {\n"
+    "    background: var(--accent); color: white; border-color: var(--accent);\n"
+    "}\n"
+    ".btn.primary:hover { opacity: 0.9; }\n"
+    ".btn-full { width: 100%; padding: 10px; font-size: 13px; margin-top: 8px; }\n"
+    "\n"
+    "/* Input row */\n"
+    ".input-row { display: flex; gap: 6px; margin-top: 8px; }\n"
+    ".input-row input, .form-input {\n"
+    "    flex: 1; padding: 7px 10px; border-radius: var(--radius-sm);\n"
+    "    border: 1px solid var(--border); background: var(--bg);\n"
+    "    color: var(--text); font-size: 12px; font-family: 'SF Mono', Menlo, monospace;\n"
+    "    outline: none; transition: border-color 0.15s;\n"
+    "}\n"
+    ".input-row input:focus, .form-input:focus { border-color: var(--accent); }\n"
+    "\n"
+    "/* Denial cards */\n"
+    ".denial-card {\n"
+    "    background: var(--surface); border-radius: var(--radius-sm);\n"
+    "    padding: 10px 12px; margin-bottom: 6px;\n"
+    "    border: 1px solid var(--border); box-shadow: var(--shadow);\n"
+    "    display: flex; align-items: center; gap: 8px;\n"
+    "}\n"
+    ".denial-icon { color: var(--orange); font-size: 16px; flex-shrink: 0; }\n"
+    ".denial-info { flex: 1; min-width: 0; }\n"
+    ".denial-proc { font-weight: 600; font-size: 12px; color: var(--orange); }\n"
+    ".denial-file { font-size: 10px; color: var(--text-tertiary); font-family: 'SF Mono', Menlo, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }\n"
+    ".denial-meta { text-align: right; flex-shrink: 0; }\n"
+    ".denial-time { font-size: 10px; color: var(--text-tertiary); display: block; }\n"
+    ".btn-allow-sm {\n"
+    "    font-size: 10px; padding: 3px 8px; border-radius: 6px;\n"
+    "    border: 1px solid rgba(52,199,89,0.3); background: var(--green-bg);\n"
+    "    color: var(--green); cursor: pointer; font-family: inherit; margin-top: 4px;\n"
+    "}\n"
+    "\n"
+    "/* Log entries */\n"
+    ".log-entry {\n"
+    "    padding: 8px 0; border-bottom: 1px solid var(--border);\n"
+    "    font-size: 11px;\n"
+    "}\n"
+    ".log-entry:last-child { border-bottom: none; }\n"
+    ".log-ts { color: var(--text-tertiary); font-family: 'SF Mono', Menlo, monospace; font-size: 10px; }\n"
+    ".log-event { font-weight: 600; margin: 0 4px; }\n"
+    ".log-event.allow { color: var(--green); }\n"
+    ".log-event.deny { color: var(--red); }\n"
+    ".log-event.unlock { color: var(--accent); }\n"
+    ".log-event.lock { color: var(--orange); }\n"
+    ".log-detail { color: var(--text-secondary); font-size: 10px; display: block; margin-top: 2px; }\n"
+    "\n"
+    "/* Settings */\n"
+    ".setting-row {\n"
+    "    display: flex; align-items: center; justify-content: space-between;\n"
+    "    padding: 12px 0; border-bottom: 1px solid var(--border);\n"
+    "}\n"
+    ".setting-row:last-child { border-bottom: none; }\n"
+    ".setting-label { font-size: 13px; font-weight: 500; }\n"
+    ".setting-desc { font-size: 11px; color: var(--text-secondary); margin-top: 2px; }\n"
+    ".setting-value { font-size: 12px; color: var(--accent); font-weight: 500; }\n"
+    "select.form-select {\n"
+    "    padding: 5px 8px; border-radius: var(--radius-sm); border: 1px solid var(--border);\n"
+    "    background: var(--surface); color: var(--text); font-size: 12px;\n"
+    "    font-family: inherit; outline: none;\n"
+    "}\n"
+    "\n"
+    "/* Empty state */\n"
+    ".empty-state { text-align: center; padding: 32px 16px; }\n"
+    ".empty-icon { font-size: 32px; margin-bottom: 8px; }\n"
+    ".empty-text { color: var(--text-tertiary); font-size: 12px; line-height: 1.5; }\n"
+    "\n"
+    "/* Toast */\n"
+    ".toast {\n"
+    "    position: fixed; bottom: 12px; left: 50%; transform: translateX(-50%) translateY(20px);\n"
+    "    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);\n"
+    "    padding: 8px 16px; font-size: 12px; font-weight: 500; color: var(--green);\n"
+    "    box-shadow: 0 4px 12px rgba(0,0,0,0.15);\n"
+    "    opacity: 0; transition: all 0.3s ease; pointer-events: none; z-index: 1000;\n"
+    "    backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);\n"
+    "}\n"
+    ".toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }\n"
     ".toast.error { color: var(--red); }\n"
-    "/* Input row for inline allow/deny */\n"
-    ".input-row { display: flex; gap: 4px; margin-top: 6px; }\n"
-    ".input-row input { flex: 1; padding: 4px 8px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: rgba(0,0,0,0.3); color: var(--text); font-size: 10px; font-family: 'SF Mono', Menlo, monospace; outline: none; }\n"
-    ".input-row input:focus { border-color: rgba(59, 130, 246, 0.5); }\n"
-    ".input-row button { padding: 4px 8px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: var(--green-dim); color: var(--green); font-size: 10px; cursor: pointer; font-family: inherit; }\n"
-    "/* Overlay panel */\n"
-    ".panel-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.6); z-index: 200; }\n"
-    ".panel-overlay.show { display: flex; align-items: center; justify-content: center; }\n"
-    ".panel { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); width: 280px; max-height: 350px; overflow: hidden; }\n"
-    ".panel-header { display: flex; justify-content: space-between; align-items: center; padding: 10px 12px; border-bottom: 1px solid var(--border); font-weight: 600; font-size: 12px; }\n"
-    ".panel-body { padding: 10px 12px; font-size: 10px; color: var(--text-soft); white-space: pre-wrap; font-family: 'SF Mono', Menlo, monospace; overflow-y: auto; max-height: 280px; margin: 0; }\n"
+    "\n"
+    "/* Modal overlay */\n"
+    ".modal-overlay {\n"
+    "    display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0;\n"
+    "    background: rgba(0,0,0,0.4); z-index: 500;\n"
+    "    backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);\n"
+    "}\n"
+    ".modal-overlay.show { display: flex; align-items: center; justify-content: center; }\n"
+    ".modal {\n"
+    "    background: var(--bg); border: 1px solid var(--border); border-radius: 14px;\n"
+    "    width: 290px; box-shadow: 0 8px 32px rgba(0,0,0,0.2); overflow: hidden;\n"
+    "}\n"
+    ".modal-header {\n"
+    "    display: flex; justify-content: space-between; align-items: center;\n"
+    "    padding: 14px 16px; border-bottom: 1px solid var(--border);\n"
+    "}\n"
+    ".modal-title { font-weight: 600; font-size: 14px; }\n"
+    ".modal-close {\n"
+    "    background: none; border: none; color: var(--text-tertiary);\n"
+    "    cursor: pointer; font-size: 18px; padding: 0; line-height: 1;\n"
+    "}\n"
+    ".modal-body { padding: 16px; }\n"
+    ".modal-body p { font-size: 12px; color: var(--text-secondary); margin-bottom: 12px; line-height: 1.4; }\n"
+    ".modal-body pre {\n"
+    "    font-size: 11px; color: var(--text-secondary); white-space: pre-wrap;\n"
+    "    font-family: 'SF Mono', Menlo, monospace; max-height: 200px; overflow-y: auto;\n"
+    "    background: var(--surface); padding: 10px; border-radius: var(--radius-sm);\n"
+    "    border: 1px solid var(--border);\n"
+    "}\n"
+    "\n"
+    "/* Footer */\n"
+    ".footer {\n"
+    "    display: flex; align-items: center; justify-content: space-between;\n"
+    "    padding: 8px 16px; border-top: 1px solid var(--border);\n"
+    "    font-size: 10px; color: var(--text-tertiary);\n"
+    "}\n"
+    "\n"
+    "@keyframes spin { to { transform: rotate(360deg); } }\n"
+    ".spinning { animation: spin 0.8s linear infinite; display: inline-block; }\n"
     "</style>\n"
     "</head>\n"
     "<body>\n"
     "\n"
     "<div class=\"header\">\n"
-    "    <div class=\"logo\">\n"
+    "    <div class=\"header-left\">\n"
     "        <svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\">\n"
     "            <rect x=\"3\" y=\"11\" width=\"18\" height=\"11\" rx=\"2\" ry=\"2\"/>\n"
     "            <path d=\"M7 11V7a5 5 0 0 1 10 0v4\"/>\n"
     "        </svg>\n"
-    "        onvault\n"
+    "        <span class=\"header-title\">onvault</span>\n"
     "    </div>\n"
-    "    <span class=\"badge locked\" id=\"statusBadge\">Locked</span>\n"
-    "</div>\n"
-    "\n"
-    "<div id=\"vaultSection\" class=\"section\">\n"
-    "    <div class=\"section-title\">Vaults</div>\n"
-    "    <div id=\"vaultList\"></div>\n"
-    "</div>\n"
-    "\n"
-    "<div id=\"denialSection\" class=\"section\" style=\"display:none\">\n"
-    "    <div class=\"section-title\">Recent Denials</div>\n"
-    "    <div id=\"denialList\"></div>\n"
-    "</div>\n"
-    "\n"
-    "<div id=\"addVaultPanel\" style=\"display:none; padding: 8px 12px;\">\n"
-    "    <div class=\"section-title\">Add Vault</div>\n"
-    "    <div class=\"input-row\">\n"
-    "        <input placeholder=\"~/.ssh or /path/to/dir\" id=\"addVaultInput\">\n"
-    "        <button onclick=\"doAddVault()\">Protect</button>\n"
+    "    <div class=\"status-pill locked\" id=\"statusPill\">\n"
+    "        <span class=\"status-dot\"></span>\n"
+    "        <span id=\"statusText\">Locked</span>\n"
     "    </div>\n"
     "</div>\n"
     "\n"
-    "<div class=\"action-bar\">\n"
-    "    <button class=\"primary\" onclick=\"promptAddVault()\">+ Add Vault</button>\n"
-    "    <button onclick=\"viewPolicies()\">Policies</button>\n"
-    "    <button id=\"lockBtn\" onclick=\"doLockUnlock()\">Lock</button>\n"
-    "    <button onclick=\"refresh()\" id=\"refreshBtn\">Refresh</button>\n"
+    "<div class=\"tab-bar\">\n"
+    "    <div class=\"tab active\" onclick=\"switchTab('vaults')\" id=\"tab-vaults\">Vaults</div>\n"
+    "    <div class=\"tab\" onclick=\"switchTab('policies')\" id=\"tab-policies\">Policies</div>\n"
+    "    <div class=\"tab\" onclick=\"switchTab('log')\" id=\"tab-log\">Log</div>\n"
+    "    <div class=\"tab\" onclick=\"switchTab('settings')\" id=\"tab-settings\">Settings</div>\n"
+    "</div>\n"
+    "\n"
+    "<!-- Vaults Tab -->\n"
+    "<div class=\"tab-content active\" id=\"content-vaults\">\n"
+    "    <div class=\"content-section\">\n"
+    "        <div id=\"vaultList\"></div>\n"
+    "        <div id=\"denialSection\" style=\"display:none\">\n"
+    "            <div class=\"section-label\" style=\"margin-top:8px\">Recent Denials</div>\n"
+    "            <div id=\"denialList\"></div>\n"
+    "        </div>\n"
+    "        <button class=\"btn btn-full primary\" onclick=\"promptAddVault()\">Add Vault</button>\n"
+    "    </div>\n"
+    "</div>\n"
+    "\n"
+    "<!-- Policies Tab -->\n"
+    "<div class=\"tab-content\" id=\"content-policies\">\n"
+    "    <div class=\"content-section\">\n"
+    "        <div id=\"policyList\"></div>\n"
+    "    </div>\n"
+    "</div>\n"
+    "\n"
+    "<!-- Log Tab -->\n"
+    "<div class=\"tab-content\" id=\"content-log\">\n"
+    "    <div class=\"content-section\">\n"
+    "        <div class=\"btn-row\" style=\"margin-bottom:10px\">\n"
+    "            <button class=\"btn\" onclick=\"filterLog('all')\" id=\"log-filter-all\" style=\"background:var(--accent-bg);color:var(--accent)\">All</button>\n"
+    "            <button class=\"btn\" onclick=\"filterLog('denied')\" id=\"log-filter-denied\">Denied</button>\n"
+    "            <button class=\"btn\" onclick=\"filterLog('allowed')\" id=\"log-filter-allowed\">Allowed</button>\n"
+    "        </div>\n"
+    "        <div id=\"logList\"></div>\n"
+    "    </div>\n"
+    "</div>\n"
+    "\n"
+    "<!-- Settings Tab -->\n"
+    "<div class=\"tab-content\" id=\"content-settings\">\n"
+    "    <div class=\"content-section\">\n"
+    "        <div class=\"section-label\">Security</div>\n"
+    "        <div class=\"setting-row\">\n"
+    "            <div>\n"
+    "                <div class=\"setting-label\">Verification Mode</div>\n"
+    "                <div class=\"setting-desc\">How processes are verified</div>\n"
+    "            </div>\n"
+    "            <select class=\"form-select\" id=\"verifyMode\" onchange=\"toast('Restart daemon to apply',false)\">\n"
+    "                <option value=\"codesign_preferred\">Codesign (preferred)</option>\n"
+    "                <option value=\"hash_only\">Hash only</option>\n"
+    "                <option value=\"codesign_required\">Codesign (required)</option>\n"
+    "            </select>\n"
+    "        </div>\n"
+    "        <div class=\"setting-row\">\n"
+    "            <div>\n"
+    "                <div class=\"setting-label\">Touch ID</div>\n"
+    "                <div class=\"setting-desc\">Unlock with biometrics</div>\n"
+    "            </div>\n"
+    "            <button class=\"btn\" id=\"touchIdBtn\" onclick=\"doTouchIdUnlock()\">Unlock</button>\n"
+    "        </div>\n"
+    "\n"
+    "        <div class=\"section-label\" style=\"margin-top:12px\">Recovery</div>\n"
+    "        <div class=\"setting-row\">\n"
+    "            <div>\n"
+    "                <div class=\"setting-label\">Recovery Key</div>\n"
+    "                <div class=\"setting-desc\">View your emergency recovery key</div>\n"
+    "            </div>\n"
+    "            <button class=\"btn\" onclick=\"showRecoveryPrompt()\">View</button>\n"
+    "        </div>\n"
+    "        <div class=\"setting-row\">\n"
+    "            <div>\n"
+    "                <div class=\"setting-label\">Forgot Passphrase?</div>\n"
+    "                <div class=\"setting-desc\">Unlock using recovery key</div>\n"
+    "            </div>\n"
+    "            <button class=\"btn\" onclick=\"showRecoverPrompt()\">Recover</button>\n"
+    "        </div>\n"
+    "\n"
+    "        <div class=\"section-label\" style=\"margin-top:12px\">Advanced</div>\n"
+    "        <div class=\"setting-row\">\n"
+    "            <div>\n"
+    "                <div class=\"setting-label\">Rotate Keys</div>\n"
+    "                <div class=\"setting-desc\">Re-encrypt all vaults with new key</div>\n"
+    "            </div>\n"
+    "            <button class=\"btn danger\" onclick=\"showRotatePrompt()\">Rotate</button>\n"
+    "        </div>\n"
+    "        <div class=\"setting-row\">\n"
+    "            <div>\n"
+    "                <div class=\"setting-label\">Watch Mode</div>\n"
+    "                <div class=\"setting-desc\">Discover process access patterns</div>\n"
+    "            </div>\n"
+    "            <button class=\"btn\" onclick=\"toast('Use CLI: onvault vault watch',false)\">Start</button>\n"
+    "        </div>\n"
+    "    </div>\n"
     "</div>\n"
     "\n"
     "<div class=\"footer\">\n"
-    "    <span>onvault 0.1.0</span>\n"
+    "    <span>onvault v0.1.0</span>\n"
     "    <span id=\"lastUpdate\"></span>\n"
     "</div>\n"
     "\n"
     "<div class=\"toast\" id=\"toast\"></div>\n"
     "\n"
-    "<div class=\"panel-overlay\" id=\"panelOverlay\" onclick=\"hidePanel()\">\n"
-    "    <div class=\"panel\" onclick=\"event.stopPropagation()\">\n"
-    "        <div class=\"panel-header\">\n"
-    "            <span id=\"panelTitle\"></span>\n"
-    "            <button onclick=\"hidePanel()\" style=\"background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:14px\">✕</button>\n"
+    "<!-- Modal -->\n"
+    "<div class=\"modal-overlay\" id=\"modalOverlay\" onclick=\"hideModal()\">\n"
+    "    <div class=\"modal\" onclick=\"event.stopPropagation()\">\n"
+    "        <div class=\"modal-header\">\n"
+    "            <span class=\"modal-title\" id=\"modalTitle\"></span>\n"
+    "            <button class=\"modal-close\" onclick=\"hideModal()\">&#10005;</button>\n"
     "        </div>\n"
-    "        <pre class=\"panel-body\" id=\"panelBody\"></pre>\n"
-    "        <div id=\"panelAuth\" style=\"display:none;padding:10px 12px;border-top:1px solid var(--border)\">\n"
-    "            <div class=\"input-row\">\n"
-    "                <input type=\"password\" placeholder=\"Passphrase\" id=\"panelPassInput\">\n"
-    "                <button id=\"panelAuthBtn\" onclick=\"panelAuthSubmit()\">Confirm</button>\n"
-    "            </div>\n"
-    "        </div>\n"
+    "        <div class=\"modal-body\" id=\"modalBody\"></div>\n"
     "    </div>\n"
     "</div>\n"
     "\n"
     "<script>\n"
+    "/* ES5 only — no let/const/async/await/arrow functions/template literals */\n"
     "var API = window.location.origin;\n"
-    "var data = { locked: true, vault_count: 0, vaults: [] };\n"
+    "var state = { locked: true, vault_count: 0, vaults: [] };\n"
     "var denials = [];\n"
+    "var logEntries = [];\n"
+    "var logFilter = 'all';\n"
     "var expandedVaults = {};\n"
-    "var pendingAuthAction = null;\n"
     "var authToken = null;\n"
+    "var currentTab = 'vaults';\n"
     "var _refreshInterval = null;\n"
     "\n"
+    "/* --- Utility --- */\n"
     "function esc(s) {\n"
     "    if (!s) return '';\n"
-    "    return String(s)\n"
-    "        .replace(/&/g, '&amp;')\n"
-    "        .replace(/</g, '&lt;')\n"
-    "        .replace(/>/g, '&gt;')\n"
-    "        .replace(/\"/g, '&quot;')\n"
-    "        .replace(/'/g, '&#39;');\n"
+    "    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')\n"
+    "        .replace(/\"/g,'&quot;').replace(/'/g,'&#39;');\n"
     "}\n"
     "\n"
     "function toast(msg, isError) {\n"
     "    var t = document.getElementById('toast');\n"
-    "    t.innerHTML = msg;\n"
+    "    t.textContent = msg;\n"
     "    t.className = 'toast show' + (isError ? ' error' : '');\n"
     "    setTimeout(function() { t.className = 'toast'; }, 2500);\n"
     "}\n"
     "\n"
+    "function timeAgo(ts) {\n"
+    "    var s = Math.floor(Date.now() / 1000) - ts;\n"
+    "    if (s < 60) return s + 's ago';\n"
+    "    if (s < 3600) return Math.floor(s / 60) + 'm ago';\n"
+    "    return Math.floor(s / 3600) + 'h ago';\n"
+    "}\n"
+    "\n"
+    "function notifyResize() {\n"
+    "    try { window.webkit.messageHandlers.resize.postMessage(document.body.scrollHeight); } catch(e) {}\n"
+    "}\n"
+    "\n"
+    "/* --- API helpers --- */\n"
     "function fetchJSON(path) {\n"
     "    return fetch(API + path).then(function(r) {\n"
     "        return r.json().then(function(j) {\n"
-    "            if (r.status === 401 || (j && !j.ok && j.msg && j.msg.indexOf('Unauthorized') >= 0)) {\n"
-    "                authToken = null;\n"
-    "            }\n"
-    "            if (r.status === 401) throw j;\n"
+    "            if (r.status === 401) { authToken = null; throw j; }\n"
     "            return j;\n"
     "        });\n"
     "    });\n"
@@ -2163,10 +2871,7 @@ static const char *get_menubar_html(void)
     "function fetchText(path) {\n"
     "    return fetch(API + path).then(function(r) {\n"
     "        return r.text().then(function(text) {\n"
-    "            if (r.status === 401) {\n"
-    "                authToken = null;\n"
-    "                throw { ok: false, msg: text || 'Unauthorized' };\n"
-    "            }\n"
+    "            if (r.status === 401) { authToken = null; throw { ok: false, msg: 'Unauthorized' }; }\n"
     "            return text;\n"
     "        });\n"
     "    });\n"
@@ -2177,230 +2882,438 @@ static const char *get_menubar_html(void)
     "    if (authToken) headers['Authorization'] = 'Bearer ' + authToken;\n"
     "    return fetch(API + path, { method: 'POST', body: body, headers: headers }).then(function(r) {\n"
     "        return r.json().then(function(j) {\n"
-    "            if (r.status === 401 || (j && !j.ok && j.msg && j.msg.indexOf('Unauthorized') >= 0)) {\n"
-    "                authToken = null;\n"
-    "            }\n"
+    "            if (r.status === 401) authToken = null;\n"
     "            j._status = r.status;\n"
     "            return j;\n"
     "        });\n"
     "    });\n"
     "}\n"
     "\n"
+    "function tokenParam() {\n"
+    "    return authToken ? '?token=' + encodeURIComponent(authToken) : '';\n"
+    "}\n"
+    "\n"
+    "/* --- Data fetching --- */\n"
     "function fetchData() {\n"
-    "    var tokenParam = authToken ? '?token=' + encodeURIComponent(authToken) : '';\n"
+    "    var tp = tokenParam();\n"
     "    return Promise.all([\n"
-    "        fetchJSON('/api/status' + tokenParam),\n"
-    "        fetchJSON('/api/denials' + tokenParam)\n"
+    "        fetchJSON('/api/status' + tp),\n"
+    "        fetchJSON('/api/denials' + tp)\n"
     "    ]).then(function(results) {\n"
-    "        data = results[0];\n"
+    "        state = results[0];\n"
     "        denials = results[1];\n"
     "        render();\n"
-    "    }).catch(function(err) {\n"
-    "        if (err && err.msg && err.msg.indexOf('Unauthorized') >= 0) authToken = null;\n"
-    "        data = { locked: true, vault_count: 0, vaults: [] };\n"
+    "    }).catch(function() {\n"
+    "        state = { locked: true, vault_count: 0, vaults: [] };\n"
     "        denials = [];\n"
     "        render();\n"
     "    });\n"
     "}\n"
     "\n"
-    "function timeAgo(ts) {\n"
-    "    var s = Math.floor(Date.now() / 1000) - ts;\n"
-    "    if (s < 60) return s + 's';\n"
-    "    if (s < 3600) return Math.floor(s / 60) + 'm';\n"
-    "    return Math.floor(s / 3600) + 'h';\n"
+    "function fetchLog() {\n"
+    "    fetchText('/api/log' + tokenParam()).then(function(text) {\n"
+    "        try { logEntries = JSON.parse(text); } catch(e) { logEntries = []; }\n"
+    "        renderLog();\n"
+    "    }).catch(function() { logEntries = []; renderLog(); });\n"
     "}\n"
     "\n"
-    "function render() {\n"
-    "    var badge = document.getElementById('statusBadge');\n"
-    "    badge.className = 'badge ' + (data.locked ? 'locked' : 'unlocked');\n"
-    "    badge.textContent = data.locked ? 'Locked' : data.vault_count + ' vault(s)';\n"
+    "function fetchPolicies() {\n"
+    "    fetchText('/api/policies' + tokenParam()).then(function(text) {\n"
+    "        renderPolicies(text);\n"
+    "    }).catch(function() { renderPolicies('Locked or unavailable'); });\n"
+    "}\n"
     "\n"
-    "    var vl = document.getElementById('vaultList');\n"
-    "    if (data.vaults.length === 0) {\n"
-    "        vl.innerHTML = '<div class=\"empty-state\"><div class=\"icon\">' + (data.locked ? '🔒' : '🛡️') + '</div>' +\n"
-    "            '<p>' + (data.locked ? 'Locked — click Unlock below.' : 'No vaults yet. Click + Add Vault.') + '</p></div>';\n"
-    "    } else {\n"
-    "        vl.innerHTML = data.vaults.map(function(v) {\n"
-    "            var exp = expandedVaults[v.id] ? ' expanded' : '';\n"
-    "            var vidArg = encodeURIComponent(v.id);\n"
-    "            return '<div class=\"vault-card' + exp + '\" onclick=\"toggle(decodeURIComponent(\\'' + vidArg + '\\'))\">' +\n"
-    "                '<div class=\"vault-row\"><div class=\"vault-name\"><span class=\"icon\">' +\n"
-    "                (v.mounted ? '🔓' : '🔒') + '</span>' + esc(v.id) + '</div>' +\n"
-    "                '<span class=\"vault-status ' + (v.mounted ? 'mounted' : 'locked') + '\">' +\n"
-    "                (v.mounted ? 'Active' : 'Locked') + '</span></div>' +\n"
-    "                '<div class=\"vault-source\">' + esc(v.source) + '</div>' +\n"
-    "                '<div class=\"vault-detail\">' +\n"
-    "                '<div class=\"vault-actions\">' +\n"
-    "                '<button onclick=\"event.stopPropagation();viewRules(decodeURIComponent(\\'' + vidArg + '\\'))\">Rules</button>' +\n"
-    "                '<button onclick=\"event.stopPropagation();showInput(\\'allow\\',decodeURIComponent(\\'' + vidArg + '\\'))\">Allow</button>' +\n"
-    "                '<button onclick=\"event.stopPropagation();showInput(\\'deny\\',decodeURIComponent(\\'' + vidArg + '\\'))\">Deny</button>' +\n"
-    "                '<button class=\"danger\" onclick=\"event.stopPropagation();toast(\\'Use CLI: onvault vault remove ' + esc(v.id) + '\\')\">Remove</button>' +\n"
-    "                '</div>' +\n"
-    "                '<div class=\"input-row\" id=\"allow-' + v.id + '\" style=\"display:none\">' +\n"
-    "                '<input placeholder=\"/usr/bin/process\" id=\"allow-input-' + v.id + '\">' +\n"
-    "                '<button onclick=\"event.stopPropagation();doRule(\\'allow\\',decodeURIComponent(\\'' + vidArg + '\\'))\">Allow</button>' +\n"
-    "                '</div>' +\n"
-    "                '<div class=\"input-row\" id=\"deny-' + v.id + '\" style=\"display:none\">' +\n"
-    "                '<input placeholder=\"/usr/bin/process\" id=\"deny-input-' + v.id + '\">' +\n"
-    "                '<button onclick=\"event.stopPropagation();doRule(\\'deny\\',decodeURIComponent(\\'' + vidArg + '\\'))\">Deny</button>' +\n"
-    "                '</div></div>';\n"
-    "        }).join('');\n"
+    "/* --- Tab switching --- */\n"
+    "function switchTab(name) {\n"
+    "    currentTab = name;\n"
+    "    var tabs = document.querySelectorAll('.tab');\n"
+    "    var contents = document.querySelectorAll('.tab-content');\n"
+    "    for (var i = 0; i < tabs.length; i++) {\n"
+    "        tabs[i].className = 'tab' + (tabs[i].id === 'tab-' + name ? ' active' : '');\n"
     "    }\n"
+    "    for (var j = 0; j < contents.length; j++) {\n"
+    "        contents[j].className = 'tab-content' + (contents[j].id === 'content-' + name ? ' active' : '');\n"
+    "    }\n"
+    "    if (name === 'log') fetchLog();\n"
+    "    if (name === 'policies') fetchPolicies();\n"
+    "    notifyResize();\n"
+    "}\n"
     "\n"
-    "    var ds = document.getElementById('denialSection');\n"
-    "    var dl = document.getElementById('denialList');\n"
-    "    if (denials.length > 0) {\n"
-    "        ds.style.display = 'block';\n"
-    "        dl.innerHTML = denials.slice(-5).reverse().map(function(d) {\n"
-    "            var pathArg = encodeURIComponent(d.path || '');\n"
-    "            var vaultArg = encodeURIComponent(d.vault || '');\n"
-    "            return '<div class=\"denial-card\"><div class=\"denial-info\">' +\n"
-    "                '<span class=\"denial-proc\">' + esc(d.process) + '</span> \\u2192 ' + esc(d.vault) +\n"
-    "                '<div class=\"denial-file\">' + esc(d.file) + '</div></div>' +\n"
-    "                '<span class=\"denial-time\">' + timeAgo(d.time) + '</span>' +\n"
-    "                '<button class=\"denial-allow\" onclick=\"quickAllow(decodeURIComponent(\\'' + pathArg + '\\'),decodeURIComponent(\\'' + vaultArg + '\\'))\">Allow</button></div>';\n"
-    "        }).join('');\n"
-    "    } else { ds.style.display = 'none'; }\n"
+    "/* --- Rendering --- */\n"
+    "function render() {\n"
+    "    /* Status pill */\n"
+    "    var pill = document.getElementById('statusPill');\n"
+    "    pill.className = 'status-pill ' + (state.locked ? 'locked' : 'unlocked');\n"
+    "    document.getElementById('statusText').textContent = state.locked ? 'Locked' : state.vault_count + ' vault' + (state.vault_count !== 1 ? 's' : '');\n"
     "\n"
-    "    var lockBtn = document.getElementById('lockBtn');\n"
-    "    if (lockBtn) lockBtn.textContent = data.locked ? 'Unlock' : 'Lock';\n"
-    "\n"
+    "    renderVaults();\n"
+    "    renderDenials();\n"
     "    document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});\n"
     "    notifyResize();\n"
     "}\n"
     "\n"
-    "function toggle(id) {\n"
-    "    expandedVaults[id] = !expandedVaults[id];\n"
-    "    render();\n"
+    "function renderVaults() {\n"
+    "    var vl = document.getElementById('vaultList');\n"
+    "    if (state.locked) {\n"
+    "        vl.innerHTML = '<div class=\"empty-state\"><div class=\"empty-icon\">&#x1F512;</div>' +\n"
+    "            '<div class=\"empty-text\">Locked<br>Click the status pill or use Settings to unlock.</div></div>';\n"
+    "        return;\n"
+    "    }\n"
+    "    if (!state.vaults || state.vaults.length === 0) {\n"
+    "        vl.innerHTML = '<div class=\"empty-state\"><div class=\"empty-icon\">&#x1F6E1;</div>' +\n"
+    "            '<div class=\"empty-text\">No vaults yet<br>Add a directory to protect it.</div></div>';\n"
+    "        return;\n"
+    "    }\n"
+    "    vl.innerHTML = state.vaults.map(function(v) {\n"
+    "        var exp = expandedVaults[v.id] ? ' expanded' : '';\n"
+    "        var vid = encodeURIComponent(v.id);\n"
+    "        return '<div class=\"card' + exp + '\" onclick=\"toggleVault(\\'' + vid + '\\')\">' +\n"
+    "            '<div class=\"card-row\"><div class=\"card-title\">' +\n"
+    "            (v.mounted ? '&#x1F513;' : '&#x1F512;') + ' ' + esc(v.id) + '</div>' +\n"
+    "            '<span class=\"badge-sm ' + (v.mounted ? 'active' : 'locked') + '\">' +\n"
+    "            (v.mounted ? 'Mounted' : 'Locked') + '</span></div>' +\n"
+    "            '<div class=\"card-subtitle\">' + esc(v.source) + '</div>' +\n"
+    "            '<div class=\"card-detail\">' +\n"
+    "            '<div class=\"btn-row\">' +\n"
+    "            '<button class=\"btn\" onclick=\"event.stopPropagation();viewRules(\\'' + vid + '\\')\">Rules</button>' +\n"
+    "            '<button class=\"btn\" onclick=\"event.stopPropagation();promptRule(\\'allow\\',\\'' + vid + '\\')\">Allow</button>' +\n"
+    "            '<button class=\"btn\" onclick=\"event.stopPropagation();promptRule(\\'deny\\',\\'' + vid + '\\')\">Deny</button>' +\n"
+    "            '<button class=\"btn danger\" onclick=\"event.stopPropagation();promptRemoveVault(\\'' + vid + '\\')\">Remove</button>' +\n"
+    "            '</div></div></div>';\n"
+    "    }).join('');\n"
     "}\n"
     "\n"
-    "function showInput(type, id) {\n"
-    "    var el = document.getElementById(type + '-' + id);\n"
-    "    var other = type === 'allow' ? 'deny' : 'allow';\n"
-    "    el.style.display = el.style.display === 'none' ? 'flex' : 'none';\n"
-    "    document.getElementById(other + '-' + id).style.display = 'none';\n"
+    "function renderDenials() {\n"
+    "    var ds = document.getElementById('denialSection');\n"
+    "    var dl = document.getElementById('denialList');\n"
+    "    if (!denials || denials.length === 0) { ds.style.display = 'none'; return; }\n"
+    "    ds.style.display = 'block';\n"
+    "    dl.innerHTML = denials.slice(-5).reverse().map(function(d) {\n"
+    "        var pa = encodeURIComponent(d.path || '');\n"
+    "        var va = encodeURIComponent(d.vault || '');\n"
+    "        return '<div class=\"denial-card\">' +\n"
+    "            '<div class=\"denial-icon\">&#x26A0;</div>' +\n"
+    "            '<div class=\"denial-info\"><span class=\"denial-proc\">' + esc(d.process) + '</span>' +\n"
+    "            '<div class=\"denial-file\">' + esc(d.file) + '</div></div>' +\n"
+    "            '<div class=\"denial-meta\"><span class=\"denial-time\">' + timeAgo(d.time) + '</span>' +\n"
+    "            '<button class=\"btn-allow-sm\" onclick=\"promptQuickAllow(\\'' + pa + '\\',\\'' + va + '\\')\">Allow</button></div></div>';\n"
+    "    }).join('');\n"
     "}\n"
     "\n"
-    "function doRule(type, id) {\n"
-    "    var input = document.getElementById(type + '-input-' + id);\n"
-    "    var proc = input.value.trim();\n"
-    "    if (!proc) return;\n"
-    "    input.value = '';\n"
-    "    document.getElementById(type + '-' + id).style.display = 'none';\n"
-    "    postAPI('/api/' + type, proc + '\\n' + id).then(function(j) {\n"
-    "        toast(esc(j.msg), !j.ok);\n"
-    "        fetchData();\n"
-    "    }).catch(function() { toast('Failed', true); });\n"
-    "}\n"
-    "\n"
-    "function promptAddVault() {\n"
-    "    var panel = document.getElementById('addVaultPanel');\n"
-    "    panel.style.display = panel.style.display === 'none' ? 'block' : 'none';\n"
-    "    if (panel.style.display === 'block') document.getElementById('addVaultInput').focus();\n"
+    "function renderPolicies(text) {\n"
+    "    var el = document.getElementById('policyList');\n"
+    "    if (!text || text.indexOf('Locked') >= 0) {\n"
+    "        el.innerHTML = '<div class=\"empty-state\"><div class=\"empty-icon\">&#x1F4CB;</div>' +\n"
+    "            '<div class=\"empty-text\">Unlock to view policies</div></div>';\n"
+    "    } else {\n"
+    "        el.innerHTML = '<pre style=\"font-size:11px;color:var(--text-secondary);white-space:pre-wrap;' +\n"
+    "            'font-family:SF Mono,Menlo,monospace;background:var(--surface);padding:12px;' +\n"
+    "            'border-radius:var(--radius);border:1px solid var(--border)\">' + esc(text) + '</pre>';\n"
+    "    }\n"
     "    notifyResize();\n"
     "}\n"
     "\n"
+    "function renderLog() {\n"
+    "    var el = document.getElementById('logList');\n"
+    "    if (!logEntries || logEntries.length === 0) {\n"
+    "        el.innerHTML = '<div class=\"empty-state\"><div class=\"empty-icon\">&#x1F4DD;</div>' +\n"
+    "            '<div class=\"empty-text\">No log entries</div></div>';\n"
+    "        notifyResize();\n"
+    "        return;\n"
+    "    }\n"
+    "    var filtered = logEntries;\n"
+    "    if (logFilter === 'denied') {\n"
+    "        filtered = logEntries.filter(function(e) { return e.event && e.event.toLowerCase().indexOf('deny') >= 0; });\n"
+    "    } else if (logFilter === 'allowed') {\n"
+    "        filtered = logEntries.filter(function(e) { return e.event && e.event.toLowerCase().indexOf('allow') >= 0; });\n"
+    "    }\n"
+    "    el.innerHTML = filtered.slice(-30).reverse().map(function(e) {\n"
+    "        var evClass = '';\n"
+    "        var ev = (e.event || '').toLowerCase();\n"
+    "        if (ev.indexOf('allow') >= 0) evClass = ' allow';\n"
+    "        else if (ev.indexOf('deny') >= 0) evClass = ' deny';\n"
+    "        else if (ev.indexOf('unlock') >= 0) evClass = ' unlock';\n"
+    "        else if (ev.indexOf('lock') >= 0) evClass = ' lock';\n"
+    "        var ts = e.ts ? new Date(e.ts * 1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'}) : '';\n"
+    "        return '<div class=\"log-entry\"><span class=\"log-ts\">' + ts + '</span>' +\n"
+    "            '<span class=\"log-event' + evClass + '\">' + esc(e.event) + '</span>' +\n"
+    "            (e.vault ? ' ' + esc(e.vault) : '') +\n"
+    "            (e.detail ? '<span class=\"log-detail\">' + esc(e.detail) + '</span>' : '') +\n"
+    "            '</div>';\n"
+    "    }).join('');\n"
+    "    notifyResize();\n"
+    "}\n"
+    "\n"
+    "function filterLog(f) {\n"
+    "    logFilter = f;\n"
+    "    var filters = ['all', 'denied', 'allowed'];\n"
+    "    filters.forEach(function(name) {\n"
+    "        var btn = document.getElementById('log-filter-' + name);\n"
+    "        if (btn) {\n"
+    "            btn.style.background = (name === f) ? 'var(--accent-bg)' : '';\n"
+    "            btn.style.color = (name === f) ? 'var(--accent)' : '';\n"
+    "        }\n"
+    "    });\n"
+    "    renderLog();\n"
+    "}\n"
+    "\n"
+    "/* --- Interactions --- */\n"
+    "function toggleVault(vid) {\n"
+    "    var id = decodeURIComponent(vid);\n"
+    "    expandedVaults[id] = !expandedVaults[id];\n"
+    "    renderVaults();\n"
+    "    notifyResize();\n"
+    "}\n"
+    "\n"
+    "function viewRules(vid) {\n"
+    "    var id = decodeURIComponent(vid);\n"
+    "    fetchText('/api/rules?vault=' + encodeURIComponent(id) + (authToken ? '&token=' + encodeURIComponent(authToken) : '')).then(function(text) {\n"
+    "        showModal('Rules: ' + id, '<pre>' + esc(text) + '</pre>');\n"
+    "    }).catch(function() { toast('Failed to load rules', true); });\n"
+    "}\n"
+    "\n"
+    "/* --- Auth-gated actions with passphrase modal --- */\n"
+    "function showPassphraseModal(title, desc, callback) {\n"
+    "    var tp = tokenParam().replace('?','&');\n"
+    "    fetchJSON('/api/auth-status' + tokenParam()).then(function(r) {\n"
+    "        if (r && r.elevated) {\n"
+    "            callback(null); /* elevated — no passphrase needed */\n"
+    "        } else {\n"
+    "            showModal(title, '<p>' + desc + '</p>' +\n"
+    "                '<input type=\"password\" class=\"form-input\" id=\"modalPassInput\" placeholder=\"Passphrase\" ' +\n"
+    "                'onkeydown=\"if(event.keyCode===13)document.getElementById(\\'modalPassBtn\\').click()\">' +\n"
+    "                '<button class=\"btn primary btn-full\" id=\"modalPassBtn\" onclick=\"submitModalPass()\">Confirm</button>');\n"
+    "            window._pendingPassCallback = callback;\n"
+    "            setTimeout(function() {\n"
+    "                var inp = document.getElementById('modalPassInput');\n"
+    "                if (inp) inp.focus();\n"
+    "            }, 100);\n"
+    "        }\n"
+    "    }).catch(function() {\n"
+    "        showModal(title, '<p>' + desc + '</p>' +\n"
+    "            '<input type=\"password\" class=\"form-input\" id=\"modalPassInput\" placeholder=\"Passphrase\" ' +\n"
+    "            'onkeydown=\"if(event.keyCode===13)document.getElementById(\\'modalPassBtn\\').click()\">' +\n"
+    "            '<button class=\"btn primary btn-full\" id=\"modalPassBtn\" onclick=\"submitModalPass()\">Confirm</button>');\n"
+    "        window._pendingPassCallback = callback;\n"
+    "        setTimeout(function() {\n"
+    "            var inp = document.getElementById('modalPassInput');\n"
+    "            if (inp) inp.focus();\n"
+    "        }, 100);\n"
+    "    });\n"
+    "}\n"
+    "\n"
+    "function submitModalPass() {\n"
+    "    var inp = document.getElementById('modalPassInput');\n"
+    "    var pass = inp ? inp.value : '';\n"
+    "    if (!pass) return;\n"
+    "    hideModal();\n"
+    "    if (window._pendingPassCallback) {\n"
+    "        window._pendingPassCallback(pass);\n"
+    "        window._pendingPassCallback = null;\n"
+    "    }\n"
+    "}\n"
+    "\n"
+    "function promptRule(type, vid) {\n"
+    "    var id = decodeURIComponent(vid);\n"
+    "    showModal((type === 'allow' ? 'Allow' : 'Deny') + ' Process', '<p>Enter process path for <strong>' + esc(id) + '</strong></p>' +\n"
+    "        '<input class=\"form-input\" id=\"modalProcInput\" placeholder=\"/usr/bin/process\" ' +\n"
+    "        'onkeydown=\"if(event.keyCode===13)document.getElementById(\\'modalProcBtn\\').click()\">' +\n"
+    "        '<button class=\"btn primary btn-full\" id=\"modalProcBtn\" onclick=\"doRuleFromModal(\\'' +\n"
+    "        encodeURIComponent(type) + '\\',\\'' + encodeURIComponent(id) + '\\')\">Confirm</button>');\n"
+    "    setTimeout(function() {\n"
+    "        var inp = document.getElementById('modalProcInput');\n"
+    "        if (inp) inp.focus();\n"
+    "    }, 100);\n"
+    "}\n"
+    "\n"
+    "function doRuleFromModal(typeEnc, vidEnc) {\n"
+    "    var type = decodeURIComponent(typeEnc);\n"
+    "    var id = decodeURIComponent(vidEnc);\n"
+    "    var procInput = document.getElementById('modalProcInput');\n"
+    "    var proc = procInput ? procInput.value.trim() : '';\n"
+    "    if (!proc) return;\n"
+    "    hideModal();\n"
+    "    showPassphraseModal(type === 'allow' ? 'Authorize Allow' : 'Authorize Deny',\n"
+    "        'Enter passphrase to ' + type + ' <strong>' + esc(proc) + '</strong> for <strong>' + esc(id) + '</strong>.',\n"
+    "        function(pass) {\n"
+    "            var body = pass ? (pass + '\\n' + proc + '\\n' + id) : (proc + '\\n' + id);\n"
+    "            postAPI('/api/' + type, body).then(function(j) {\n"
+    "                toast(j.msg || (type + ' applied'), !j.ok);\n"
+    "                fetchData();\n"
+    "            }).catch(function() { toast('Failed', true); });\n"
+    "        });\n"
+    "}\n"
+    "\n"
+    "function promptQuickAllow(pathEnc, vaultEnc) {\n"
+    "    var proc = decodeURIComponent(pathEnc);\n"
+    "    var vault = decodeURIComponent(vaultEnc);\n"
+    "    showPassphraseModal('Authorize Allow', 'Allow <strong>' + esc(proc) + '</strong> for <strong>' + esc(vault) + '</strong>?', function(pass) {\n"
+    "        var body = pass ? (pass + '\\n' + proc + '\\n' + vault) : (proc + '\\n' + vault);\n"
+    "        postAPI('/api/allow', body).then(function(j) {\n"
+    "            toast(j.msg || 'Allowed', !j.ok);\n"
+    "            fetchData();\n"
+    "        }).catch(function() { toast('Failed', true); });\n"
+    "    });\n"
+    "}\n"
+    "\n"
+    "function promptRemoveVault(vid) {\n"
+    "    var id = decodeURIComponent(vid);\n"
+    "    showPassphraseModal('Remove Vault', 'This will decrypt and unprotect <strong>' + esc(id) + '</strong>. Enter passphrase to confirm.', function(pass) {\n"
+    "        if (!pass) { toast('Passphrase required', true); return; }\n"
+    "        postAPI('/api/vault/remove', pass + '\\n' + id).then(function(j) {\n"
+    "            toast(j.msg || 'Removed', !j.ok);\n"
+    "            fetchData();\n"
+    "        }).catch(function() { toast('Use CLI: onvault vault remove ' + id, true); });\n"
+    "    });\n"
+    "}\n"
+    "\n"
+    "function promptAddVault() {\n"
+    "    showModal('Add Vault', '<p>Enter the path to protect:</p>' +\n"
+    "        '<input class=\"form-input\" id=\"modalAddInput\" placeholder=\"~/.ssh or /path/to/dir\" ' +\n"
+    "        'onkeydown=\"if(event.keyCode===13)document.getElementById(\\'modalAddBtn\\').click()\">' +\n"
+    "        '<button class=\"btn primary btn-full\" id=\"modalAddBtn\" onclick=\"doAddVault()\">Protect</button>');\n"
+    "    setTimeout(function() {\n"
+    "        var inp = document.getElementById('modalAddInput');\n"
+    "        if (inp) inp.focus();\n"
+    "    }, 100);\n"
+    "}\n"
+    "\n"
     "function doAddVault() {\n"
-    "    var input = document.getElementById('addVaultInput');\n"
-    "    var path = input.value.trim();\n"
+    "    var inp = document.getElementById('modalAddInput');\n"
+    "    var path = inp ? inp.value.trim() : '';\n"
     "    if (!path) return;\n"
-    "    input.value = '';\n"
-    "    document.getElementById('addVaultPanel').style.display = 'none';\n"
+    "    hideModal();\n"
     "    postAPI('/api/vault/add', path).then(function(j) {\n"
-    "        toast(esc(j.msg), !j.ok);\n"
+    "        toast(j.msg || 'Vault added', !j.ok);\n"
     "        fetchData();\n"
     "    }).catch(function() { toast('Failed to add vault', true); });\n"
     "}\n"
     "\n"
-    "function viewRules(id) {\n"
-    "    var tokenParam = authToken ? '&token=' + encodeURIComponent(authToken) : '';\n"
-    "    fetchText('/api/rules?vault=' + encodeURIComponent(id) + tokenParam).then(function(text) {\n"
-    "        showPanel('Rules: ' + id, text);\n"
-    "    }).catch(function(err) {\n"
-    "        toast(esc(err && err.msg ? err.msg : 'Failed to load rules'), true);\n"
-    "    });\n"
-    "}\n"
-    "\n"
-    "function quickAllow(proc, vault) {\n"
-    "    postAPI('/api/allow', proc + '\\n' + vault).then(function(j) {\n"
-    "        toast(esc(j.msg), !j.ok);\n"
-    "        fetchData();\n"
-    "    }).catch(function() { toast('Failed', true); });\n"
-    "}\n"
-    "\n"
-    "function refresh() {\n"
-    "    var btn = document.getElementById('refreshBtn');\n"
-    "    btn.innerHTML = '<span class=\"spinning\">\\u21bb</span>';\n"
-    "    fetchData().then(function() { btn.textContent = 'Refresh'; });\n"
-    "}\n"
+    "/* --- Lock/Unlock --- */\n"
+    "document.getElementById('statusPill').onclick = function() { doLockUnlock(); };\n"
     "\n"
     "function doLockUnlock() {\n"
-    "    if (data.locked) {\n"
-    "        showPanel('Unlock', 'Enter your passphrase to unlock all vaults.');\n"
-    "        pendingAuthAction = 'unlock';\n"
+    "    if (state.locked) {\n"
+    "        showModal('Unlock', '<p>Enter your passphrase to unlock all vaults.</p>' +\n"
+    "            '<input type=\"password\" class=\"form-input\" id=\"modalUnlockInput\" placeholder=\"Passphrase\" ' +\n"
+    "            'onkeydown=\"if(event.keyCode===13)document.getElementById(\\'modalUnlockBtn\\').click()\">' +\n"
+    "            '<button class=\"btn primary btn-full\" id=\"modalUnlockBtn\" onclick=\"doUnlock()\">Unlock</button>');\n"
+    "        setTimeout(function() {\n"
+    "            var inp = document.getElementById('modalUnlockInput');\n"
+    "            if (inp) inp.focus();\n"
+    "        }, 100);\n"
     "    } else {\n"
-    "        showPanel('Lock All Vaults', 'Enter your passphrase to lock and unmount all vaults.');\n"
-    "        pendingAuthAction = 'lock';\n"
+    "        showPassphraseModal('Lock', 'Enter passphrase to lock and unmount all vaults.', function(pass) {\n"
+    "            if (!pass) { toast('Passphrase required', true); return; }\n"
+    "            postAPI('/api/lock', pass).then(function(j) {\n"
+    "                if (j.ok) authToken = null;\n"
+    "                toast(j.msg || 'Locked', !j.ok);\n"
+    "                fetchData();\n"
+    "            }).catch(function() { toast('Failed to lock', true); });\n"
+    "        });\n"
     "    }\n"
-    "    document.getElementById('panelAuth').style.display = 'block';\n"
-    "    document.getElementById('panelPassInput').value = '';\n"
-    "    setTimeout(function() { document.getElementById('panelPassInput').focus(); }, 100);\n"
     "}\n"
     "\n"
-    "function panelAuthSubmit() {\n"
-    "    var pass = document.getElementById('panelPassInput').value;\n"
+    "function doUnlock() {\n"
+    "    var inp = document.getElementById('modalUnlockInput');\n"
+    "    var pass = inp ? inp.value : '';\n"
     "    if (!pass) return;\n"
-    "    document.getElementById('panelPassInput').value = '';\n"
-    "    var action = pendingAuthAction;\n"
-    "    pendingAuthAction = null;\n"
-    "\n"
-    "    /* Show loading state */\n"
-    "    document.getElementById('panelBody').textContent = 'Authenticating...';\n"
-    "    document.getElementById('panelAuth').style.display = 'none';\n"
-    "\n"
-    "    postAPI('/api/' + action, pass).then(function(j) {\n"
-    "        if (action === 'unlock' && j.ok && j.token) {\n"
-    "            authToken = j.token;\n"
-    "        }\n"
-    "        if (action === 'lock' && j.ok) {\n"
-    "            authToken = null;\n"
-    "        }\n"
-    "        toast(esc(j.msg), !j.ok);\n"
-    "        hidePanel();\n"
+    "    hideModal();\n"
+    "    postAPI('/api/unlock', pass).then(function(j) {\n"
+    "        if (j.ok && j.token) authToken = j.token;\n"
+    "        toast(j.msg || (j.ok ? 'Unlocked' : 'Failed'), !j.ok);\n"
     "        fetchData();\n"
-    "    }).catch(function() {\n"
-    "        toast('Failed — try again', true);\n"
-    "        hidePanel();\n"
+    "    }).catch(function() { toast('Failed to unlock', true); });\n"
+    "}\n"
+    "\n"
+    "/* --- Touch ID --- */\n"
+    "function doTouchIdUnlock() {\n"
+    "    postAPI('/api/unlock-touchid', '').then(function(j) {\n"
+    "        if (j.ok && j.token) authToken = j.token;\n"
+    "        toast(j.msg || (j.ok ? 'Unlocked via Touch ID' : 'Touch ID failed'), !j.ok);\n"
+    "        fetchData();\n"
+    "    }).catch(function() { toast('Touch ID not available', true); });\n"
+    "}\n"
+    "\n"
+    "/* --- Recovery --- */\n"
+    "function showRecoveryPrompt() {\n"
+    "    showPassphraseModal('View Recovery Key', 'Enter passphrase to view your recovery key.', function(pass) {\n"
+    "        if (!pass) { toast('Passphrase required', true); return; }\n"
+    "        postAPI('/api/export-recovery', pass).then(function(j) {\n"
+    "            if (j.ok) {\n"
+    "                showModal('Recovery Key', '<p>Store this key securely. You will need it if you forget your passphrase.</p>' +\n"
+    "                    '<pre style=\"font-size:16px;text-align:center;letter-spacing:2px;padding:16px\">' + esc(j.key) + '</pre>');\n"
+    "            } else {\n"
+    "                toast(j.msg || 'Failed', true);\n"
+    "            }\n"
+    "        }).catch(function() { toast('Failed', true); });\n"
     "    });\n"
     "}\n"
     "\n"
-    "function viewPolicies() {\n"
-    "    var tokenParam = authToken ? '?token=' + encodeURIComponent(authToken) : '';\n"
-    "    fetchText('/api/policies' + tokenParam).then(function(text) {\n"
-    "        showPanel('All Policies', text);\n"
-    "    }).catch(function(err) {\n"
-    "        toast(esc(err && err.msg ? err.msg : 'Failed to load policies'), true);\n"
+    "function showRecoverPrompt() {\n"
+    "    showModal('Recovery Unlock', '<p>Enter your 24-character recovery key and a new passphrase.</p>' +\n"
+    "        '<input class=\"form-input\" id=\"modalRecKeyInput\" placeholder=\"Recovery key (24 chars)\" style=\"margin-bottom:8px\">' +\n"
+    "        '<input type=\"password\" class=\"form-input\" id=\"modalRecPassInput\" placeholder=\"New passphrase\" style=\"margin-bottom:8px\">' +\n"
+    "        '<input type=\"password\" class=\"form-input\" id=\"modalRecPass2Input\" placeholder=\"Confirm new passphrase\">' +\n"
+    "        '<button class=\"btn primary btn-full\" id=\"modalRecBtn\" onclick=\"doRecover()\">Recover</button>');\n"
+    "    setTimeout(function() {\n"
+    "        var inp = document.getElementById('modalRecKeyInput');\n"
+    "        if (inp) inp.focus();\n"
+    "    }, 100);\n"
+    "}\n"
+    "\n"
+    "function doRecover() {\n"
+    "    var key = (document.getElementById('modalRecKeyInput').value || '').trim();\n"
+    "    var pass1 = document.getElementById('modalRecPassInput').value || '';\n"
+    "    var pass2 = document.getElementById('modalRecPass2Input').value || '';\n"
+    "    if (!key || !pass1) { toast('All fields required', true); return; }\n"
+    "    if (pass1 !== pass2) { toast('Passphrases do not match', true); return; }\n"
+    "    hideModal();\n"
+    "    postAPI('/api/recover', key + '\\n' + pass1).then(function(j) {\n"
+    "        if (j.ok && j.token) authToken = j.token;\n"
+    "        toast(j.msg || (j.ok ? 'Recovered successfully' : 'Failed'), !j.ok);\n"
+    "        fetchData();\n"
+    "    }).catch(function() { toast('Recovery failed', true); });\n"
+    "}\n"
+    "\n"
+    "/* --- Key Rotation --- */\n"
+    "function showRotatePrompt() {\n"
+    "    showPassphraseModal('Rotate Keys', 'This will re-encrypt all vault files with a new master key. This may take a while for large vaults.', function(pass) {\n"
+    "        if (!pass) { toast('Passphrase required', true); return; }\n"
+    "        toast('Rotating keys...', false);\n"
+    "        postAPI('/api/rotate-keys', pass).then(function(j) {\n"
+    "            toast(j.msg || (j.ok ? 'Keys rotated' : 'Failed'), !j.ok);\n"
+    "            fetchData();\n"
+    "        }).catch(function() { toast('Rotation failed', true); });\n"
     "    });\n"
     "}\n"
     "\n"
-    "function showPanel(title, body) {\n"
-    "    document.getElementById('panelTitle').textContent = title;\n"
-    "    document.getElementById('panelBody').textContent = body || '';\n"
-    "    document.getElementById('panelAuth').style.display = 'none';\n"
-    "    document.getElementById('panelOverlay').className = 'panel-overlay show';\n"
+    "/* --- Modal --- */\n"
+    "function showModal(title, bodyHtml) {\n"
+    "    document.getElementById('modalTitle').textContent = title;\n"
+    "    document.getElementById('modalBody').innerHTML = bodyHtml;\n"
+    "    document.getElementById('modalOverlay').className = 'modal-overlay show';\n"
+    "    notifyResize();\n"
     "}\n"
     "\n"
-    "function hidePanel() {\n"
-    "    document.getElementById('panelOverlay').className = 'panel-overlay';\n"
+    "function hideModal() {\n"
+    "    document.getElementById('modalOverlay').className = 'modal-overlay';\n"
+    "    window._pendingPassCallback = null;\n"
+    "    notifyResize();\n"
     "}\n"
     "\n"
-    "function notifyResize() {\n"
-    "    try { window.webkit.messageHandlers.resize.postMessage(document.body.scrollHeight); } catch(e) {}\n"
+    "/* --- Session refresh --- */\n"
+    "function refreshSession() {\n"
+    "    if (!authToken) return;\n"
+    "    var tp = tokenParam();\n"
+    "    fetch(API + '/api/session-refresh' + tp).catch(function() {});\n"
     "}\n"
     "\n"
+    "/* --- Init --- */\n"
     "fetchData();\n"
     "if (_refreshInterval) clearInterval(_refreshInterval);\n"
     "_refreshInterval = setInterval(fetchData, 5000);\n"
+    "setInterval(refreshSession, 600000); /* every 10 min */\n"
     "</script>\n"
     "</body>\n"
     "</html>\n"

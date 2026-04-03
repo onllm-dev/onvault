@@ -30,6 +30,8 @@ typedef enum {
     IPC_CMD_ROTATE_KEYS,
     IPC_CMD_LOG,
     IPC_CMD_AUTH_CHALLENGE,  /* Request a nonce for challenge-response auth */
+    IPC_CMD_UNLOCK_TOUCHID,  /* Unlock via Touch ID biometrics */
+    IPC_CMD_RECOVER,         /* Unlock via recovery key + set new passphrase */
 } onvault_ipc_cmd_t;
 
 /* IPC message header */

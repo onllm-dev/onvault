@@ -137,34 +137,76 @@ src/auth/touchid.o: src/auth/touchid.m
 	$(CC) $(OBJCFLAGS) $(INCLUDES) -c $< -o $@
 
 # CLI binary
-$(CLI_BIN): src/cli/onvault.c $(COMMON_OBJ) $(AUTH_OBJ) $(KEYSTORE_OBJ)
-	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^ $(LDFLAGS)
+$(CLI_BIN): src/cli/onvault.c $(COMMON_OBJ) $(AUTH_OBJ) $(KEYSTORE_OBJ) $(TOUCHID_OBJ)
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^ $(LDFLAGS) -framework LocalAuthentication
 
 # Daemon binary (includes all modules)
 $(DAEMON_BIN): src/daemon/onvaultd.c $(ALL_C_OBJ) $(KEYSTORE_OBJ) $(ESF_M_OBJ) $(MENUBAR_OBJ) $(TOUCHID_OBJ)
 	$(CC) $(OBJCFLAGS) $(INCLUDES) -o $@ $^ $(LDFLAGS_GUI) $(LDFLAGS_ESF) $(FUSE_LDFLAGS)
 
-TEST_VAULT_BIN = tests/test_vault
+TEST_VAULT_BIN    = tests/test_vault
+TEST_AUTH_BIN     = tests/test_auth
+TEST_FUSE_OPS_BIN = tests/test_fuse_ops
+TEST_CONFIG_BIN   = tests/test_config
+TEST_POLICY_BIN   = tests/test_policy
+TEST_LOG_BIN      = tests/test_log
 TEST_KEYSTORE_STUB = tests/keystore_stub.o
+TEST_TOUCHID_STUB  = tests/touchid_stub.o
+TEST_STUBS         = $(TEST_KEYSTORE_STUB) $(TEST_TOUCHID_STUB)
 
-# Test keystore stub (in-memory, no Keychain popups)
+# Test stubs (in-memory, no Keychain/TouchID popups)
 $(TEST_KEYSTORE_STUB): tests/keystore_stub.c
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
+$(TEST_TOUCHID_STUB): tests/touchid_stub.c
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
 # Test binaries (use stub keystore — no Keychain/iCloud access)
-$(TEST_BIN): tests/test_crypto.c $(COMMON_OBJ) $(AUTH_OBJ) $(TEST_KEYSTORE_STUB)
+$(TEST_BIN): tests/test_crypto.c $(COMMON_OBJ) $(AUTH_OBJ) $(TEST_STUBS)
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^ $(TEST_LDFLAGS)
 
-$(TEST_VAULT_BIN): tests/test_vault.c $(COMMON_OBJ) $(FUSE_OBJ) $(ESF_C_OBJ) $(AUTH_OBJ) $(TEST_KEYSTORE_STUB)
+$(TEST_VAULT_BIN): tests/test_vault.c $(COMMON_OBJ) $(FUSE_OBJ) $(ESF_C_OBJ) $(AUTH_OBJ) $(TEST_STUBS)
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^ $(TEST_LDFLAGS) $(FUSE_LDFLAGS)
 
-# Run tests
-test: $(TEST_BIN) $(TEST_VAULT_BIN)
+$(TEST_AUTH_BIN): tests/test_auth.c $(COMMON_OBJ) $(AUTH_OBJ) $(TEST_STUBS)
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^ $(TEST_LDFLAGS)
+
+$(TEST_FUSE_OPS_BIN): tests/test_fuse_ops.c $(COMMON_OBJ) $(FUSE_OBJ) $(ESF_C_OBJ) $(AUTH_OBJ) $(TEST_STUBS)
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^ $(TEST_LDFLAGS) $(FUSE_LDFLAGS)
+
+$(TEST_CONFIG_BIN): tests/test_config.c $(COMMON_OBJ) $(AUTH_OBJ) $(TEST_STUBS)
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^ $(TEST_LDFLAGS)
+
+$(TEST_POLICY_BIN): tests/test_policy.c $(COMMON_OBJ) $(FUSE_OBJ) $(ESF_C_OBJ) $(AUTH_OBJ) $(TEST_STUBS)
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^ $(TEST_LDFLAGS) $(FUSE_LDFLAGS)
+
+$(TEST_LOG_BIN): tests/test_log.c $(COMMON_OBJ) $(AUTH_OBJ) $(TEST_STUBS)
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^ $(TEST_LDFLAGS)
+
+# Run tests — prefix each binary with HOME=$${HOME} so a test suite that
+# overrides HOME via setenv() cannot pollute the shell environment for the
+# next suite (each recipe line runs in its own sub-shell).
+test: $(TEST_BIN) $(TEST_VAULT_BIN) $(TEST_AUTH_BIN) $(TEST_FUSE_OPS_BIN) $(TEST_CONFIG_BIN) $(TEST_POLICY_BIN) $(TEST_LOG_BIN)
 	@echo "=== Running crypto tests ==="
-	./$(TEST_BIN)
+	HOME=$${HOME} ./$(TEST_BIN)
 	@echo ""
 	@echo "=== Running vault tests ==="
-	./$(TEST_VAULT_BIN)
+	HOME=$${HOME} ./$(TEST_VAULT_BIN)
+	@echo ""
+	@echo "=== Running auth tests ==="
+	HOME=$${HOME} ./$(TEST_AUTH_BIN)
+	@echo ""
+	@echo "=== Running FUSE ops tests ==="
+	HOME=$${HOME} ./$(TEST_FUSE_OPS_BIN)
+	@echo ""
+	@echo "=== Running config parser tests ==="
+	HOME=$${HOME} ./$(TEST_CONFIG_BIN)
+	@echo ""
+	@echo "=== Running policy tests ==="
+	HOME=$${HOME} ./$(TEST_POLICY_BIN)
+	@echo ""
+	@echo "=== Running audit log tests ==="
+	HOME=$${HOME} ./$(TEST_LOG_BIN)
 
 # Distribution build (OpenSSL/Argon2 static; macFUSE still required at runtime)
 .PHONY: dist install uninstall
@@ -202,4 +244,4 @@ uninstall:
 
 clean:
 	find src -name "*.o" -delete
-	rm -f $(CLI_BIN) $(DAEMON_BIN) $(TEST_BIN) $(TEST_VAULT_BIN) tests/*.o
+	rm -f $(CLI_BIN) $(DAEMON_BIN) $(TEST_BIN) $(TEST_VAULT_BIN) $(TEST_AUTH_BIN) $(TEST_FUSE_OPS_BIN) $(TEST_CONFIG_BIN) $(TEST_POLICY_BIN) $(TEST_LOG_BIN) $(TEST_STUBS) tests/*.o

@@ -26,6 +26,7 @@
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/mount.h>
+#include <sys/statvfs.h>
 #include <dirent.h>
 #include <stdlib.h>
 
@@ -58,14 +59,47 @@ static onvault_fuse_ctx_t *get_ctx(void)
     return (onvault_fuse_ctx_t *)fuse_get_context()->private_data;
 }
 
-/* Map a FUSE path to the real ciphertext path */
-static void real_path(const char *path, char *out)
+/* Map a FUSE path to the real ciphertext path.
+ * Returns 0 on success, -1 if path escapes the vault directory. */
+static int real_path(const char *path, char *out)
 {
     onvault_fuse_ctx_t *ctx = get_ctx();
-    if (strcmp(path, "/") == 0)
+
+    if (strcmp(path, "/") == 0) {
         snprintf(out, PATH_MAX, "%s", ctx->vault_dir);
-    else
-        snprintf(out, PATH_MAX, "%s%s", ctx->vault_dir, path);
+        return 0;
+    }
+
+    /* Reject paths containing ".." to prevent directory traversal */
+    if (strstr(path, "..") != NULL)
+        return -1;
+
+    snprintf(out, PATH_MAX, "%s%s", ctx->vault_dir, path);
+
+    /* Resolve symlinks and verify the result stays within vault_dir */
+    char resolved[PATH_MAX];
+    if (realpath(out, resolved) != NULL) {
+        size_t vlen = strlen(ctx->vault_dir);
+        if (strncmp(resolved, ctx->vault_dir, vlen) != 0)
+            return -1; /* escaped vault boundary */
+        snprintf(out, PATH_MAX, "%s", resolved);
+    }
+    /* If realpath fails (file doesn't exist yet), verify the parent */
+    else {
+        char parent[PATH_MAX];
+        snprintf(parent, PATH_MAX, "%s", out);
+        char *slash = strrchr(parent, '/');
+        if (slash && slash != parent) {
+            *slash = '\0';
+            if (realpath(parent, resolved) != NULL) {
+                size_t vlen = strlen(ctx->vault_dir);
+                if (strncmp(resolved, ctx->vault_dir, vlen) != 0)
+                    return -1;
+            }
+        }
+    }
+
+    return 0;
 }
 
 static size_t ciphertext_len_for_plaintext(uint64_t plain_size)
@@ -85,7 +119,7 @@ static size_t ciphertext_len_for_plaintext(uint64_t plain_size)
 static int ov_getattr(const char *path, struct stat *stbuf)
 {
     char rpath[PATH_MAX];
-    real_path(path, rpath);
+    if (real_path(path, rpath) != 0) return -EACCES;
 
     if (lstat(rpath, stbuf) != 0)
         return -errno;
@@ -113,7 +147,7 @@ static int ov_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
     (void)fi;
 
     char rpath[PATH_MAX];
-    real_path(path, rpath);
+    if (real_path(path, rpath) != 0) return -EACCES;
 
     DIR *dir = opendir(rpath);
     if (!dir)
@@ -147,7 +181,7 @@ static int ov_open(const char *path, struct fuse_file_info *fi)
     }
 
     char rpath[PATH_MAX];
-    real_path(path, rpath);
+    if (real_path(path, rpath) != 0) return -EACCES;
 
     int fd = open(rpath, fi->flags);
     if (fd < 0)
@@ -163,7 +197,7 @@ static int ov_read(const char *path, char *buf, size_t size, off_t offset,
     (void)fi;
 
     char rpath[PATH_MAX];
-    real_path(path, rpath);
+    if (real_path(path, rpath) != 0) return -EACCES;
 
     onvault_fuse_ctx_t *ctx = get_ctx();
 
@@ -252,7 +286,7 @@ static int ov_write(const char *path, const char *buf, size_t size, off_t offset
     (void)fi;
 
     char rpath[PATH_MAX];
-    real_path(path, rpath);
+    if (real_path(path, rpath) != 0) return -EACCES;
 
     onvault_fuse_ctx_t *ctx = get_ctx();
 
@@ -379,7 +413,7 @@ static int ov_write(const char *path, const char *buf, size_t size, off_t offset
 static int ov_truncate(const char *path, off_t newsize)
 {
     char rpath[PATH_MAX];
-    real_path(path, rpath);
+    if (real_path(path, rpath) != 0) return -EACCES;
 
     if (newsize < 0)
         return -EINVAL;
@@ -532,7 +566,7 @@ static int ov_create(const char *path, mode_t mode, struct fuse_file_info *fi)
     }
 
     char rpath[PATH_MAX];
-    real_path(path, rpath);
+    if (real_path(path, rpath) != 0) return -EACCES;
 
     /* Create the ciphertext file with size header */
     int fd = open(rpath, O_CREAT | O_WRONLY | O_TRUNC, mode);
@@ -553,6 +587,99 @@ static int ov_create(const char *path, mode_t mode, struct fuse_file_info *fi)
     return 0;
 }
 
+static int ov_unlink(const char *path)
+{
+    char rpath[PATH_MAX];
+    if (real_path(path, rpath) != 0) return -EACCES;
+    if (unlink(rpath) != 0)
+        return -errno;
+    return 0;
+}
+
+static int ov_rename(const char *from, const char *to)
+{
+    char rfrom[PATH_MAX], rto[PATH_MAX];
+    if (real_path(from, rfrom) != 0) return -EACCES;
+    if (real_path(to, rto) != 0) return -EACCES;
+    if (rename(rfrom, rto) != 0)
+        return -errno;
+    return 0;
+}
+
+static int ov_mkdir(const char *path, mode_t mode)
+{
+    char rpath[PATH_MAX];
+    if (real_path(path, rpath) != 0) return -EACCES;
+    if (mkdir(rpath, mode) != 0)
+        return -errno;
+    return 0;
+}
+
+static int ov_rmdir(const char *path)
+{
+    char rpath[PATH_MAX];
+    if (real_path(path, rpath) != 0) return -EACCES;
+    if (rmdir(rpath) != 0)
+        return -errno;
+    return 0;
+}
+
+static int ov_chmod(const char *path, mode_t mode)
+{
+    char rpath[PATH_MAX];
+    if (real_path(path, rpath) != 0) return -EACCES;
+    if (chmod(rpath, mode) != 0)
+        return -errno;
+    return 0;
+}
+
+static int ov_chown(const char *path, uid_t uid, gid_t gid)
+{
+    char rpath[PATH_MAX];
+    if (real_path(path, rpath) != 0) return -EACCES;
+    if (lchown(rpath, uid, gid) != 0)
+        return -errno;
+    return 0;
+}
+
+static int ov_utimens(const char *path, const struct timespec ts[2])
+{
+    char rpath[PATH_MAX];
+    if (real_path(path, rpath) != 0) return -EACCES;
+    if (utimensat(AT_FDCWD, rpath, ts, AT_SYMLINK_NOFOLLOW) != 0)
+        return -errno;
+    return 0;
+}
+
+static int ov_statfs(const char *path, struct statvfs *stbuf)
+{
+    char rpath[PATH_MAX];
+    if (real_path(path, rpath) != 0) return -EACCES;
+    if (statvfs(rpath, stbuf) != 0)
+        return -errno;
+    return 0;
+}
+
+static int ov_symlink(const char *target, const char *linkname)
+{
+    char rlink[PATH_MAX];
+    if (real_path(linkname, rlink) != 0) return -EACCES;
+    if (symlink(target, rlink) != 0)
+        return -errno;
+    return 0;
+}
+
+static int ov_readlink(const char *path, char *buf, size_t size)
+{
+    char rpath[PATH_MAX];
+    if (real_path(path, rpath) != 0) return -EACCES;
+    ssize_t len = readlink(rpath, buf, size - 1);
+    if (len < 0)
+        return -errno;
+    buf[len] = '\0';
+    return 0;
+}
+
 static struct fuse_operations onvault_fuse_ops = {
     .getattr  = ov_getattr,
     .readdir  = ov_readdir,
@@ -562,6 +689,16 @@ static struct fuse_operations onvault_fuse_ops = {
     .truncate = ov_truncate,
     .create   = ov_create,
     .release  = ov_release,
+    .unlink   = ov_unlink,
+    .rename   = ov_rename,
+    .mkdir    = ov_mkdir,
+    .rmdir    = ov_rmdir,
+    .chmod    = ov_chmod,
+    .chown    = ov_chown,
+    .utimens  = ov_utimens,
+    .statfs   = ov_statfs,
+    .symlink  = ov_symlink,
+    .readlink = ov_readlink,
 };
 
 int onvault_fuse_mount(const char *vault_id,

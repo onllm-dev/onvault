@@ -155,17 +155,23 @@ static int cmd_unlock(void)
         return 1;
     }
 
-    onvault_key_wipe(&master_key, sizeof(master_key));
-
     /* Notify daemon to load the master key from session */
     char response[ONVAULT_IPC_MAX_MSG];
     uint32_t resp_len = sizeof(response) - 1;
     int ipc_rc = onvault_ipc_send(IPC_CMD_UNLOCK, NULL, 0, response, &resp_len);
-    if (ipc_rc != ONVAULT_OK) {
-        printf("Unlocked (daemon not running — start with: onvaultd)\n");
-    } else {
-        printf("Unlocked. Vaults are now accessible.\n");
+
+    /* Wipe master key from CLI process — daemon has its own copy via session */
+    onvault_key_wipe(&master_key, sizeof(master_key));
+
+    if (ipc_rc == ONVAULT_ERR_IO) {
+        fprintf(stderr, "Error: Could not connect to daemon (not running?)\n");
+        fprintf(stderr, "  Start with: onvault start\n");
+        return 1;
+    } else if (ipc_rc != ONVAULT_OK) {
+        fprintf(stderr, "Unlock failed (err=%d). Daemon may need restart.\n", ipc_rc);
+        return 1;
     }
+    printf("Unlocked. Vaults are now accessible.\n");
     return 0;
 }
 
@@ -912,8 +918,24 @@ int main(int argc, char *argv[])
     }
     if (strcmp(cmd, "stop") == 0)
         return cmd_stop();
-    if (strcmp(cmd, "unlock") == 0)
+    if (strcmp(cmd, "unlock") == 0) {
+        /* Check for --touchid flag */
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "--touchid") == 0) {
+                char response[ONVAULT_IPC_MAX_MSG];
+                uint32_t resp_len = sizeof(response) - 1;
+                int rc = onvault_ipc_send(IPC_CMD_UNLOCK_TOUCHID, NULL, 0,
+                                           response, &resp_len);
+                if (rc != ONVAULT_OK) {
+                    fprintf(stderr, "Touch ID unlock failed (err=%d)\n", rc);
+                    return 1;
+                }
+                printf("Unlocked via Touch ID.\n");
+                return 0;
+            }
+        }
         return cmd_unlock();
+    }
     if (strcmp(cmd, "lock") == 0)
         return cmd_lock();
     if (strcmp(cmd, "status") == 0)
@@ -967,6 +989,67 @@ int main(int argc, char *argv[])
                 denied_only = 1;
         }
         return cmd_log(denied_only);
+    }
+
+    if (strcmp(cmd, "rotate-keys") == 0) {
+        uint8_t proof[ONVAULT_HASH_SIZE];
+        if (auth_challenge_response("Passphrase (required to rotate keys): ", proof) != 0)
+            return 1;
+        char response[ONVAULT_IPC_MAX_MSG];
+        uint32_t resp_len = sizeof(response) - 1;
+        int rc = onvault_ipc_send(IPC_CMD_ROTATE_KEYS, proof, ONVAULT_HASH_SIZE,
+                                   response, &resp_len);
+        onvault_memzero(proof, sizeof(proof));
+        if (rc == ONVAULT_ERR_AUTH) { fprintf(stderr, "Wrong passphrase.\n"); return 1; }
+        if (rc != ONVAULT_OK) { fprintf(stderr, "Key rotation failed (err=%d)\n", rc); return 1; }
+        response[resp_len] = '\0';
+        printf("%s", response);
+        return 0;
+    }
+
+    if (strcmp(cmd, "export-recovery") == 0) {
+        char pass[256];
+        read_passphrase("Passphrase: ", pass, sizeof(pass));
+        onvault_crypto_init();
+        int vrc = onvault_auth_verify_passphrase(pass);
+        onvault_memzero(pass, sizeof(pass));
+        if (vrc != ONVAULT_OK) { fprintf(stderr, "Wrong passphrase.\n"); return 1; }
+        /* Recovery key display requires daemon to be unlocked and have the config key.
+         * For now, print a message directing to the init output. */
+        printf("Recovery key was displayed during 'onvault init'.\n");
+        printf("If lost, there is no way to retrieve it.\n");
+        return 0;
+    }
+
+    if (strcmp(cmd, "recover") == 0) {
+        char recovery_key[32], pass1[256], pass2[256];
+        fprintf(stderr, "Recovery key (24 chars): ");
+        if (fgets(recovery_key, sizeof(recovery_key), stdin) == NULL) return 1;
+        size_t rklen = strlen(recovery_key);
+        if (rklen > 0 && recovery_key[rklen - 1] == '\n') recovery_key[rklen - 1] = '\0';
+
+        read_passphrase("New passphrase: ", pass1, sizeof(pass1));
+        read_passphrase("Confirm passphrase: ", pass2, sizeof(pass2));
+        if (strcmp(pass1, pass2) != 0) {
+            fprintf(stderr, "Passphrases do not match.\n");
+            onvault_memzero(pass1, sizeof(pass1));
+            onvault_memzero(pass2, sizeof(pass2));
+            return 1;
+        }
+        onvault_memzero(pass2, sizeof(pass2));
+
+        onvault_crypto_init();
+        onvault_key_t master_key;
+        int rc = onvault_auth_unlock_recovery(recovery_key, pass1, &master_key);
+        onvault_memzero(recovery_key, sizeof(recovery_key));
+        onvault_memzero(pass1, sizeof(pass1));
+        if (rc != ONVAULT_OK) {
+            fprintf(stderr, "Recovery failed (err=%d). Wrong recovery key?\n", rc);
+            return 1;
+        }
+        onvault_key_wipe(&master_key, sizeof(master_key));
+        printf("Recovery successful. You can now unlock with your new passphrase.\n");
+        return 0;
     }
 
     if (strcmp(cmd, "configure") == 0 || strcmp(cmd, "config") == 0)
